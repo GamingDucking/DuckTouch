@@ -403,7 +403,12 @@ fn glGetString(env: &mut Environment, name: GLenum) -> ConstPtr<GLubyte> {
             gles11::VENDOR => b"Imagination Technologies",
             gles11::RENDERER => b"PowerVR MBXLite with VGPLite",
             gles11::VERSION => b"OpenGL ES-CM 1.1 (76)",
-            gles11::EXTENSIONS => b"GL_APPLE_framebuffer_multisample GL_APPLE_texture_max_level GL_EXT_discard_framebuffer GL_EXT_texture_filter_anisotropic GL_EXT_texture_lod_bias GL_IMG_read_format GL_IMG_texture_compression_pvrtc GL_IMG_texture_format_BGRA8888 GL_OES_blend_subtract GL_OES_compressed_paletted_texture GL_OES_depth24 GL_OES_draw_texture GL_OES_framebuffer_object GL_OES_mapbuffer GL_OES_point_size_array GL_OES_point_sprite GL_OES_read_format GL_OES_rgb8_rgba8 GL_OES_texture_mirrored_repeat GL_OES_vertex_array_object ",
+            // Includes GL_OES_matrix_palette: the real PowerVR SGX in the
+            // iPhone 3GS exposes it, and touchHLE now emulates palette
+            // skinning CPU-side (see gles1_on_gl2's skin_vertices). Games such
+            // as LEGO Ninjago: Rise of the Snakes feature-test this string and
+            // use the palette path for skinned character meshes.
+            gles11::EXTENSIONS => b"GL_APPLE_framebuffer_multisample GL_APPLE_texture_max_level GL_EXT_discard_framebuffer GL_EXT_texture_filter_anisotropic GL_EXT_texture_lod_bias GL_IMG_read_format GL_IMG_texture_compression_pvrtc GL_IMG_texture_format_BGRA8888 GL_OES_blend_subtract GL_OES_compressed_paletted_texture GL_OES_depth24 GL_OES_draw_texture GL_OES_framebuffer_object GL_OES_mapbuffer GL_OES_matrix_palette GL_OES_point_size_array GL_OES_point_sprite GL_OES_read_format GL_OES_rgb8_rgba8 GL_OES_texture_mirrored_repeat GL_OES_vertex_array_object ",
             _ => b"Unknown",
         }
     } else {
@@ -1210,23 +1215,41 @@ fn glIsVertexArrayOES(env: &mut Environment, array: GLuint) -> GLboolean {
         }
     })
 }
-fn glCurrentPaletteMatrixOES(_env: &mut Environment, _matrixpaletteindex: GLuint) {}
-fn glLoadPaletteFromModelViewMatrixOES(_env: &mut Environment) {}
+fn glCurrentPaletteMatrixOES(env: &mut Environment, matrixpaletteindex: GLuint) {
+    with_ctx_and_mem(env, |gles, _mem| unsafe {
+        gles.CurrentPaletteMatrixOES(matrixpaletteindex)
+    })
+}
+fn glLoadPaletteFromModelViewMatrixOES(env: &mut Environment) {
+    with_ctx_and_mem(env, |gles, _mem| unsafe {
+        gles.LoadPaletteFromModelViewMatrixOES()
+    })
+}
 fn glMatrixIndexPointerOES(
-    _env: &mut Environment,
-    _size: GLint,
-    _type_: GLenum,
-    _stride: GLsizei,
-    _pointer: ConstVoidPtr,
+    env: &mut Environment,
+    size: GLint,
+    type_: GLenum,
+    stride: GLsizei,
+    pointer: ConstVoidPtr,
 ) {
+    with_ctx_and_mem(env, |gles, mem| unsafe {
+        let pointer =
+            translate_pointer_or_offset_to_host(gles, mem, pointer, gles11::ARRAY_BUFFER_BINDING);
+        gles.MatrixIndexPointerOES(size, type_, stride, pointer)
+    })
 }
 fn glWeightPointerOES(
-    _env: &mut Environment,
-    _size: GLint,
-    _type_: GLenum,
-    _stride: GLsizei,
-    _pointer: ConstVoidPtr,
+    env: &mut Environment,
+    size: GLint,
+    type_: GLenum,
+    stride: GLsizei,
+    pointer: ConstVoidPtr,
 ) {
+    with_ctx_and_mem(env, |gles, mem| unsafe {
+        let pointer =
+            translate_pointer_or_offset_to_host(gles, mem, pointer, gles11::ARRAY_BUFFER_BINDING);
+        gles.WeightPointerOES(size, type_, stride, pointer)
+    })
 }
 fn glGetBufferPointervOES(
     env: &mut Environment,
