@@ -603,8 +603,12 @@ impl Window {
             sdl2::hint::set("SDL_ANDROID_BLOCK_ON_PAUSE", "0");
         }
 
-        // Separate mouse and touch events
+        // Separate mouse and touch events in both SDL synthesis directions.
+        // SDL_TOUCH_MOUSE_EVENTS=0 stops touch input from also generating mouse input.
+        // SDL_MOUSE_TOUCH_EVENTS=0 stops mouse input from also generating touch input.
+        // Without both, one physical press can become two UIKit touches on some hosts.
         sdl2::hint::set("SDL_TOUCH_MOUSE_EVENTS", "0");
+        sdl2::hint::set("SDL_MOUSE_TOUCH_EVENTS", "0");
 
         // SDL2 disables the screen saver by default, but iPhone OS enables
         // the idle timer that triggers sleep by default, so we turn it back on
