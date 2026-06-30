@@ -460,20 +460,13 @@ fn objc_msgSend_inner(
 
             let missing_selector_name = selector.as_str(&env.mem).to_owned();
 
-            // Cocos2D compatibility:
-            // Potato Story repeatedly asks jkMainLayer for these Cocos2D
-            // cascade flags right before Android falls into the UDF loop.
-            // Treat missing cascade support as false without going through
-            // the generic "does not respond" path.
-            if missing_selector_name == "isCascadeColorEnabled"
-                || missing_selector_name == "isCascadeOpacityEnabled"
-            {
-                log_dbg!(
-                    "Cocos2D compat: {:?} missing selector \"{}\"; returning false",
-                    receiver,
-                    missing_selector_name
-                );
-                env.cpu.regs_mut()[0..2].fill(0);
+            if try_cocos_missing_selector_compat(
+                env,
+                receiver,
+                &missing_selector_name,
+                name,
+                is_metaclass,
+            ) {
                 return;
             }
 
@@ -764,12 +757,16 @@ Type mismatch when sending message {} to {:?}!
             is_metaclass,
         }) = host_object.as_any().downcast_ref()
         {
+            let sel_name = selector.as_str(&env.mem).to_owned();
+            if try_cocos_missing_selector_compat(env, receiver, &sel_name, name, is_metaclass) {
+                return;
+            }
             log!(
                 "Class \"{}\" ({:?}) is unimplemented. Call to {} method \"{}\".",
                 name,
                 class,
                 if is_metaclass { "class" } else { "instance" },
-                selector.as_str(&env.mem),
+                sel_name,
             );
             env.cpu.regs_mut()[0..2].fill(0);
             return;
@@ -778,12 +775,16 @@ Type mismatch when sending message {} to {:?}!
             is_metaclass,
         }) = host_object.as_any().downcast_ref()
         {
+            let sel_name = selector.as_str(&env.mem).to_owned();
+            if try_cocos_missing_selector_compat(env, receiver, &sel_name, name, is_metaclass) {
+                return;
+            }
             log!(
                 "Call to faked class \"{}\" ({:?}) {} method \"{}\". Behaving as if message was sent to nil.",
                 name,
                 class,
                 if is_metaclass { "class" } else { "instance" },
-                selector.as_str(&env.mem),
+                sel_name,
             );
             env.cpu.regs_mut()[0..2].fill(0);
             return;
@@ -795,6 +796,314 @@ Type mismatch when sending message {} to {:?}!
             return;
         }
     }
+}
+
+// ============================================================================
+// Broad Cocos2D / Cocos2d-x missing-selector compatibility
+// ============================================================================
+// Old iOS Cocos games often mix framework versions, categories, optional
+// protocols, and per-game subclasses. Returning a sane default for a missing
+// selector is usually closer to Objective-C's loose runtime behavior than
+// panicking or spamming the log. These shims are deliberately conservative:
+// they only trigger for Cocos-looking classes/selectors or harmless UIKit-style
+// lifecycle/property selectors.
+
+fn objc_ret_zero(env: &mut Environment) {
+    env.cpu.regs_mut()[0..2].fill(0);
+}
+
+fn objc_ret_u32(env: &mut Environment, value: u32) {
+    env.cpu.regs_mut()[0] = value;
+    env.cpu.regs_mut()[1] = 0;
+}
+
+fn objc_ret_f32(env: &mut Environment, value: f32) {
+    env.cpu.regs_mut()[0] = value.to_bits();
+    env.cpu.regs_mut()[1] = 0;
+}
+
+fn objc_ret_f64(env: &mut Environment, value: f64) {
+    let bits = value.to_bits();
+    env.cpu.regs_mut()[0] = bits as u32;
+    env.cpu.regs_mut()[1] = (bits >> 32) as u32;
+}
+
+fn objc_ret_id(env: &mut Environment, value: id) {
+    env.cpu.regs_mut()[0] = value.to_bits();
+    env.cpu.regs_mut()[1] = 0;
+}
+
+fn cocos_selector_log_once(class_name: &str, selector: &str, note: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<(String, String, String)>>> = OnceLock::new();
+    let key = (class_name.to_string(), selector.to_string(), note.to_string());
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    if seen.lock().unwrap().insert(key) {
+        log_dbg!(
+            "Cocos compat: class={} missing selector={} -> {}",
+            class_name,
+            selector,
+            note
+        );
+    }
+}
+
+fn is_cocos_like_class_name(name: &str) -> bool {
+    name.starts_with("CC")
+        || name.starts_with("CCT")
+        || name.starts_with("Cocos")
+        || name.contains("Cocos")
+        || name.contains("cocos")
+        || name.contains("EAGL")
+        || name.contains("GLView")
+        || name.contains("Director")
+        || name.contains("Scene")
+        || name.contains("Layer")
+        || name.contains("Sprite")
+        || name.contains("Menu")
+        || name.contains("Button")
+        || name.contains("Label")
+        || name.contains("Texture")
+        || name.contains("Atlas")
+        || name.contains("TileMap")
+        || name.contains("TMX")
+        || name.contains("Particle")
+        || name.contains("Action")
+        || name.contains("Scheduler")
+        || name.contains("TouchDispatcher")
+        || name.contains("GameLayer")
+        || name.contains("GameScene")
+        || name.contains("RootView")
+        || name.contains("GameView")
+}
+
+fn is_cocos_selector_name(sel: &str) -> bool {
+    sel.starts_with("cc")
+        || sel.starts_with("CCTouch")
+        || sel.starts_with("touchDispatcher")
+        || sel.contains("Touch")
+        || sel.contains("touch")
+        || sel.contains("Action")
+        || sel.contains("action")
+        || sel.contains("Scheduler")
+        || sel.contains("schedule")
+        || sel.contains("unschedule")
+        || sel.contains("Animation")
+        || sel.contains("animation")
+        || sel.contains("Texture")
+        || sel.contains("texture")
+        || sel.contains("Sprite")
+        || sel.contains("sprite")
+        || sel.contains("BlendFunc")
+        || sel.contains("Opacity")
+        || sel.contains("Color")
+        || sel.contains("AnchorPoint")
+        || sel.contains("Position")
+        || sel.contains("ZOrder")
+        || sel.contains("VertexZ")
+        || sel.contains("Scale")
+        || sel.contains("Rotation")
+        || sel.contains("Skew")
+        || sel.contains("Flip")
+        || sel.contains("Visible")
+        || sel.contains("Cascade")
+        || sel.contains("contentSize")
+        || sel.contains("ContentSize")
+}
+
+fn is_safe_uikit_lifecycle_selector(sel: &str) -> bool {
+    matches!(
+        sel,
+        "viewDidLoad" | "viewDidUnload" | "viewWillAppear:" | "viewDidAppear:" |
+        "viewWillDisappear:" | "viewDidDisappear:" | "viewWillLayoutSubviews" |
+        "viewDidLayoutSubviews" | "didReceiveMemoryWarning" | "loadView" |
+        "willMoveToSuperview:" | "didMoveToSuperview" | "willMoveToWindow:" |
+        "didMoveToWindow" | "didAddSubview:" | "willRemoveSubview:" |
+        "layoutSubviews" | "setNeedsLayout" | "layoutIfNeeded" |
+        "setNeedsDisplay" | "setNeedsDisplayInRect:" | "drawRect:" |
+        "applicationWillResignActive:" | "applicationDidBecomeActive:" |
+        "applicationDidEnterBackground:" | "applicationWillEnterForeground:" |
+        "applicationWillTerminate:" | "applicationDidReceiveMemoryWarning:"
+    )
+}
+
+fn try_cocos_missing_selector_compat(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+    class_name: &str,
+    is_metaclass: bool,
+) -> bool {
+    let cocosish = is_cocos_like_class_name(class_name) || is_cocos_selector_name(selector_name);
+    let safe_uikit = is_safe_uikit_lifecycle_selector(selector_name);
+    if !cocosish && !safe_uikit {
+        return false;
+    }
+
+    // Lifecycle / scheduler / optional callback selectors: missing means no-op.
+    if safe_uikit
+        || selector_name.starts_with("set")
+        || selector_name.starts_with("add")
+        || selector_name.starts_with("remove")
+        || selector_name.starts_with("schedule")
+        || selector_name.starts_with("unschedule")
+        || selector_name.starts_with("register")
+        || selector_name.starts_with("unregister")
+        || selector_name.starts_with("resume")
+        || selector_name.starts_with("pause")
+        || selector_name.starts_with("stop")
+        || selector_name.starts_with("cleanup")
+        || selector_name.starts_with("reorder")
+        || selector_name.starts_with("sort")
+        || selector_name.starts_with("visit")
+        || selector_name.starts_with("draw")
+        || selector_name.starts_with("update")
+        || selector_name.starts_with("onEnter")
+        || selector_name.starts_with("onExit")
+        || selector_name.starts_with("onEnterTransitionDidFinish")
+        || selector_name.starts_with("onExitTransitionDidStart")
+        || selector_name.starts_with("ccTouches")
+        || selector_name == "ccTouchMoved:withEvent:"
+        || selector_name == "ccTouchEnded:withEvent:"
+        || selector_name == "ccTouchCancelled:withEvent:"
+        || selector_name == "accelerometer:didAccelerate:"
+        || selector_name == "keyBackClicked"
+        || selector_name == "keyMenuClicked"
+    {
+        cocos_selector_log_once(class_name, selector_name, "void/no-op");
+        objc_ret_zero(env);
+        return true;
+    }
+
+    // Targeted touch began returns BOOL. Returning YES lets old CCTargetedTouch
+    // delegates claim the touch when the selector is optional/missing on a shim.
+    if selector_name == "ccTouchBegan:withEvent:" || selector_name == "containsTouchLocation:" {
+        cocos_selector_log_once(class_name, selector_name, "YES");
+        objc_ret_u32(env, 1);
+        return true;
+    }
+
+    // Common YES defaults that keep active Cocos nodes alive.
+    if matches!(
+        selector_name,
+        "isRunning" | "running" | "isVisible" | "visible" |
+        "isEnabled" | "enabled" | "isTouchEnabled" | "touchEnabled" |
+        "isAccelerometerEnabled" | "accelerometerEnabled" |
+        "isKeyboardEnabled" | "keyboardEnabled" |
+        "isUserInteractionEnabled" | "userInteractionEnabled" |
+        "isRelativeAnchorPoint" | "relativeAnchorPoint" |
+        "shouldAutorotate" | "shouldAutorotateToInterfaceOrientation:" |
+        "prefersStatusBarHidden" | "isViewLoaded"
+    ) {
+        cocos_selector_log_once(class_name, selector_name, "YES");
+        objc_ret_u32(env, 1);
+        return true;
+    }
+
+    // Common NO defaults for optional Cocos flags.
+    if matches!(
+        selector_name,
+        "isCascadeColorEnabled" | "cascadeColorEnabled" |
+        "isCascadeOpacityEnabled" | "cascadeOpacityEnabled" |
+        "isOpacityModifyRGB" | "doesOpacityModifyRGB" |
+        "ignoreAnchorPointForPosition" | "isIgnoreAnchorPointForPosition" |
+        "isFlipX" | "flipX" | "isFlipY" | "flipY" |
+        "isTextureRectRotated" | "textureRectRotated" |
+        "isDirty" | "dirty" | "isClosed" | "closed" |
+        "isPaused" | "paused" | "isSelected" | "selected" |
+        "hasActions" | "hasVisibleParents" | "isKeyboardShown"
+    ) {
+        cocos_selector_log_once(class_name, selector_name, "NO");
+        objc_ret_zero(env);
+        return true;
+    }
+
+    // Integer-ish defaults.
+    if matches!(
+        selector_name,
+        "tag" | "zOrder" | "getZOrder" | "vertexZ" | "orderOfArrival" |
+        "priority" | "touchPriority" | "handlerPriority" | "atlasIndex" |
+        "numberOfRunningActions" | "runningActions" | "count" |
+        "childrenCount" | "opacity" | "displayedOpacity" |
+        "getOpacity" | "getDisplayedOpacity" | "level" | "stage" |
+        "state" | "orientation" | "supportedInterfaceOrientations"
+    ) {
+        let value = match selector_name {
+            "opacity" | "displayedOpacity" | "getOpacity" | "getDisplayedOpacity" => 255,
+            "supportedInterfaceOrientations" => 0x18, // landscape left/right mask on old UIKit-style callers.
+            _ => 0,
+        };
+        cocos_selector_log_once(class_name, selector_name, "integer default");
+        objc_ret_u32(env, value);
+        return true;
+    }
+
+    // Float / CGFloat defaults.
+    if matches!(
+        selector_name,
+        "scale" | "scaleX" | "scaleY" | "getScale" | "getScaleX" | "getScaleY" |
+        "contentScaleFactor" | "screenScale" | "getContentScaleFactor"
+    ) {
+        cocos_selector_log_once(class_name, selector_name, "1.0f");
+        objc_ret_f32(env, 1.0);
+        return true;
+    }
+    if matches!(
+        selector_name,
+        "rotation" | "rotationX" | "rotationY" | "skewX" | "skewY" |
+        "getRotation" | "getRotationX" | "getRotationY" |
+        "getSkewX" | "getSkewY" | "anchorPointInPoints" |
+        "positionX" | "positionY" | "getPositionX" | "getPositionY" |
+        "cameraEyeX" | "cameraEyeY" | "cameraEyeZ"
+    ) {
+        cocos_selector_log_once(class_name, selector_name, "0.0f");
+        objc_ret_f32(env, 0.0);
+        return true;
+    }
+    if matches!(selector_name, "animationInterval" | "dt" | "delta" | "timeScale") {
+        let value = if selector_name == "animationInterval" { 1.0 / 60.0 } else if selector_name == "timeScale" { 1.0 } else { 0.0 };
+        cocos_selector_log_once(class_name, selector_name, "double default");
+        objc_ret_f64(env, value);
+        return true;
+    }
+
+    // Return self for chainable init/autorelease-ish Cocos factories when they
+    // are missing on a fake/unimplemented class. For class methods, returning
+    // the class itself is worse than nil, so only do this for instances.
+    if !is_metaclass && matches!(selector_name, "init" | "initWithCoder:" | "autorelease" | "retain") {
+        cocos_selector_log_once(class_name, selector_name, "self");
+        objc_ret_id(env, receiver);
+        return true;
+    }
+
+    // Object defaults. Nil is better than falling through to a noisy missing
+    // selector path for optional properties. Existing generic fallback also
+    // returns nil, but this keeps logs cleaner for high-frequency game loops.
+    if matches!(
+        selector_name,
+        "parent" | "children" | "scheduler" | "actionManager" |
+        "touchDispatcher" | "texture" | "spriteFrame" | "batchNode" |
+        "camera" | "grid" | "shaderProgram" | "userData" |
+        "userObject" | "delegate" | "target" | "selector" |
+        "nextResponder" | "window" | "view" | "rootViewController" |
+        "navigationController" | "scene" | "runningScene"
+    ) {
+        cocos_selector_log_once(class_name, selector_name, "nil object");
+        objc_ret_zero(env);
+        return true;
+    }
+
+    // Very broad final Cocos safety net for setters/callbacks with arguments.
+    // This catches lots of minor version drift like setDisplayFrame: or
+    // registerScriptHandler: without hiding truly unknown zero-argument getters.
+    if cocosish && selector_name.ends_with(':') {
+        cocos_selector_log_once(class_name, selector_name, "argument selector no-op");
+        objc_ret_zero(env);
+        return true;
+    }
+
+    false
 }
 
 // ============================================================================
