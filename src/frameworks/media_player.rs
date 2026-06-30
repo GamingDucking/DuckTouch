@@ -29,7 +29,12 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         media_query::CLASSES,
         mf_mail_compose_view_controller::CLASSES,
     ],
-    constant_exports: &[movie_player::CONSTANTS, music_player::CONSTANTS],
+    constant_exports: &[
+        movie_player::CONSTANTS,
+        music_player::CONSTANTS,
+        media_library::CONSTANTS,
+        media_playlist::CONSTANTS,
+    ],
     function_exports: &[],
 };
 
