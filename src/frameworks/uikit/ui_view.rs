@@ -203,12 +203,17 @@ fn touchhle_cocos_is_gl_or_game_view_name(class_name: &str) -> bool {
         || class_name.contains("GLView")
         || class_name.contains("Cocos")
         || class_name.contains("CCGL")
+        || class_name.contains("Unity")
+        || class_name.contains("UnityView")
+        || class_name.contains("UnityGLView")
+        || class_name.contains("UnityRenderingView")
+        || class_name.contains("RenderView")
         || class_name.contains("RootView")
         || class_name.contains("GameView")
 }
 
 fn touchhle_cocos_landscape_rect(env: &Environment) -> CGRect {
-    let size = std::env::var("TOUCHHLE_COCOS_LANDSCAPE_SIZE")
+    let size = std::env::var("TOUCHHLE_COCOS_LANDSCAPE_SIZE").or_else(|_| std::env::var("TOUCHHLE_UNITY_LANDSCAPE_SIZE")).or_else(|_| std::env::var("TOUCHHLE_ENGINE_LANDSCAPE_SIZE"))
         .ok()
         .and_then(|v| {
             let mut parts = v.split(|c| c == 'x' || c == 'X' || c == ',');
@@ -238,6 +243,8 @@ fn touchhle_cocos_should_force_landscape_view(env: &mut Environment, view: id) -
     }
 
     if std::env::var_os("TOUCHHLE_COCOS_FORCE_LANDSCAPE_VIEW").is_some()
+        || std::env::var_os("TOUCHHLE_UNITY_FORCE_LANDSCAPE_VIEW").is_some()
+        || std::env::var_os("TOUCHHLE_ENGINE_FORCE_LANDSCAPE_VIEW").is_some()
         || std::env::var_os("TOUCHHLE_FORCE_LANDSCAPE_VIEW_BOUNDS").is_some()
     {
         return true;

@@ -65,6 +65,11 @@ fn touchhle_cocos_is_gl_or_game_view_name(class_name: &str) -> bool {
         || class_name.contains("GLView")
         || class_name.contains("Cocos")
         || class_name.contains("CCGL")
+        || class_name.contains("Unity")
+        || class_name.contains("UnityView")
+        || class_name.contains("UnityGLView")
+        || class_name.contains("UnityRenderingView")
+        || class_name.contains("RenderView")
         || class_name.contains("GameView")
         || class_name.contains("RootView")
 }
@@ -79,7 +84,9 @@ fn touchhle_should_use_landscape_touch_remap(env: &Environment) -> bool {
 
         // Manual override for testing.
         _ => std::env::var_os("TOUCHHLE_TOUCH_LOCATION_PORTRAIT_TO_LANDSCAPE").is_some()
-            || std::env::var_os("TOUCHHLE_COCOS_TOUCH_REMAP").is_some(),
+            || std::env::var_os("TOUCHHLE_COCOS_TOUCH_REMAP").is_some()
+            || std::env::var_os("TOUCHHLE_UNITY_TOUCH_REMAP").is_some()
+            || std::env::var_os("TOUCHHLE_ENGINE_TOUCH_REMAP").is_some(),
     }
 }
 
@@ -96,6 +103,8 @@ fn should_remap_touch_location_for_view(env: &mut Environment, view: id) -> bool
 
     if std::env::var_os("TOUCHHLE_TOUCH_LOCATION_PORTRAIT_TO_LANDSCAPE").is_some()
         || std::env::var_os("TOUCHHLE_COCOS_TOUCH_REMAP").is_some()
+        || std::env::var_os("TOUCHHLE_UNITY_TOUCH_REMAP").is_some()
+        || std::env::var_os("TOUCHHLE_ENGINE_TOUCH_REMAP").is_some()
     {
         return true;
     }
@@ -106,7 +115,7 @@ fn should_remap_touch_location_for_view(env: &mut Environment, view: id) -> bool
 }
 
 fn touchhle_cocos_target_size() -> (f32, f32) {
-    std::env::var("TOUCHHLE_COCOS_TOUCH_SIZE")
+    std::env::var("TOUCHHLE_COCOS_TOUCH_SIZE").or_else(|_| std::env::var("TOUCHHLE_UNITY_TOUCH_SIZE")).or_else(|_| std::env::var("TOUCHHLE_ENGINE_TOUCH_SIZE"))
         .ok()
         .and_then(|v| {
             let mut parts = v.split(|c| c == 'x' || c == 'X' || c == ',');
@@ -124,7 +133,10 @@ fn touchhle_cocos_remap_point(env: &mut Environment, view: id, point: CGPoint) -
     let mode = std::env::var("TOUCHHLE_TOUCH_MODE").unwrap_or_else(|_| {
         match env.bundle.bundle_identifier() {
             "at.source.veggie1" | "at.source.potato3D" | "at.source.potpan" => "scale".to_string(),
-            _ => std::env::var("TOUCHHLE_COCOS_TOUCH_MODE").unwrap_or_else(|_| "scale".to_string()),
+            _ => std::env::var("TOUCHHLE_COCOS_TOUCH_MODE")
+                .or_else(|_| std::env::var("TOUCHHLE_UNITY_TOUCH_MODE"))
+                .or_else(|_| std::env::var("TOUCHHLE_ENGINE_TOUCH_MODE"))
+                .unwrap_or_else(|_| "scale".to_string()),
         }
     });
 
@@ -169,10 +181,16 @@ fn touchhle_cocos_remap_point(env: &mut Environment, view: id, point: CGPoint) -
 }
 
 fn touchhle_cocos_should_allow_multitouch(env: &mut Environment, view: id) -> bool {
-    if std::env::var_os("TOUCHHLE_COCOS_FORCE_SINGLE_TOUCH").is_some() {
+    if std::env::var_os("TOUCHHLE_COCOS_FORCE_SINGLE_TOUCH").is_some()
+        || std::env::var_os("TOUCHHLE_UNITY_FORCE_SINGLE_TOUCH").is_some()
+        || std::env::var_os("TOUCHHLE_ENGINE_FORCE_SINGLE_TOUCH").is_some()
+    {
         return false;
     }
-    if std::env::var_os("TOUCHHLE_COCOS_FORCE_MULTITOUCH").is_some() {
+    if std::env::var_os("TOUCHHLE_COCOS_FORCE_MULTITOUCH").is_some()
+        || std::env::var_os("TOUCHHLE_UNITY_FORCE_MULTITOUCH").is_some()
+        || std::env::var_os("TOUCHHLE_ENGINE_FORCE_MULTITOUCH").is_some()
+    {
         return true;
     }
     let class_name = touchhle_cocos_view_class_name(env, view);
