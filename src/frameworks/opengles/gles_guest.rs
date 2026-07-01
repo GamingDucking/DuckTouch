@@ -3179,6 +3179,32 @@ fn strip_captain_tomato_shader_precision(source: &str) -> String {
     lines.join("\n")
 }
 
+fn normalize_shader_preprocessor_whitespace(source: &str) -> String {
+    let mut out = String::with_capacity(source.len() + 32);
+    for (i, line) in source.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let line = line.trim_end_matches('\r');
+        let trimmed_start = line.trim_start();
+        let is_directive = trimmed_start.starts_with('#');
+        if is_directive {
+            if let Some(comment_at) = line.find("//") {
+                let before = &line[..comment_at];
+                let comment = &line[comment_at..];
+                if !before.ends_with(' ') && !before.ends_with('\t') && !before.is_empty() {
+                    out.push_str(before.trim_end());
+                    out.push(' ');
+                    out.push_str(comment);
+                    continue;
+                }
+            }
+        }
+        out.push_str(line);
+    }
+    out
+}
+
 fn glShaderSource(
     env: &mut Environment,
     shader: GLuint,
@@ -3227,10 +3253,18 @@ fn glShaderSource(
                 .cstr_at_with_max_len(str_ptr, MAX_SHADER_SRC_LEN)
                 .to_vec()
         };
-        // Normalize GLES precision qualifiers for all Cocos2D shaders.
-        // Fixes Mesa link failures like:
-        // uniform `CC_PMatrix` declared as type `f16mat4` and type `mat4`.
+        // Normalize shader text before sending it to the driver:
+        // 1. Fix up preprocessor-directive whitespace (see doc comment on
+        //    `normalize_shader_preprocessor_whitespace`) — real-world guest
+        //    shaders (e.g. Gameloft's "9mm") glue same-line comments
+        //    directly onto `#endif`/`#if`/`#elif` or use CRLF endings,
+        //    which real PowerVR SGX drivers tolerated but modern GLSL
+        //    compilers reject with "unexpected tokens following #endif".
+        // 2. Normalize GLES precision qualifiers for all Cocos2D shaders.
+        //    Fixes Mesa link failures like:
+        //    uniform `CC_PMatrix` declared as type `f16mat4` and type `mat4`.
         let src = String::from_utf8_lossy(&bytes_vec);
+        let src = normalize_shader_preprocessor_whitespace(&src);
         let bytes_vec = strip_captain_tomato_shader_precision(&src).into_bytes();
 
         let cs = std::ffi::CString::new(bytes_vec).unwrap_or_default();
@@ -5410,3 +5444,45 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(glLabelObjectEXT(_, _, _, _)),
     export_c_func!(glGetObjectLabelEXT(_, _, _, _, _)),
 ];
+
+#[cfg(test)]
+mod shader_preprocessor_normalization_tests {
+    use super::normalize_shader_preprocessor_whitespace;
+
+    #[test]
+    fn inserts_space_before_comment_on_endif() {
+        let src = "#if defined(FOO)\nvoid main() {}\n#endif//comment\n";
+        let out = normalize_shader_preprocessor_whitespace(src);
+        assert!(out.contains("#endif //comment"));
+    }
+
+    #[test]
+    fn inserts_space_before_comment_on_if() {
+        let src = "#if defined(FOO)//bar\nvoid main() {}\n#endif\n";
+        let out = normalize_shader_preprocessor_whitespace(src);
+        assert!(out.contains("#if defined(FOO) //bar"));
+    }
+
+    #[test]
+    fn strips_stray_carriage_returns() {
+        let src = "#if defined(FOO)\r\nvoid main() {}\r\n#endif\r\n";
+        let out = normalize_shader_preprocessor_whitespace(src);
+        assert!(!out.contains('\r'));
+        assert!(out.contains("#if defined(FOO)"));
+        assert!(out.contains("#endif"));
+    }
+
+    #[test]
+    fn leaves_already_spaced_directives_unchanged() {
+        let src = "#if defined(FOO) // bar\nvoid main() {}\n#endif // baz\n";
+        let out = normalize_shader_preprocessor_whitespace(src);
+        assert_eq!(out, src.replace('\r', ""));
+    }
+
+    #[test]
+    fn does_not_touch_comments_in_body_code() {
+        let src = "void main() {\n  float x = 1.0;//no space needed here\n}\n";
+        let out = normalize_shader_preprocessor_whitespace(src);
+        assert_eq!(out, src);
+    }
+}
