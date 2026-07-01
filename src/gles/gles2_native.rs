@@ -219,9 +219,7 @@ fn patch_shader_for_native_es2(
         if trimmed.starts_with("#version") && version_line.is_none() {
             version_line = Some(line.to_string());
         } else if trimmed.starts_with("#extension") {
-            // If the driver doesn't support texture_lod, strip that extension
             if !texture_lod_ext_supported && trimmed.contains("GL_EXT_shader_texture_lod") {
-                // Drop this line entirely
                 continue;
             }
             extension_lines.push(line.to_string());
@@ -242,7 +240,6 @@ fn patch_shader_for_native_es2(
         }
     }
 
-    // Reassemble: version, then extensions, then body.
     let mut out = String::with_capacity(source.len() + 64);
     if let Some(v) = &version_line {
         out.push_str(v);
@@ -260,12 +257,6 @@ fn patch_shader_for_native_es2(
         out.push('\n');
     }
 
-    // If the driver doesn't support GL_EXT_shader_texture_lod, replace
-    // texture2DLodEXT / texture2DProjLodEXT / textureCubeLodEXT calls.
-    // These functions take an extra LOD parameter that we drop:
-    //   texture2DLodEXT(sampler, coord, lod) -> texture2D(sampler, coord)
-    //   texture2DProjLodEXT(sampler, coord, lod) -> texture2DProj(sampler, coord)
-    //   textureCubeLodEXT(sampler, coord, lod) -> textureCube(sampler, coord)
     if !texture_lod_ext_supported {
         out = replace_texture_lod_ext_calls(&out);
     }
@@ -394,6 +385,16 @@ mod tests {
         let src = "#version 100\nvoid main() { gl_Position = vec4(1.0); }\n";
         let out = patch_shader_for_native_es2(src, true, false);
         assert!(!out.contains("precision"));
+    }
+
+    #[test]
+    fn hoists_extension_directives_before_body_code() {
+        let src = "#version 100\nvoid helper() {}\n#extension GL_OES_texture_3D : enable\nvoid main() { gl_FragColor = vec4(1.0); }\n";
+        let out = patch_shader_for_native_es2(src, true, false);
+        let ext_pos = out.find("#extension GL_OES_texture_3D : enable").unwrap();
+        let helper_pos = out.find("void helper()").unwrap();
+        assert!(ext_pos < helper_pos);
+        assert!(out.starts_with("#version 100\n#extension GL_OES_texture_3D : enable\n"));
     }
 }
 
