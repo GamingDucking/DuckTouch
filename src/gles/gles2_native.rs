@@ -1179,27 +1179,6 @@ impl GLES for GLES2Native<'_> {
             joined.push_str(&s);
         }
 
-        // Check if any patching is needed at all. If the shader has no
-        // extension directives and no texture*LodEXT calls, pass through
-        // unchanged for maximum fidelity.
-        let needs_ext_hoist = joined.contains("#extension")
-            && joined.lines().enumerate().any(|(i, line)| {
-                let trimmed = line.trim();
-                if !trimmed.starts_with("#extension") {
-                    return false;
-                }
-                // Check if there's a non-preprocessor, non-empty, non-comment
-                // line before this #extension
-                joined.lines().take(i).any(|prev| {
-                    let pt = prev.trim();
-                    !pt.is_empty() && !pt.starts_with('#') && !pt.starts_with("//")
-                })
-            });
-        let needs_lod_patch = !self.texture_lod_ext_supported
-            && (joined.contains("texture2DLodEXT")
-                || joined.contains("texture2DProjLodEXT")
-                || joined.contains("textureCubeLodEXT"));
-
         // GLSL ES fragment shaders have no default precision for `float`, so
         // strict drivers (e.g. AMD's native GLES) reject any fragment shader
         // that declares a float without a `precision ... float;` line. Real
@@ -1212,7 +1191,21 @@ impl GLES for GLES2Native<'_> {
         let needs_precision_inject = shader_type as GLenum == gles2::FRAGMENT_SHADER
             && !shader_has_default_float_precision(&joined);
 
-        if !needs_ext_hoist && !needs_lod_patch && !needs_precision_inject {
+        // Patch whenever the shader carries any #extension directive (its
+        // placement relative to code is what strict drivers reject), needs a
+        // texture*LodEXT rewrite, or needs a default float precision. This is
+        // deliberately broad: real PowerVR SGX drivers tolerated late
+        // #extension lines and glued preprocessor tokens, but Adreno/Mali
+        // reject them, so we always normalize rather than trying to predict
+        // the exact offending arrangement.
+        let needs_lod_patch = !self.texture_lod_ext_supported
+            && (joined.contains("texture2DLodEXT")
+                || joined.contains("texture2DProjLodEXT")
+                || joined.contains("textureCubeLodEXT"));
+        let needs_patch =
+            joined.contains("#extension") || needs_lod_patch || needs_precision_inject;
+
+        if !needs_patch {
             // No patching needed — pass through directly.
             gles2::ShaderSource(shader, count, string, length);
             return;
