@@ -3189,7 +3189,13 @@ fn normalize_shader_preprocessor_whitespace(source: &str) -> String {
         let trimmed_start = line.trim_start();
         let is_directive = trimmed_start.starts_with('#');
         if is_directive {
-            if let Some(comment_at) = line.find("//") {
+            let comment_at = match (line.find("//"), line.find("/*")) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            if let Some(comment_at) = comment_at {
                 let before = &line[..comment_at];
                 let comment = &line[comment_at..];
                 if !before.ends_with(' ') && !before.ends_with('\t') && !before.is_empty() {
@@ -3217,12 +3223,13 @@ fn glShaderSource(
     }
     // Copy each source string out of the guest's memory into a host-side
     // buffer so we can pass real host pointers to the GLES implementation.
-    let mut owned: Vec<std::ffi::CString> = Vec::with_capacity(count as usize);
+    // Concatenate first so preprocessor normalization can see directive
+    // boundaries that guest code split across multiple source strings.
+    let mut raw_source = Vec::<u8>::new();
     for i in 0..count {
         let str_ptr_ptr: ConstPtr<ConstPtr<GLubyte>> = string + (i as GuestUSize);
         let str_ptr: ConstPtr<GLubyte> = env.mem.read(str_ptr_ptr);
         if str_ptr.is_null() {
-            owned.push(std::ffi::CString::default());
             continue;
         }
         // Check if explicit lengths were provided.
@@ -3253,26 +3260,26 @@ fn glShaderSource(
                 .cstr_at_with_max_len(str_ptr, MAX_SHADER_SRC_LEN)
                 .to_vec()
         };
-        // Normalize shader text before sending it to the driver:
-        // 1. Fix up preprocessor-directive whitespace (see doc comment on
-        //    `normalize_shader_preprocessor_whitespace`) — real-world guest
-        //    shaders (e.g. Gameloft's "9mm") glue same-line comments
-        //    directly onto `#endif`/`#if`/`#elif` or use CRLF endings,
-        //    which real PowerVR SGX drivers tolerated but modern GLSL
-        //    compilers reject with "unexpected tokens following #endif".
-        // 2. Normalize GLES precision qualifiers for all Cocos2D shaders.
-        //    Fixes Mesa link failures like:
-        //    uniform `CC_PMatrix` declared as type `f16mat4` and type `mat4`.
-        let src = String::from_utf8_lossy(&bytes_vec);
-        let src = normalize_shader_preprocessor_whitespace(&src);
-        let bytes_vec = strip_captain_tomato_shader_precision(&src).into_bytes();
-
-        let cs = std::ffi::CString::new(bytes_vec).unwrap_or_default();
-        owned.push(cs);
+        raw_source.extend_from_slice(&bytes_vec);
     }
-    let ptrs: Vec<*const std::os::raw::c_char> = owned.iter().map(|s| s.as_ptr()).collect();
+    // Normalize shader text before sending it to the driver:
+    // 1. Fix up preprocessor-directive whitespace (see doc comment on
+    //    `normalize_shader_preprocessor_whitespace`) — real-world guest
+    //    shaders (e.g. Gameloft's "9mm") glue same-line comments
+    //    directly onto `#endif`/`#if`/`#elif` or use CRLF endings,
+    //    which real PowerVR SGX drivers tolerated but modern GLSL
+    //    compilers reject with "unexpected tokens following #endif".
+    // 2. Normalize GLES precision qualifiers for all Cocos2D shaders.
+    //    Fixes Mesa link failures like:
+    //    uniform `CC_PMatrix` declared as type `f16mat4` and type `mat4`.
+    let src = String::from_utf8_lossy(&raw_source);
+    let src = normalize_shader_preprocessor_whitespace(&src);
+    let bytes_vec = strip_captain_tomato_shader_precision(&src).into_bytes();
+
+    let cs = std::ffi::CString::new(bytes_vec).unwrap_or_default();
+    let ptr = cs.as_ptr();
     with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.ShaderSource(shader, count, ptrs.as_ptr(), std::ptr::null());
+        gles.ShaderSource(shader, 1, &ptr, std::ptr::null());
     });
 }
 fn glEnableVertexAttribArray(env: &mut Environment, index: GLuint) {
@@ -5484,5 +5491,29 @@ mod shader_preprocessor_normalization_tests {
         let src = "void main() {\n  float x = 1.0;//no space needed here\n}\n";
         let out = normalize_shader_preprocessor_whitespace(src);
         assert_eq!(out, src);
+    }
+
+    #[test]
+    fn inserts_space_before_block_comment_on_directive() {
+        let src = "#endif/* trailing */\nvoid main() {}\n";
+        let out = normalize_shader_preprocessor_whitespace(src);
+        assert!(out.contains("#endif /* trailing */"));
+    }
+
+    #[test]
+    fn normalizes_directive_spanning_concatenated_source_strings() {
+        // Guest code often calls glShaderSource with count > 1, splitting the
+        // source into several strings. touchHLE concatenates them before
+        // normalization; verify that a directive whose trailing `//comment`
+        // only becomes adjacent *after* concatenation is still fixed up.
+        // Real case: Gameloft's "9mm" glues `#endif//...` at a chunk boundary,
+        // which real PowerVR SGX tolerated but desktop/Adreno GLSL rejects with
+        // "unexpected tokens following #endif".
+        let chunk_a = "#if defined(FOO)\nvoid main() {}\n#endif";
+        let chunk_b = "//trailing comment\n";
+        let joined = format!("{chunk_a}{chunk_b}");
+        let out = normalize_shader_preprocessor_whitespace(&joined);
+        assert!(out.contains("#endif //trailing comment"));
+        assert!(!out.contains("#endif//trailing comment"));
     }
 }
