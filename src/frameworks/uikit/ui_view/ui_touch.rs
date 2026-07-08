@@ -30,6 +30,7 @@ pub const UITouchPhaseBegan: UITouchPhase = 0;
 pub const UITouchPhaseMoved: UITouchPhase = 1;
 pub const UITouchPhaseStationary: UITouchPhase = 2;
 pub const UITouchPhaseEnded: UITouchPhase = 3;
+pub const UITouchPhaseCancelled: UITouchPhase = 4;
 
 #[derive(Default)]
 pub struct State {
@@ -196,6 +197,118 @@ fn touchhle_cocos_should_allow_multitouch(env: &mut Environment, view: id) -> bo
     let class_name = touchhle_cocos_view_class_name(env, view);
     touchhle_cocos_is_gl_or_game_view_name(&class_name)
 }
+
+pub(super) fn touch_is_ended_or_cancelled(env: &Environment, touch: id) -> bool {
+    if touch == nil {
+        return true;
+    }
+    let phase = env.objc.borrow::<UITouchHostObject>(touch).phase;
+    phase == UITouchPhaseEnded || phase == UITouchPhaseCancelled
+}
+
+fn touchhle_new_event_for_current_touches(env: &mut Environment, include_ended_touches: bool) -> id {
+    let all_touches_set: id = msg_class![env;
+        NSMutableSet
+        allocWithZone:(MutVoidPtr::null())];
+
+    let existing: Vec<id> = env
+        .framework_state
+        .uikit
+        .ui_touch
+        .current_touches
+        .values()
+        .cloned()
+        .collect();
+    for touch in existing {
+        let _: () = msg![env; all_touches_set addObject:touch];
+    }
+
+    let event = if include_ended_touches {
+        ui_event::new_event_including_ended(env, all_touches_set)
+    } else {
+        ui_event::new_event(env, all_touches_set)
+    };
+    release(env, all_touches_set);
+    autorelease(env, event);
+    event
+}
+
+fn touchhle_cancel_stale_active_touch(
+    env: &mut Environment,
+    finger_id: FingerId,
+    timestamp: NSTimeInterval,
+    reason: &str,
+) {
+    let Some(&touch) = env
+        .framework_state
+        .uikit
+        .ui_touch
+        .current_touches
+        .get(&finger_id)
+    else {
+        return;
+    };
+
+    let (view, start_location, location) = {
+        let host = env.objc.borrow::<UITouchHostObject>(touch);
+        (host.view, host.start_location, host.location)
+    };
+
+    {
+        let host = env.objc.borrow_mut::<UITouchHostObject>(touch);
+        host.previous_location = host.location;
+        host.timestamp = timestamp;
+        host.phase = UITouchPhaseCancelled;
+    }
+
+    let touches: id = msg_class![env;
+        NSMutableSet
+        allocWithZone:(MutVoidPtr::null())];
+    let _: () = msg![env; touches addObject:touch];
+
+    // Keep the stale touch in current_touches until after cancellation is sent.
+    // This mirrors real UIKit lifetime: the same UITouch object survives
+    // Began -> Moved -> Cancelled/Ended, and only then leaves the active set.
+    let event = touchhle_new_event_for_current_touches(env, true);
+
+    if view != nil {
+        log!(
+            "UITouch stale cleanup: cancelling finger {:?} touch {:?} on view {:?} ({})",
+            finger_id,
+            touch,
+            view,
+            reason
+        );
+        let _: () = msg![env; view touchesCancelled:touches withEvent:event];
+        touchhle_send_cocos_touch_aliases_to_chain(env, view, "cancelled", touches, event);
+        recognize_swipes(env, view, start_location, location);
+    } else {
+        log!(
+            "UITouch stale cleanup: dropping finger {:?} touch {:?} with nil view ({})",
+            finger_id,
+            touch,
+            reason
+        );
+    }
+
+    release(env, touches);
+
+    if let Some(old_touch) = env
+        .framework_state
+        .uikit
+        .ui_touch
+        .current_touches
+        .remove(&finger_id)
+    {
+        release(env, old_touch);
+    }
+
+    log_dbg!(
+        "UITouch stale cleanup done: active_touches={}",
+        env.framework_state.uikit.ui_touch.current_touches.len()
+    );
+}
+
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -414,11 +527,17 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
             .current_touches
             .contains_key(&finger_id)
         {
-            log!(
-                "Warning: New touch {:?} initiated but old one exists.",
-                finger_id
+            // A fresh down for an already-active finger means SDL/the host lost
+            // the old up, or the platform synthesized duplicate input. Do not
+            // turn this into a move: that keeps Cocos/Kobold2D/Unity gameplay
+            // objects alive forever. First cancel the stale old sequence, then
+            // create a brand-new UITouch for this down.
+            touchhle_cancel_stale_active_touch(
+                env,
+                finger_id,
+                timestamp,
+                "duplicate TouchesDown for active finger",
             );
-            return handle_touches_move(env, HashMap::from([(finger_id, coords)]));
         }
 
         let location = CGPoint {
@@ -446,22 +565,7 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
         retain(env, new_touch);
     }
 
-    let all_touches_set: id = msg_class![env; NSMutableSet
-        allocWithZone:(MutVoidPtr::null())];
-    let existing_touches: Vec<id> = env
-        .framework_state
-        .uikit
-        .ui_touch
-        .current_touches
-        .values()
-        .cloned()
-        .collect();
-    for touch in existing_touches {
-        let _: () = msg![env; all_touches_set addObject:touch];
-    }
-
-    let event = ui_event::new_event(env, all_touches_set);
-    autorelease(env, event);
+    let event = touchhle_new_event_for_current_touches(env, false);
     let views_with_existing_touches: HashSet<id> = env
         .framework_state
         .uikit
@@ -566,15 +670,12 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
                 .collect();
             if !stuck.is_empty() {
                 for fid in stuck {
-                    if let Some(t) = env
-                        .framework_state
-                        .uikit
-                        .ui_touch
-                        .current_touches
-                        .remove(&fid)
-                    {
-                        release(env, t);
-                    }
+                    touchhle_cancel_stale_active_touch(
+                        env,
+                        fid,
+                        timestamp,
+                        "single-touch view received a new touch before old touch ended",
+                    );
                 }
             } else {
                 continue;
@@ -603,9 +704,16 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
         let _: () = msg![env;
             view touchesBegan:v_set withEvent:event];
         touchhle_send_cocos_touch_aliases_to_chain(env, view, "began", v_set, event);
+        release(env, v_set);
     }
+    release(env, touches);
+    log_dbg!(
+        "UITouch touchesDown done: active_touches={}",
+        env.framework_state.uikit.ui_touch.current_touches.len()
+    );
     release(env, pool);
 }
+
 
 fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     let pool: id = msg_class![env;
@@ -650,29 +758,16 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
         let _: () = msg![env; v_set addObject:touch];
     }
 
-    let all_touches_set: id = msg_class![env; NSMutableSet
-        allocWithZone:(MutVoidPtr::null())];
-    let existing: Vec<id> = env
-        .framework_state
-        .uikit
-        .ui_touch
-        .current_touches
-        .values()
-        .cloned()
-        .collect();
-    for t in existing {
-        let _: () = msg![env; all_touches_set addObject:t];
-    }
-
-    let event = ui_event::new_event(env, all_touches_set);
-    autorelease(env, event);
+    let event = touchhle_new_event_for_current_touches(env, false);
     for (view, v_set) in view_touches {
         let _: () = msg![env;
             view touchesMoved:v_set withEvent:event];
         touchhle_send_cocos_touch_aliases_to_chain(env, view, "moved", v_set, event);
+        release(env, v_set);
     }
     release(env, pool);
 }
+
 
 
 fn ultrahle_minionjump_drain_pending_callback(env: &mut Environment, select_only: bool) {
@@ -752,25 +847,8 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
         msg![env; pi systemUptime]
     };
 
-    let touches: id = msg_class![env;
-        NSMutableSet
-        allocWithZone:(MutVoidPtr::null())];
-    let all_touches_set: id = msg_class![env;
-        NSMutableSet
-        allocWithZone:(MutVoidPtr::null())];
-    let existing: Vec<id> = env
-        .framework_state
-        .uikit
-        .ui_touch
-        .current_touches
-        .values()
-        .cloned()
-        .collect();
-    for t in existing {
-        let _: () = msg![env; all_touches_set addObject:t];
-    }
-
     let mut view_touches: HashMap<id, id> = HashMap::new();
+    let mut ended_fingers: Vec<FingerId> = Vec::new();
     // (view, start_location, end_location) for swipe gesture detection.
     let mut swipe_candidates: Vec<(id, CGPoint, CGPoint)> = Vec::new();
     for (finger_id, coords) in map {
@@ -801,9 +879,6 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
             swipe_candidates.push((view, start_location, location));
         }
 
-        let _: () = msg![env;
-            touches addObject:touch];
-
         if let Entry::Vacant(e) = view_touches.entry(view) {
             let s: id = msg_class![env;
                 NSMutableSet
@@ -812,25 +887,43 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
         }
         let v_set: id = *view_touches.get(&view).unwrap();
         let _: () = msg![env; v_set addObject:touch];
-        env.framework_state
-            .uikit
-            .ui_touch
-            .current_touches
-            .remove(&finger_id);
-        release(env, touch);
+        ended_fingers.push(finger_id);
     }
 
-    let event = ui_event::new_event(env, all_touches_set);
-    autorelease(env, event);
+    // Create the UIEvent while ended touches are still in current_touches.
+    // The game must receive the exact same UITouch object that began/moved,
+    // with phase == Ended, before we clear our active-touch map.
+    let event = touchhle_new_event_for_current_touches(env, true);
     for (view, v_set) in view_touches {
         let _: () = msg![env;
             view touchesEnded:v_set withEvent:event];
         touchhle_send_cocos_touch_aliases_to_chain(env, view, "ended", v_set, event);
+        release(env, v_set);
     }
     for (view, start, end) in swipe_candidates {
         recognize_taps(env, view, start, end);
         recognize_swipes(env, view, start, end);
     }
+
+    // Only now is it safe to remove/release the touches. Removing before the
+    // touchesEnded dispatch makes Cocos/Kobold2D/Unity code miss the release,
+    // which leaves weapons/buttons/drag objects alive forever.
+    for finger_id in ended_fingers {
+        if let Some(touch) = env
+            .framework_state
+            .uikit
+            .ui_touch
+            .current_touches
+            .remove(&finger_id)
+        {
+            release(env, touch);
+        }
+    }
+
+    log_dbg!(
+        "UITouch touchesUp cleanup done: active_touches={}",
+        env.framework_state.uikit.ui_touch.current_touches.len()
+    );
 
     // ULTRAHLE_MINIONJUMP_DRAIN_SELECT_BEGIN
     ultrahle_minionjump_drain_pending_callback(env, true);
@@ -841,6 +934,7 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
 
     release(env, pool);
 }
+
 
 
 fn recognize_taps(env: &mut Environment, view: id, start: CGPoint, end: CGPoint) {
