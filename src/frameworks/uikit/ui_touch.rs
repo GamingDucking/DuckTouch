@@ -77,7 +77,7 @@ fn touchhle_cocos_is_gl_or_game_view_name(class_name: &str) -> bool {
 fn touchhle_should_use_landscape_touch_remap(env: &Environment) -> bool {
     match env.bundle.bundle_identifier() {
         // Confirmed landscape Source/Cocos games.
-        "at.source.veggie1" | "at.source.potato3D" | "at.source.potpan" => true,
+        "at.source.veggie1" | "at.source.potato3D" | "at.source.potpan" | "com.robtop.geometryjump" => true,
 
         // TomatoZombie is native portrait.
         "at.source.tomzom" => false,
@@ -91,22 +91,8 @@ fn touchhle_should_use_landscape_touch_remap(env: &Environment) -> bool {
 }
 
 fn should_remap_touch_location_for_view(env: &mut Environment, view: id) -> bool {
-    match env.bundle.bundle_identifier() {
-        // Confirmed/wip landscape Source/Cocos games.
-        "at.source.veggie1" | "at.source.potato3D" | "at.source.potpan" => return true,
-
-        // TomatoZombie is native portrait.
-        "at.source.tomzom" => return false,
-
-        _ => {}
-    }
-
-    if std::env::var_os("TOUCHHLE_TOUCH_LOCATION_PORTRAIT_TO_LANDSCAPE").is_some()
-        || std::env::var_os("TOUCHHLE_COCOS_TOUCH_REMAP").is_some()
-        || std::env::var_os("TOUCHHLE_UNITY_TOUCH_REMAP").is_some()
-        || std::env::var_os("TOUCHHLE_ENGINE_TOUCH_REMAP").is_some()
-    {
-        return true;
+    if !touchhle_should_use_landscape_touch_remap(env) {
+        return false;
     }
 
     if view == nil { return false; }
@@ -132,7 +118,7 @@ fn touchhle_cocos_remap_point(env: &mut Environment, view: id, point: CGPoint) -
     let (target_w, target_h) = touchhle_cocos_target_size();
     let mode = std::env::var("TOUCHHLE_TOUCH_MODE").unwrap_or_else(|_| {
         match env.bundle.bundle_identifier() {
-            "at.source.veggie1" | "at.source.potato3D" | "at.source.potpan" => "scale".to_string(),
+            "at.source.veggie1" | "at.source.potato3D" | "at.source.potpan" | "com.robtop.geometryjump" => "scale".to_string(),
             _ => std::env::var("TOUCHHLE_COCOS_TOUCH_MODE")
                 .or_else(|_| std::env::var("TOUCHHLE_UNITY_TOUCH_MODE"))
                 .or_else(|_| std::env::var("TOUCHHLE_ENGINE_TOUCH_MODE"))
