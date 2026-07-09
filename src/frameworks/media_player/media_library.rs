@@ -21,12 +21,10 @@ impl HostObject for MPMediaLibraryHostObject {}
 
 pub const MPMediaLibraryDidChangeNotification: &str = "MPMediaLibraryDidChangeNotification";
 
-pub const CONSTANTS: ConstantExports = &[
-    (
-        "_MPMediaLibraryDidChangeNotification",
-        HostConstant::NSString(MPMediaLibraryDidChangeNotification),
-    ),
-];
+pub const CONSTANTS: ConstantExports = &[(
+    "_MPMediaLibraryDidChangeNotification",
+    HostConstant::NSString(MPMediaLibraryDidChangeNotification),
+)];
 
 pub const CLASSES: ClassExports = objc_classes! {
 

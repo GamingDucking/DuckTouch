@@ -457,7 +457,10 @@ fn objc_msgSend_inner(
                     .as_any()
                     .downcast_ref::<super::ClassHostObject>()
                     .unwrap();
-                (class_host_object.name.clone(), class_host_object.is_metaclass)
+                (
+                    class_host_object.name.clone(),
+                    class_host_object.is_metaclass,
+                )
             };
 
             let missing_selector_name = selector.as_str(&env.mem).to_owned();
@@ -851,7 +854,11 @@ fn cocos_selector_log_once(class_name: &str, selector: &str, note: &str) {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
     static SEEN: OnceLock<Mutex<HashSet<(String, String, String)>>> = OnceLock::new();
-    let key = (class_name.to_string(), selector.to_string(), note.to_string());
+    let key = (
+        class_name.to_string(),
+        selector.to_string(),
+        note.to_string(),
+    );
     let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
     if seen.lock().unwrap().insert(key) {
         log_dbg!(
@@ -961,25 +968,47 @@ fn is_cocos_selector_name(sel: &str) -> bool {
 fn is_safe_uikit_lifecycle_selector(sel: &str) -> bool {
     matches!(
         sel,
-        "viewDidLoad" | "viewDidUnload" | "viewWillAppear:" | "viewDidAppear:" |
-        "viewWillDisappear:" | "viewDidDisappear:" | "viewWillLayoutSubviews" |
-        "viewDidLayoutSubviews" | "didReceiveMemoryWarning" | "loadView" |
-        "willMoveToSuperview:" | "didMoveToSuperview" | "willMoveToWindow:" |
-        "didMoveToWindow" | "didAddSubview:" | "willRemoveSubview:" |
-        "layoutSubviews" | "setNeedsLayout" | "layoutIfNeeded" |
-        "setNeedsDisplay" | "setNeedsDisplayInRect:" | "drawRect:" |
-        "applicationWillResignActive:" | "applicationDidBecomeActive:" |
-        "applicationDidEnterBackground:" | "applicationWillEnterForeground:" |
-        "applicationWillTerminate:" | "applicationDidReceiveMemoryWarning:" |
-        "application:didFinishLaunchingWithOptions:" |
-        "applicationDidFinishLaunching:" |
-        "applicationWillResignActive" | "applicationDidBecomeActive" |
-        "applicationDidEnterBackground" | "applicationWillEnterForeground" |
-        "willRotateToInterfaceOrientation:duration:" |
-        "didRotateFromInterfaceOrientation:" |
-        "willAnimateRotationToInterfaceOrientation:duration:" |
-        "touchesBegan:withEvent:" | "touchesMoved:withEvent:" |
-        "touchesEnded:withEvent:" | "touchesCancelled:withEvent:"
+        "viewDidLoad"
+            | "viewDidUnload"
+            | "viewWillAppear:"
+            | "viewDidAppear:"
+            | "viewWillDisappear:"
+            | "viewDidDisappear:"
+            | "viewWillLayoutSubviews"
+            | "viewDidLayoutSubviews"
+            | "didReceiveMemoryWarning"
+            | "loadView"
+            | "willMoveToSuperview:"
+            | "didMoveToSuperview"
+            | "willMoveToWindow:"
+            | "didMoveToWindow"
+            | "didAddSubview:"
+            | "willRemoveSubview:"
+            | "layoutSubviews"
+            | "setNeedsLayout"
+            | "layoutIfNeeded"
+            | "setNeedsDisplay"
+            | "setNeedsDisplayInRect:"
+            | "drawRect:"
+            | "applicationWillResignActive:"
+            | "applicationDidBecomeActive:"
+            | "applicationDidEnterBackground:"
+            | "applicationWillEnterForeground:"
+            | "applicationWillTerminate:"
+            | "applicationDidReceiveMemoryWarning:"
+            | "application:didFinishLaunchingWithOptions:"
+            | "applicationDidFinishLaunching:"
+            | "applicationWillResignActive"
+            | "applicationDidBecomeActive"
+            | "applicationDidEnterBackground"
+            | "applicationWillEnterForeground"
+            | "willRotateToInterfaceOrientation:duration:"
+            | "didRotateFromInterfaceOrientation:"
+            | "willAnimateRotationToInterfaceOrientation:duration:"
+            | "touchesBegan:withEvent:"
+            | "touchesMoved:withEvent:"
+            | "touchesEnded:withEvent:"
+            | "touchesCancelled:withEvent:"
     )
 }
 
@@ -1066,18 +1095,36 @@ fn try_cocos_missing_selector_compat(
     // Common YES defaults that keep active Cocos nodes alive.
     if matches!(
         selector_name,
-        "isRunning" | "running" | "isVisible" | "visible" |
-        "isEnabled" | "enabled" | "isTouchEnabled" | "touchEnabled" |
-        "isAccelerometerEnabled" | "accelerometerEnabled" |
-        "isKeyboardEnabled" | "keyboardEnabled" |
-        "isUserInteractionEnabled" | "userInteractionEnabled" |
-        "isRelativeAnchorPoint" | "relativeAnchorPoint" |
-        "shouldAutorotate" | "shouldAutorotateToInterfaceOrientation:" |
-        "prefersStatusBarHidden" | "isViewLoaded" |
-        "shouldAutorotateToInterfaceOrientation" |
-        "shouldUseAutorotation" | "unityIsReady" | "isUnityReady" |
-        "requiresOpenGLES2" | "shouldAttachRenderDelegate" |
-        "isActive" | "active" | "acceptsFirstResponder" | "canBecomeFirstResponder"
+        "isRunning"
+            | "running"
+            | "isVisible"
+            | "visible"
+            | "isEnabled"
+            | "enabled"
+            | "isTouchEnabled"
+            | "touchEnabled"
+            | "isAccelerometerEnabled"
+            | "accelerometerEnabled"
+            | "isKeyboardEnabled"
+            | "keyboardEnabled"
+            | "isUserInteractionEnabled"
+            | "userInteractionEnabled"
+            | "isRelativeAnchorPoint"
+            | "relativeAnchorPoint"
+            | "shouldAutorotate"
+            | "shouldAutorotateToInterfaceOrientation:"
+            | "prefersStatusBarHidden"
+            | "isViewLoaded"
+            | "shouldAutorotateToInterfaceOrientation"
+            | "shouldUseAutorotation"
+            | "unityIsReady"
+            | "isUnityReady"
+            | "requiresOpenGLES2"
+            | "shouldAttachRenderDelegate"
+            | "isActive"
+            | "active"
+            | "acceptsFirstResponder"
+            | "canBecomeFirstResponder"
     ) {
         cocos_selector_log_once(class_name, selector_name, "YES");
         objc_ret_u32(env, 1);
@@ -1087,17 +1134,37 @@ fn try_cocos_missing_selector_compat(
     // Common NO defaults for optional Cocos flags.
     if matches!(
         selector_name,
-        "isCascadeColorEnabled" | "cascadeColorEnabled" |
-        "isCascadeOpacityEnabled" | "cascadeOpacityEnabled" |
-        "isOpacityModifyRGB" | "doesOpacityModifyRGB" |
-        "ignoreAnchorPointForPosition" | "isIgnoreAnchorPointForPosition" |
-        "isFlipX" | "flipX" | "isFlipY" | "flipY" |
-        "isTextureRectRotated" | "textureRectRotated" |
-        "isDirty" | "dirty" | "isClosed" | "closed" |
-        "isPaused" | "paused" | "isSelected" | "selected" |
-        "hasActions" | "hasVisibleParents" | "isKeyboardShown" |
-        "isKeyboardVisible" | "keyboardVisible" | "isShowingKeyboard" |
-        "useAnimatedAutorotation" | "isRenderingPaused" | "renderingPaused"
+        "isCascadeColorEnabled"
+            | "cascadeColorEnabled"
+            | "isCascadeOpacityEnabled"
+            | "cascadeOpacityEnabled"
+            | "isOpacityModifyRGB"
+            | "doesOpacityModifyRGB"
+            | "ignoreAnchorPointForPosition"
+            | "isIgnoreAnchorPointForPosition"
+            | "isFlipX"
+            | "flipX"
+            | "isFlipY"
+            | "flipY"
+            | "isTextureRectRotated"
+            | "textureRectRotated"
+            | "isDirty"
+            | "dirty"
+            | "isClosed"
+            | "closed"
+            | "isPaused"
+            | "paused"
+            | "isSelected"
+            | "selected"
+            | "hasActions"
+            | "hasVisibleParents"
+            | "isKeyboardShown"
+            | "isKeyboardVisible"
+            | "keyboardVisible"
+            | "isShowingKeyboard"
+            | "useAnimatedAutorotation"
+            | "isRenderingPaused"
+            | "renderingPaused"
     ) {
         cocos_selector_log_once(class_name, selector_name, "NO");
         objc_ret_zero(env);
@@ -1107,17 +1174,38 @@ fn try_cocos_missing_selector_compat(
     // Integer-ish defaults.
     if matches!(
         selector_name,
-        "tag" | "zOrder" | "getZOrder" | "vertexZ" | "orderOfArrival" |
-        "priority" | "touchPriority" | "handlerPriority" | "atlasIndex" |
-        "numberOfRunningActions" | "runningActions" | "count" |
-        "childrenCount" | "opacity" | "displayedOpacity" |
-        "getOpacity" | "getDisplayedOpacity" | "level" | "stage" |
-        "state" | "orientation" | "supportedInterfaceOrientations" |
-        "application:supportedInterfaceOrientationsForWindow:" |
-        "supportedInterfaceOrientationsForWindow:" |
-        "interfaceOrientation" | "statusBarOrientation" |
-        "currentOrientation" | "targetFrameRate" | "preferredFramesPerSecond" |
-        "renderingAPI" | "graphicsDeviceType" | "displayIndex"
+        "tag"
+            | "zOrder"
+            | "getZOrder"
+            | "vertexZ"
+            | "orderOfArrival"
+            | "priority"
+            | "touchPriority"
+            | "handlerPriority"
+            | "atlasIndex"
+            | "numberOfRunningActions"
+            | "runningActions"
+            | "count"
+            | "childrenCount"
+            | "opacity"
+            | "displayedOpacity"
+            | "getOpacity"
+            | "getDisplayedOpacity"
+            | "level"
+            | "stage"
+            | "state"
+            | "orientation"
+            | "supportedInterfaceOrientations"
+            | "application:supportedInterfaceOrientationsForWindow:"
+            | "supportedInterfaceOrientationsForWindow:"
+            | "interfaceOrientation"
+            | "statusBarOrientation"
+            | "currentOrientation"
+            | "targetFrameRate"
+            | "preferredFramesPerSecond"
+            | "renderingAPI"
+            | "graphicsDeviceType"
+            | "displayIndex"
     ) {
         let value = match selector_name {
             "opacity" | "displayedOpacity" | "getOpacity" | "getDisplayedOpacity" => 255,
@@ -1135,9 +1223,18 @@ fn try_cocos_missing_selector_compat(
     // Float / CGFloat defaults.
     if matches!(
         selector_name,
-        "scale" | "scaleX" | "scaleY" | "getScale" | "getScaleX" | "getScaleY" |
-        "contentScaleFactor" | "screenScale" | "getContentScaleFactor" |
-        "nativeScale" | "renderScale" | "dpiScale"
+        "scale"
+            | "scaleX"
+            | "scaleY"
+            | "getScale"
+            | "getScaleX"
+            | "getScaleY"
+            | "contentScaleFactor"
+            | "screenScale"
+            | "getContentScaleFactor"
+            | "nativeScale"
+            | "renderScale"
+            | "dpiScale"
     ) {
         cocos_selector_log_once(class_name, selector_name, "1.0f");
         objc_ret_f32(env, 1.0);
@@ -1145,18 +1242,40 @@ fn try_cocos_missing_selector_compat(
     }
     if matches!(
         selector_name,
-        "rotation" | "rotationX" | "rotationY" | "skewX" | "skewY" |
-        "getRotation" | "getRotationX" | "getRotationY" |
-        "getSkewX" | "getSkewY" | "anchorPointInPoints" |
-        "positionX" | "positionY" | "getPositionX" | "getPositionY" |
-        "cameraEyeX" | "cameraEyeY" | "cameraEyeZ"
+        "rotation"
+            | "rotationX"
+            | "rotationY"
+            | "skewX"
+            | "skewY"
+            | "getRotation"
+            | "getRotationX"
+            | "getRotationY"
+            | "getSkewX"
+            | "getSkewY"
+            | "anchorPointInPoints"
+            | "positionX"
+            | "positionY"
+            | "getPositionX"
+            | "getPositionY"
+            | "cameraEyeX"
+            | "cameraEyeY"
+            | "cameraEyeZ"
     ) {
         cocos_selector_log_once(class_name, selector_name, "0.0f");
         objc_ret_f32(env, 0.0);
         return true;
     }
-    if matches!(selector_name, "animationInterval" | "dt" | "delta" | "timeScale" | "fixedDeltaTime") {
-        let value = if selector_name == "animationInterval" { 1.0 / 60.0 } else if selector_name == "timeScale" { 1.0 } else { 0.0 };
+    if matches!(
+        selector_name,
+        "animationInterval" | "dt" | "delta" | "timeScale" | "fixedDeltaTime"
+    ) {
+        let value = if selector_name == "animationInterval" {
+            1.0 / 60.0
+        } else if selector_name == "timeScale" {
+            1.0
+        } else {
+            0.0
+        };
         cocos_selector_log_once(class_name, selector_name, "double default");
         objc_ret_f64(env, value);
         return true;
@@ -1165,7 +1284,12 @@ fn try_cocos_missing_selector_compat(
     // Return self for chainable init/autorelease-ish Cocos factories when they
     // are missing on a fake/unimplemented class. For class methods, returning
     // the class itself is worse than nil, so only do this for instances.
-    if !is_metaclass && matches!(selector_name, "init" | "initWithCoder:" | "autorelease" | "retain") {
+    if !is_metaclass
+        && matches!(
+            selector_name,
+            "init" | "initWithCoder:" | "autorelease" | "retain"
+        )
+    {
         cocos_selector_log_once(class_name, selector_name, "self");
         objc_ret_id(env, receiver);
         return true;
@@ -1176,17 +1300,48 @@ fn try_cocos_missing_selector_compat(
     // returns nil, but this keeps logs cleaner for high-frequency game loops.
     if matches!(
         selector_name,
-        "parent" | "children" | "scheduler" | "actionManager" |
-        "touchDispatcher" | "texture" | "spriteFrame" | "batchNode" |
-        "camera" | "grid" | "shaderProgram" | "userData" |
-        "userObject" | "delegate" | "target" | "selector" |
-        "nextResponder" | "window" | "view" | "rootViewController" |
-        "navigationController" | "scene" | "runningScene" |
-        "unityView" | "rootView" | "mainDisplay" | "displayLink" |
-        "renderDelegate" | "renderingView" | "glView" | "eaglView" |
-        "unityKeyboard" | "keyboard" | "textInput" | "inputView" |
-        "displayManager" | "displayConnection" | "viewController" |
-        "controller" | "screens" | "currentScreen" | "mainScreen"
+        "parent"
+            | "children"
+            | "scheduler"
+            | "actionManager"
+            | "touchDispatcher"
+            | "texture"
+            | "spriteFrame"
+            | "batchNode"
+            | "camera"
+            | "grid"
+            | "shaderProgram"
+            | "userData"
+            | "userObject"
+            | "delegate"
+            | "target"
+            | "selector"
+            | "nextResponder"
+            | "window"
+            | "view"
+            | "rootViewController"
+            | "navigationController"
+            | "scene"
+            | "runningScene"
+            | "unityView"
+            | "rootView"
+            | "mainDisplay"
+            | "displayLink"
+            | "renderDelegate"
+            | "renderingView"
+            | "glView"
+            | "eaglView"
+            | "unityKeyboard"
+            | "keyboard"
+            | "textInput"
+            | "inputView"
+            | "displayManager"
+            | "displayConnection"
+            | "viewController"
+            | "controller"
+            | "screens"
+            | "currentScreen"
+            | "mainScreen"
     ) {
         cocos_selector_log_once(class_name, selector_name, "nil object");
         objc_ret_zero(env);
