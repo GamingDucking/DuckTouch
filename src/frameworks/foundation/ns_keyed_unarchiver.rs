@@ -12,6 +12,7 @@
 //! - Apple's [Archives and Serializations Programming Guide](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/Archiving/Articles/archives.html)
 
 use super::ns_string::{from_rust_string, get_static_str, to_rust_string};
+use super::ns_value::NSNumberHostObject;
 use crate::dyld::{ConstantExports, HostConstant};
 use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::{NSInteger, NSUInteger};
@@ -173,6 +174,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (id)delegate {
     env.objc.borrow::<NSKeyedUnarchiverHostObject>(this).delegate
+}
+
+- (bool)allowsKeyedCoding {
+    true
 }
 
 // These methods drive most of the decoding. They get called in two cases:
@@ -382,6 +387,56 @@ fn get_value_to_decode_for_key(env: &mut Environment, unarchiver: id, key: id) -
     };
     let scope = scope_value.as_dictionary()?;
     scope.get(&key)
+}
+
+fn number_from_plist_value(value: &Value) -> Option<NSNumberHostObject> {
+    match value {
+        Value::Boolean(value) => Some(NSNumberHostObject::Bool(*value)),
+        Value::Integer(value) => value
+            .as_signed()
+            .map(NSNumberHostObject::LongLong)
+            .or_else(|| value.as_unsigned().map(NSNumberHostObject::UnsignedLongLong)),
+        Value::Real(value) => Some(NSNumberHostObject::Double(*value)),
+        _ => None,
+    }
+}
+
+pub(super) fn decode_current_number(
+    env: &mut Environment,
+    unarchiver: id,
+) -> Option<NSNumberHostObject> {
+    let host_obj = borrow_host_obj(env, unarchiver);
+    let current_key = host_obj.current_key?;
+    let objects = host_obj.plist.get("$objects")?.as_array()?;
+    let item = objects.get(current_key.get() as usize)?.as_dictionary()?;
+
+    if let Some(value) = item.get("NS.number") {
+        return number_from_plist_value(value);
+    }
+    if let Some(value) = item.get("NS.boolval") {
+        return value
+            .as_boolean()
+            .map(NSNumberHostObject::Bool)
+            .or_else(|| value.as_signed_integer().map(|value| NSNumberHostObject::Bool(value != 0)))
+            .or_else(|| value.as_unsigned_integer().map(|value| NSNumberHostObject::Bool(value != 0)));
+    }
+    if let Some(value) = item.get("NS.intval") {
+        return value
+            .as_signed_integer()
+            .map(NSNumberHostObject::LongLong)
+            .or_else(|| value.as_unsigned_integer().map(NSNumberHostObject::UnsignedLongLong));
+    }
+    if let Some(value) = item.get("NS.dblval") {
+        return value
+            .as_real()
+            .map(NSNumberHostObject::Double)
+            .or_else(|| value.as_signed_integer().map(|value| NSNumberHostObject::Double(value as f64)))
+            .or_else(|| value.as_unsigned_integer().map(|value| NSNumberHostObject::Double(value as f64)));
+    }
+
+    item.get("NS.numbervalue")
+        .or_else(|| item.get("$0"))
+        .and_then(number_from_plist_value)
 }
 
 /// The core of the implementation: unarchive something by its uid.
@@ -648,3 +703,4 @@ fn keys_for_key(env: &mut Environment, unarchiver: id, key: &str) -> Vec<Uid> {
         .filter_map(|value| value.as_uid().copied())
         .collect()
 }
+

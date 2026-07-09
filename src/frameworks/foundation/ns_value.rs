@@ -6,7 +6,10 @@
 //! The `NSValue` class cluster, including `NSNumber`.
 
 use super::ns_string::{from_rust_ordering, from_rust_string};
-use super::{_nib_archive_decoder, NSComparisonResult, NSOrderedSame, NSRange, NSUInteger};
+use super::{
+    _nib_archive_decoder, ns_keyed_unarchiver, NSComparisonResult, NSOrderedSame, NSRange,
+    NSUInteger,
+};
 use crate::frameworks::core_foundation::cf_number::{
     kCFNumberCFIndexType,
     kCFNumberCGFloatType,
@@ -644,25 +647,53 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)initWithCoder:(id)coder {
     let class: Class = msg![env; coder class];
     let nib_archive_class: Class = msg_class![env; _touchHLE_NIBArchiveDecoder class];
-    let new_num = if env.objc.class_is_subclass_of(class, nib_archive_class) {
-        _nib_archive_decoder::decode_current_number(env, coder)
-    } else {
-        // Non-NIB coders (e.g. NSKeyedUnarchiver) for NSNumber are not
-        // fully supported yet. Return a zero NSNumber instead of crashing
-        // the host, mirroring the behaviour of a missing decoder.
-        log!(
-            "Warning: [NSNumber initWithCoder:{:?}] not implemented for coder class {:?}; returning numberWithInt:0.",
-            coder,
-            class
-        );
-        msg_class![env; NSNumber numberWithInt:(0_i32)]
-    };
+    if env.objc.class_is_subclass_of(class, nib_archive_class) {
+        let new_num = _nib_archive_decoder::decode_current_number(env, coder);
+        release(env, this);
+        return new_num;
+    }
+
+    let keyed_unarchiver_class: Class = msg_class![env; NSKeyedUnarchiver class];
+    if env.objc.class_is_subclass_of(class, keyed_unarchiver_class) {
+        let Some(value) = ns_keyed_unarchiver::decode_current_number(env, coder) else {
+            release(env, this);
+            return nil;
+        };
+        *env.objc.borrow_mut::<NSNumberHostObject>(this) = value;
+        return this;
+    }
+
+    let allows_keyed_sel: SEL = env
+        .objc
+        .register_host_selector("allowsKeyedCoding".to_string(), &mut env.mem);
+    let allows_keyed: bool = msg![env; coder respondsToSelector:allows_keyed_sel]
+        && msg![env; coder allowsKeyedCoding];
+    if !allows_keyed {
+        release(env, this);
+        return nil;
+    }
+
+    for (key, kind) in [("NS.boolval", 0_u8), ("NS.intval", 1), ("NS.dblval", 2)] {
+        let key = from_rust_string(env, key.to_string());
+        let key = autorelease(env, key);
+        let contains: bool = msg![env; coder containsValueForKey:key];
+        if !contains {
+            continue;
+        }
+        let value = match kind {
+            0 => NSNumberHostObject::Bool(msg![env; coder decodeBoolForKey:key]),
+            1 => NSNumberHostObject::LongLong(msg![env; coder decodeInt64ForKey:key]),
+            _ => NSNumberHostObject::Double(msg![env; coder decodeDoubleForKey:key]),
+        };
+        *env.objc.borrow_mut::<NSNumberHostObject>(this) = value;
+        return this;
+    }
+
     release(env, this);
-    new_num
+    nil
 }
 
 - (())encodeWithCoder:(id)coder {
-    // 1. Проверяем, поддерживает ли кодер Keyed Archiving (как это делает реальная iOS)
     let sel_allows: SEL = env.objc.register_host_selector("allowsKeyedCoding".to_string(), &mut env.mem);
     let allows_keyed: bool = if msg![env; coder respondsToSelector:sel_allows] {
         msg![env; coder allowsKeyedCoding]
@@ -670,42 +701,28 @@ pub const CLASSES: ClassExports = objc_classes! {
         false
     };
 
-    // 2. Если это NSKeyedArchiver, мы ОБЯЗАНЫ использовать кодирование по ключу,
-    // так как он не поддерживает сырое кодирование байтов (encodeValueOfObjCType:at:)
     if allows_keyed {
-        let key = from_rust_string(env, "NS.numbervalue".to_string());
+        let (key, kind) = match env.objc.borrow::<NSNumberHostObject>(this) {
+            NSNumberHostObject::Bool(_) => ("NS.boolval", 0_u8),
+            value if value.is_float() => ("NS.dblval", 2),
+            _ => ("NS.intval", 1),
+        };
+        let key = from_rust_string(env, key.to_string());
         let key = autorelease(env, key);
-
-        let num_obj = env.objc.borrow::<NSNumberHostObject>(this);
-        if num_obj.is_float() {
-            let val: f64 = num_obj.as_double();
-            let sel: SEL = env.objc.register_host_selector("encodeDouble:forKey:".to_string(), &mut env.mem);
-            if msg![env; coder respondsToSelector:sel] {
-                () = msg![env; coder encodeDouble:val forKey:key];
-            } else {
-                // Фолбек на строку, если эмулятор пока не реализовал encodeDouble:forKey:
-                let str: id = msg![env; this stringValue];
-                () = msg![env; coder encodeObject:str forKey:key];
+        match kind {
+            0 => {
+                let value = env.objc.borrow::<NSNumberHostObject>(this).as_bool();
+                () = msg![env; coder encodeBool:value forKey:key];
             }
-        } else {
-            let val: i64 = num_obj.as_long_long();
-            let sel: SEL = env.objc.register_host_selector("encodeInt64:forKey:".to_string(), &mut env.mem);
-            if msg![env; coder respondsToSelector:sel] {
-                () = msg![env; coder encodeInt64:val forKey:key];
-            } else {
-                // Фолбек на строку
-                let str: id = msg![env; this stringValue];
-                () = msg![env; coder encodeObject:str forKey:key];
+            1 => {
+                let value = env.objc.borrow::<NSNumberHostObject>(this).as_long_long();
+                () = msg![env; coder encodeInt64:value forKey:key];
+            }
+            _ => {
+                let value = env.objc.borrow::<NSNumberHostObject>(this).as_double();
+                () = msg![env; coder encodeDouble:value forKey:key];
             }
         }
-        return;
-    }
-
-    // 3. Для старых не-keyed архиваторов (например NSArchiver) используем сырые байты.
-    // Обязательно проверяем наличие селектора перед вызовом, чтобы защититься от паники эмулятора.
-    let sel_encode_val: SEL = env.objc.register_host_selector("encodeValueOfObjCType:at:".to_string(), &mut env.mem);
-    if !msg![env; coder respondsToSelector:sel_encode_val] {
-        log!("Warning: Coder does not support encodeValueOfObjCType:at:. Cannot encode NSNumber!");
         return;
     }
 
@@ -1005,3 +1022,4 @@ pub fn is_conversion_lossless(env: &mut Environment, this: id, type_: CFNumberTy
     };
     msg![env; this isEqualToNumber:num2]
 }
+
