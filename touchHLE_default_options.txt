@@ -49,7 +49,10 @@ com.atodab.actane: --landscape-left --button-to-touch=A,430,300 --button-to-touc
 
 # Wolfenstein 3D
 com.idsoftware.wolf3d: --landscape-right
-
+Minion Rush
+com.gameloft.despicableme2--portrait-left--portrait-right--portrait-down
+DespicableMe
+com.namconetworks.despicable--landscape-left--landscape-right
 # Spore Origins
 com.ea.spore.naj.efigsj: --landscape-left --y-tilt-offset=35
 com.ea.spore.row.efigsj: --landscape-left --y-tilt-offset=35
