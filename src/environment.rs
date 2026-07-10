@@ -2444,25 +2444,32 @@ impl Environment {
         // the coroutine boundary so it's ok.
         unsafe impl Send for WindowWrapper<'_> {}
 
+        const NO_WINDOW_MSG: &str =
+            "on_parent_stack_in_coroutine() was called while touchHLE is running in \
+             headless mode (no window). This function is only for code paths that \
+             need a real window (e.g. OpenGL ES, text input, dialogs); headless-safe \
+             callers must check env.window.is_none() first and skip the window-only \
+             work instead of routing through here.";
+
         if !self.yielder.is_null() {
             unsafe {
                 let yielder = self.yielder.as_ref().unwrap();
                 let wrapped = WindowWrapper {
-                    window: self.window.as_mut().unwrap(),
+                    window: self.window.as_mut().expect(NO_WINDOW_MSG),
                 };
                 let res = yielder.on_parent_stack(|| {
                     let wrapped = wrapped;
                     wrapped.window.on_main_stack = true;
                     f(wrapped.window, self.options.as_mut())
                 });
-                self.window.as_mut().unwrap().on_main_stack = false;
+                self.window.as_mut().expect(NO_WINDOW_MSG).on_main_stack = false;
                 res
             }
         } else {
             if let Some(w) = self.window.as_mut() {
                 w.on_main_stack = true;
             }
-            f(self.window.as_mut().unwrap(), self.options.as_mut())
+            f(self.window.as_mut().expect(NO_WINDOW_MSG), self.options.as_mut())
         }
     }
 }
