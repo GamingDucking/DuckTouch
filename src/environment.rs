@@ -466,6 +466,30 @@ impl Environment {
             )))
         };
 
+        // Auto-tune rendering workarounds based on the detected host GPU stack.
+        //
+        // Qualcomm Adreno's *native* OpenGL ES 1.1 driver is unusually strict:
+        // it samples mip-incomplete textures as opaque black (black screen for
+        // games that never set GL_TEXTURE_MIN_FILTER). Google's ANGLE backend
+        // (OpenGL ES over Vulkan) does not have this problem, so when ANGLE is
+        // active we leave everything at its defaults. When we're on the native
+        // Adreno driver and the user hasn't opted in/out explicitly, enable the
+        // texture-min-filter fix-up so these games render instead of showing a
+        // black screen. This mirrors the guidance already documented for
+        // --fix-texture-min-filter.
+        if let Some(ref window) = window {
+            if window.is_adreno_gpu() && !window.is_angle_backend() && !options.fix_texture_min_filter
+            {
+                log!(
+                    "Native Adreno OpenGL ES driver detected: auto-enabling \
+                     --fix-texture-min-filter to avoid black-screen rendering. \
+                     For best results, enable ANGLE for this app (Android 15+ \
+                     system ANGLE, or developer options 'ANGLE Preferences')."
+                );
+                options.fix_texture_min_filter = true;
+            }
+        }
+
         let mut mem = mem::Mem::new();
 
         let is_spore = bundle.bundle_identifier().starts_with("com.ea.spore");
@@ -2420,25 +2444,32 @@ impl Environment {
         // the coroutine boundary so it's ok.
         unsafe impl Send for WindowWrapper<'_> {}
 
+        const NO_WINDOW_MSG: &str =
+            "on_parent_stack_in_coroutine() was called while touchHLE is running in \
+             headless mode (no window). This function is only for code paths that \
+             need a real window (e.g. OpenGL ES, text input, dialogs); headless-safe \
+             callers must check env.window.is_none() first and skip the window-only \
+             work instead of routing through here.";
+
         if !self.yielder.is_null() {
             unsafe {
                 let yielder = self.yielder.as_ref().unwrap();
                 let wrapped = WindowWrapper {
-                    window: self.window.as_mut().unwrap(),
+                    window: self.window.as_mut().expect(NO_WINDOW_MSG),
                 };
                 let res = yielder.on_parent_stack(|| {
                     let wrapped = wrapped;
                     wrapped.window.on_main_stack = true;
                     f(wrapped.window, self.options.as_mut())
                 });
-                self.window.as_mut().unwrap().on_main_stack = false;
+                self.window.as_mut().expect(NO_WINDOW_MSG).on_main_stack = false;
                 res
             }
         } else {
             if let Some(w) = self.window.as_mut() {
                 w.on_main_stack = true;
             }
-            f(self.window.as_mut().unwrap(), self.options.as_mut())
+            f(self.window.as_mut().expect(NO_WINDOW_MSG), self.options.as_mut())
         }
     }
 }
