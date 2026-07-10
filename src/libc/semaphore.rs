@@ -15,7 +15,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use super::errno::{EAGAIN, EINVAL};
+use super::errno::{EAGAIN, EEXIST, EINVAL, ENOENT};
 
 // SEM_FAILED is defined as -1 while having a type of sem_t *
 pub const SEM_FAILED: MutPtr<sem_t> = MutPtr::from_bits(u32::MAX);
@@ -88,35 +88,48 @@ pub fn sem_open(
     // TODO: handle errno properly
     set_errno(env, 0);
 
-    let sem_name = env.mem.cstr_at_utf8(name).unwrap();
-    let sem_name_str = sem_name.to_string();
-    let host_sem_rc =
-        if let Some(existing_host_sem_rc) = State::get(env).named_semaphores.get(sem_name) {
-            if (oflag & O_EXCL) == 0 {
-                // TODO: set errno
-                return SEM_FAILED;
-            }
-            let existing_host_sem = (*existing_host_sem_rc).borrow();
-            if let Some(existing_sem) = existing_host_sem.guest_sem {
-                return existing_sem;
-            }
-            existing_host_sem_rc.clone()
-        } else {
-            if (oflag & O_CREAT) == 0 {
-                // TODO: set errno
-                return SEM_FAILED;
-            }
-            let host_sem_rc = Rc::new(RefCell::new(SemaphoreHostObject {
-                value: value as i32,
-                waiting: HashSet::new(),
-                guest_sem: None,
-                named: true,
-            }));
-            State::get_mut(env)
-                .named_semaphores
-                .insert(sem_name_str, Rc::clone(&host_sem_rc));
-            host_sem_rc
-        };
+    let sem_name_str = env.mem.cstr_at_utf8(name).unwrap().to_string();
+
+    // Look up any existing named semaphore, cloning the `Rc` so we stop
+    // borrowing `env` and can mutate it (e.g. set errno) below.
+    let existing = State::get(env).named_semaphores.get(&sem_name_str).cloned();
+
+    let host_sem_rc = if let Some(existing_host_sem_rc) = existing {
+        // The named semaphore already exists. Per Apple/POSIX `sem_open(2)`:
+        //   * `O_CREAT | O_EXCL` on an existing semaphore fails with `EEXIST`.
+        //   * Otherwise repeated `sem_open()` calls with the same name return
+        //     the same descriptor.
+        // The previous logic was inverted: it returned `SEM_FAILED` whenever
+        // `O_EXCL` was *not* set, so any app that opened the same named
+        // semaphore twice (e.g. from multiple threads) got `SEM_FAILED`
+        // (0xffffffff) and then spun forever calling `sem_wait`/`sem_post` on
+        // the bogus handle.
+        // Reference: https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/sem_open.2.html
+        if (oflag & O_EXCL) != 0 {
+            set_errno(env, EEXIST);
+            return SEM_FAILED;
+        }
+        if let Some(existing_sem) = existing_host_sem_rc.borrow().guest_sem {
+            return existing_sem;
+        }
+        existing_host_sem_rc
+    } else {
+        if (oflag & O_CREAT) == 0 {
+            // `O_CREAT` not set and the named semaphore does not exist: `ENOENT`.
+            set_errno(env, ENOENT);
+            return SEM_FAILED;
+        }
+        let host_sem_rc = Rc::new(RefCell::new(SemaphoreHostObject {
+            value: value as i32,
+            waiting: HashSet::new(),
+            guest_sem: None,
+            named: true,
+        }));
+        State::get_mut(env)
+            .named_semaphores
+            .insert(sem_name_str, Rc::clone(&host_sem_rc));
+        host_sem_rc
+    };
 
     let sem = env.mem.alloc_and_write(0);
     (*host_sem_rc).borrow_mut().guest_sem = Some(sem);
