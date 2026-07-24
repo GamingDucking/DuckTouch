@@ -759,6 +759,15 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     let mut view_touches: HashMap<id, id> = HashMap::new();
     // (view, start_location, end_location) for swipe gesture detection.
     let mut swipe_candidates: Vec<(id, CGPoint, CGPoint)> = Vec::new();
+    // Collect finger_ids to remove from current_touches AFTER touchesEnded is
+    // delivered.  Some apps (e.g. Scarface) retain a UITouch pointer inside
+    // touchesEnded: and then access it on the next run-loop turn.  Releasing
+    // the object before the callback returns causes "Faking borrow for missing
+    // object" warnings because the retain from current_touches has already
+    // been undone and the autorelease pool may have drained.  By deferring the
+    // remove+release until after all touchesEnded: callbacks we guarantee the
+    // objects stay alive throughout the handler.
+    let mut touches_to_remove: Vec<(FingerId, id)> = Vec::new();
     for (finger_id, coords) in map {
         let Some(&touch) = env
             .framework_state
@@ -798,12 +807,10 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
         }
         let v_set: id = *view_touches.get(&view).unwrap();
         let _: () = msg![env; v_set addObject:touch];
-        env.framework_state
-            .uikit
-            .ui_touch
-            .current_touches
-            .remove(&finger_id);
-        release(env, touch);
+        // Defer the remove+release so the touch object is still alive when
+        // touchesEnded:withEvent: runs (and for any cross-run-loop references
+        // the app may hold inside that callback).
+        touches_to_remove.push((finger_id, touch));
     }
 
     let event = ui_event::new_event(env, all_touches_set);
@@ -812,6 +819,20 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
         let _: () = msg![env;
             view touchesEnded:v_set withEvent:event];
         touchhle_send_cocos_touch_aliases_to_chain(env, view, "ended", v_set, event);
+    }
+
+    // Now that all touchesEnded: callbacks have returned, remove the touches
+    // from current_touches and release our retain.  The touch objects are
+    // still in the NSMutableSets held by the per-view v_set locals (via
+    // addObject:, which retains), so they remain alive until those sets are
+    // released when the autorelease pool drains.
+    for (finger_id, touch) in touches_to_remove {
+        env.framework_state
+            .uikit
+            .ui_touch
+            .current_touches
+            .remove(&finger_id);
+        release(env, touch);
     }
     for (view, start, end) in swipe_candidates {
         recognize_taps(env, view, start, end);

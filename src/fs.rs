@@ -722,6 +722,10 @@ pub struct Fs {
     root: FsNode,
     working_directory: GuestPathBuf,
     home_directory: GuestPathBuf,
+    /// Host directory used as a copy-on-write shadow for IPA bundle files.
+    /// When a guest app writes to a read-only IPA bundle file, the file is
+    /// first extracted here and the VFS node is upgraded to a writable Path.
+    cow_dir: Option<PathBuf>,
 }
 impl Fs {
     /// Construct a filesystem containing a home directory for the app, its
@@ -936,10 +940,35 @@ impl Fs {
             .with_child("usr", FsNode::dir().with_child("lib", usr_lib));
         log_dbg!("Initial filesystem layout: {:#?}", root);
 
+        // Prepare the copy-on-write shadow directory for IPA bundle files.
+        // It lives alongside the app's sandbox so CoW'd files persist across
+        // runs (matching the behaviour real iOS would show after the app
+        // modifies its own bundle, which is impossible on a real device but
+        // some games assume it works).
+        let cow_dir = if !read_only_mode {
+            let path = paths::user_data_base_path()
+                .join(paths::SANDBOX_DIR)
+                .join(bundle_id)
+                .join("bundle_cow");
+            if let Err(e) = std::fs::create_dir_all(&path) {
+                log!(
+                    "Warning: Could not create CoW directory at {:?}: {}",
+                    path,
+                    e
+                );
+                None
+            } else {
+                Some(path)
+            }
+        } else {
+            None
+        };
+
         let fs = Fs {
             root,
             working_directory,
             home_directory,
+            cow_dir,
         };
         assert!(fs.lookup_node(&bundle_guest_path).is_some());
         (fs, bundle_guest_path)
@@ -951,6 +980,7 @@ impl Fs {
             root: FsNode::dir(),
             working_directory: GuestPathBuf::from(String::new()),
             home_directory: GuestPathBuf::from(String::new()),
+            cow_dir: None,
         }
     }
 
@@ -1244,7 +1274,7 @@ impl Fs {
         }
     }
 
-    // ИСПРАВЛЕНИЕ: ЧЕСТНАЯ РЕАЛИЗАЦИЯ ПЕРЕИМЕНОВАНИЯ 
+    // ИСПРАВЛ��НИЕ: ЧЕСТНАЯ РЕАЛИЗАЦИЯ ПЕРЕИМЕНОВАНИЯ 
     // Поддерживает и файлы, и директории, обновляет дерево VFS без паники
     pub fn rename<P: AsRef<GuestPath> + Copy>(&mut self, from: P, to: P) -> Result<(), ()> {
         let from_path = from.as_ref();
@@ -1332,69 +1362,212 @@ impl Fs {
 
         let path = path.as_ref();
 
-        let (parent_node, new_filename) = self.lookup_parent_node(path).ok_or(())?;
-        let FsNode::Directory {
-            children,
-            writeable: dir_host_path,
-        } = parent_node
-        else {
-            return Err(());
-        };
+        // We need to inspect the existing node (if any) and decide what to do,
+        // then release all borrows before doing any action that calls
+        // self.lookup_parent_node(&mut self) again.
+        // The action enum carries owned data so all borrows are released before
+        // the match on `action`.
 
         // Open an existing file if possible
 
-        if let Some(existing_file) = children.get(&new_filename) {
+        // What action to take after the borrow of `children` is released.
+        // Using an enum lets us exit the borrow scope before calling
+        // self.lookup_parent_node (which needs &mut self).
+        enum OpenAction {
+            /// Open a regular host file.
+            OpenPath(PathBuf),
+            /// Open an IPA bundle file read-only.
+            OpenIpa,
+            /// Open a resource file by name.
+            OpenResource(String),
+            /// Open a directory.
+            OpenDir,
+            /// Reject the request.
+            Reject,
+            /// Copy-on-Write: extract IPA content to this host path (content
+            /// may already be on disk if `Vec<u8>` is empty).
+            CowIpa(PathBuf, Vec<u8>),
+        }
+
+        // Clone the CoW base path before the mutable borrow of self.root.
+        let cow_base_opt: Option<PathBuf> = self.cow_dir.clone();
+
+        // First borrow scope: inspect existing node, collect all data we need.
+        let (existing_new_filename, action): (String, OpenAction) = {
+            let (parent_node, new_filename) = match self.lookup_parent_node(path) {
+                Some(r) => r,
+                None => return Err(()),
+            };
+            let children = match parent_node {
+                FsNode::Directory {
+                    children,
+                    writeable: _,
+                } => children,
+                _ => return Err(()),
+            };
+        let action: OpenAction = if let Some(existing_file) = children.get(&new_filename) {
             match existing_file {
                 &FsNode::File {
                     ref location,
                     writeable,
                 } => {
                     if !writeable && (append || write) {
-                        log!("Warning: attempt to write to read-only file {:?}", path);
-                        return Err(());
-                    }
-                    match location {
-                        FileLocation::Path(host_path) => {
-                            let file = handle_open_err(
-                                File::options()
-                                    .read(read)
-                                    .write(write)
-                                    .append(append)
-                                    .create(false)
-                                    .truncate(truncate)
-                                    .open(host_path),
-                                host_path,
-                            );
-                            return Ok(GuestFile::File(file));
+                        // Copy-on-Write for IPA bundle files.
+                        if let FileLocation::IpaFileRef(ipa_ref) = location {
+                            if let Some(cow_base) = cow_base_opt.clone() {
+                                let guest_str = path.as_str();
+                                let rel = guest_str.trim_start_matches('/');
+                                let host_path = rel.split('/').fold(cow_base, |acc, c| acc.join(c));
+                                // Read the IPA content now while the borrow is valid.
+                                let content = if !host_path.exists() {
+                                    let mut ipa_file = ipa_ref.open();
+                                    let mut buf = Vec::new();
+                                    match ipa_file.read_to_end(&mut buf) {
+                                        Ok(_) => buf,
+                                        Err(e) => {
+                                            log!(
+                                                "CoW: failed to read IPA content for {:?}: {}",
+                                                path, e
+                                            );
+                                            return Err(());
+                                        }
+                                    }
+                                } else {
+                                    Vec::new() // already on disk
+                                };
+                                OpenAction::CowIpa(host_path, content)
+                            } else {
+                                OpenAction::Reject
+                            }
+                        } else {
+                            OpenAction::Reject
                         }
-                        FileLocation::IpaFileRef(file) => {
-                            assert!(!(writeable || append || write));
-                            return Ok(GuestFile::from_ipa_file(file));
-                        }
-                        FileLocation::ResourceFilePath(name) => {
-                            assert!(!(writeable || append || write));
-                            let resource_file =
-                                handle_open_err(paths::ResourceFile::open(name), name);
-                            return Ok(GuestFile::from_resource_file(resource_file));
+                    } else {
+                        match location {
+                            FileLocation::Path(p) => OpenAction::OpenPath(p.clone()),
+                            FileLocation::IpaFileRef(_) => OpenAction::OpenIpa,
+                            FileLocation::ResourceFilePath(n) => OpenAction::OpenResource(n.clone()),
                         }
                     }
                 }
                 FsNode::Directory { .. } => {
                     if write {
-                        return Err(());
+                        OpenAction::Reject
                     } else {
-                        return Ok(GuestFile::from_directory());
+                        OpenAction::OpenDir
                     }
                 }
             }
+        } else {
+            // File does not exist yet — handled by the create-new path below.
+            OpenAction::Reject // placeholder; will be overridden
         };
-        // Create a new file otherwise
+        (new_filename, action)
+        }; // ← first borrow scope ends here; self.root is fully released
 
+        // --- borrow of children / parent_node is now fully released ---
+        let new_filename = existing_new_filename;
+
+        match action {
+            OpenAction::OpenPath(host_path) => {
+                let file = handle_open_err(
+                    File::options()
+                        .read(read)
+                        .write(write)
+                        .append(append)
+                        .create(false)
+                        .truncate(truncate)
+                        .open(&host_path),
+                    &host_path,
+                );
+                return Ok(GuestFile::File(file));
+            }
+            OpenAction::OpenIpa => {
+                // Re-look up to get the IpaFileRef (read-only, no borrow conflict).
+                let (pn, fname) = self.lookup_parent_node(path).ok_or(())?;
+                if let FsNode::Directory { children, .. } = pn {
+                    if let Some(FsNode::File { location: FileLocation::IpaFileRef(f), .. }) =
+                        children.get(&fname)
+                    {
+                        return Ok(GuestFile::from_ipa_file(f));
+                    }
+                }
+                return Err(());
+            }
+            OpenAction::OpenResource(name) => {
+                let resource_file = handle_open_err(paths::ResourceFile::open(&name), &name);
+                return Ok(GuestFile::from_resource_file(resource_file));
+            }
+            OpenAction::OpenDir => {
+                return Ok(GuestFile::from_directory());
+            }
+            OpenAction::Reject => {
+                // File doesn't exist yet — fall through to the create-new path
+                // below.  Write-to-read-only is already handled by returning
+                // Err(()) inside the action computation block above.
+            }
+            OpenAction::CowIpa(host_path, content) => {
+                // Write the IPA content to the CoW location if needed.
+                if !content.is_empty() {
+                    if let Some(parent) = host_path.parent() {
+                        if let Err(e) = std::fs::create_dir_all(parent) {
+                            log!(
+                                "CoW: failed to create directories for {:?}: {}",
+                                host_path, e
+                            );
+                            return Err(());
+                        }
+                    }
+                    if let Err(e) = std::fs::write(&host_path, &content) {
+                        log!(
+                            "CoW: failed to write CoW copy to {:?}: {}",
+                            host_path, e
+                        );
+                        return Err(());
+                    }
+                    log!(
+                        "CoW: extracted IPA bundle file {:?} to {:?}",
+                        path, host_path
+                    );
+                }
+                // Upgrade the VFS node (self.root borrow is free now).
+                if let Some((parent_node_mut, fname)) = self.lookup_parent_node(path) {
+                    if let FsNode::Directory { children, .. } = parent_node_mut {
+                        children.insert(fname, FsNode::File {
+                            location: FileLocation::Path(host_path.clone()),
+                            writeable: true,
+                        });
+                    }
+                }
+                let file = handle_open_err(
+                    File::options()
+                        .read(read)
+                        .write(write)
+                        .append(append)
+                        .create(false)
+                        .truncate(truncate)
+                        .open(&host_path),
+                    &host_path,
+                );
+                return Ok(GuestFile::File(file));
+            }
+        }
+
+        // Create a new file: re-borrow the parent directory.
         if !create {
             return Err(());
         }
 
-        let Some(dir_host_path) = dir_host_path else {
+        let (parent_node2, new_filename2) = self.lookup_parent_node(path).ok_or(())?;
+        let FsNode::Directory {
+            children: children2,
+            writeable: dir_host_path2,
+        } = parent_node2
+        else {
+            return Err(());
+        };
+
+        let Some(dir_host_path2) = dir_host_path2 else {
             log!(
                 "Warning: attempt to create file at path {:?}, but directory is read-only",
                 path
@@ -1402,13 +1575,13 @@ impl Fs {
             return Err(());
         };
 
-        for c in new_filename.chars() {
+        for c in new_filename2.chars() {
             if std::path::is_separator(c) {
                 panic!("Attempt to create file at path {path:?}, but filename contains path separator character {c:?}!");
             }
         }
 
-        let host_path = dir_host_path.join(&new_filename);
+        let host_path = dir_host_path2.join(&new_filename2);
         let file = handle_open_err(
             File::options()
                 .read(read)
@@ -1424,8 +1597,8 @@ impl Fs {
             path,
             host_path
         );
-        children.insert(
-            new_filename,
+        children2.insert(
+            new_filename2,
             FsNode::File {
                 location: FileLocation::Path(host_path),
                 writeable: true,
