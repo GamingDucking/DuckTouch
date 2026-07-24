@@ -310,3 +310,10 @@ at.source.tomzom: --device-family=iphone --force-composition
 at.source.potpan: --device-family=iphone --landscape-right --force-composition
 at.source.potato3D: --device-family=iphone --landscape-right --force-composition
 com.tayasui.mrpoofree: --device-family=iphone --landscape-right --fullscreen --force-composition
+
+# Scarface
+# The game runs in landscape-right and writes to its own bundle (osres.sok,
+# tricky.sok, console_startup.txt).  Copy-on-Write in fs.rs handles the
+# writes; --landscape-right fixes the orientation; --force-composition
+# prevents render artefacts on Adreno drivers.
+com.go.starwave.scarface: --landscape-right --force-composition
