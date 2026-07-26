@@ -246,6 +246,44 @@ pub fn create_gles3_ctx(env: &mut Environment) -> Box<dyn GLESContext> {
     })
 }
 
+/// Create an OpenGL ES 2.0 context from the window's main stack.
+///
+/// The window owns the internal context used for compositing and the splash
+/// screen, so it must be created before the guest environment exists.
+pub fn create_gles2_ctx_no_parent_stack(
+    window: &mut crate::window::Window,
+) -> Box<dyn GLESContext> {
+    assert!(window.on_main_stack());
+    log!("Creating an OpenGL ES 2.0 context:");
+
+    log!("Trying: {}", GLES2NativeContext::description());
+    if let Ok(ctx) = GLES2NativeContext::new(window) {
+        log!("=> Success!");
+        return Box::new(ctx);
+    }
+
+    log!(
+        "Trying: {} (used for OpenGL ES 2.0)",
+        GLES2OnGL3Context::description()
+    );
+    if let Ok(ctx) = GLES2OnGL3Context::new(window) {
+        log!("=> Success!");
+        return Box::new(ctx);
+    }
+
+    log!(
+        "Trying: {} (legacy GL 2.1 fallback for OpenGL ES 2.0)",
+        GLES1OnGL2Context::description()
+    );
+    match GLES1OnGL2Context::new(window) {
+        Ok(ctx) => {
+            log!("=> Success!");
+            Box::new(ctx)
+        }
+        Err(err) => panic!("Couldn't create OpenGL ES 2.0 context: {}", err),
+    }
+}
+
 /// Same as [create_gles1_ctx], but without calling
 /// [Environment::on_parent_stack_in_coroutine]. Only should be called by
 /// functions not inside a coroutine that can't use [Environment].

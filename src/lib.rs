@@ -72,16 +72,16 @@ pub extern "C" fn SDL_main(
     // gets discarded, so we set a custom hook to make debugging easier.
     std::panic::set_hook(Box::new(|info| {
         let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
-            s
+            *s
         } else if let Some(s) = info.payload().downcast_ref::<String>() {
-            s
+            s.as_str()
         } else {
             "(non-string payload)"
         };
         if let Some(location) = info.location() {
-            echo!("Panic at {}: {}", location, payload);
+            echo_no_panic!("Panic at {}: {}", location, payload);
         } else {
-            echo!("Panic: {}", payload);
+            echo_no_panic!("Panic: {}", payload);
         }
     }));
     // Empty args: brings up app picker.
@@ -245,6 +245,10 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         std::env::remove_var("TOUCHHLE_FORCE_LANDSCAPE_VIEW_BOUNDS");
         std::env::remove_var("TOUCHHLE_TOUCH_LOCATION_PORTRAIT_TO_LANDSCAPE");
         std::env::remove_var("TOUCHHLE_TOUCH_MODE");
+        if app_id == "com.robtop.geometryjump" {
+            std::env::set_var("TOUCHHLE_TOUCH_LOCATION_PORTRAIT_TO_LANDSCAPE", "1");
+            std::env::set_var("TOUCHHLE_TOUCH_MODE", "right");
+        }
         std::env::remove_var("TOUCHHLE_TOUCH_LOCATION_X_OFFSET");
         std::env::remove_var("TOUCHHLE_TOUCH_LOCATION_Y_OFFSET");
         std::env::remove_var("TOUCHHLE_PRESENT_STRETCH_TO_VIEWPORT");
@@ -343,7 +347,7 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
 
     if required_device_capabilities.contains(&"opengles-3") {
         echo!(
-            "Warning: app requires OpenGL ES 3.0+ support. Only OpenGL ES 1.1 and 2.0 are currently supported."
+            "Warning: app requires OpenGL ES 3.0+ support. HyperHLE now routes EAGL OpenGL ES 3 contexts to its GLES 3 backend."
         );
     }
 

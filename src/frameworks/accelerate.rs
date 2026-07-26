@@ -875,6 +875,30 @@ fn vDSP_vma(
     }
 }
 
+/// `vDSP_vintb` — interpolate between vectors using a scalar factor.
+/// D[n] = A[n] + C[0] * (B[n] - A[n]).
+fn vDSP_vintb(
+    env: &mut Environment,
+    input_a: ConstPtr<f32>,
+    stride_a: vDSP_Length,
+    input_b: ConstPtr<f32>,
+    stride_b: vDSP_Length,
+    factor: ConstPtr<f32>,
+    output: MutPtr<f32>,
+    stride_d: vDSP_Length,
+    n: vDSP_Length,
+) {
+    let sa = stride_a.max(1) as GuestUSize;
+    let sb = stride_b.max(1) as GuestUSize;
+    let sd = stride_d.max(1) as GuestUSize;
+    let c: f32 = env.mem.read(factor.cast());
+    for i in 0..(n as GuestUSize) {
+        let a: f32 = env.mem.read((input_a + i * sa).cast());
+        let b: f32 = env.mem.read((input_b + i * sb).cast());
+        env.mem.write((output + i * sd).cast(), a + c * (b - a));
+    }
+}
+
 // ===========================================================================
 // MARK: - BLAS (Basic Linear Algebra Subprograms)
 // ===========================================================================
@@ -1065,6 +1089,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(vDSP_vneg(_, _, _, _, _)),
     export_c_func!(vDSP_vsadd(_, _, _, _, _, _)),
     export_c_func!(vDSP_vma(_, _, _, _, _, _, _, _, _)),
+    export_c_func!(vDSP_vintb(_, _, _, _, _, _, _, _)),
     // BLAS functions
     export_c_func!(cblas_saxpy(_, _, _, _, _, _)),
     export_c_func!(cblas_snrm2(_, _, _)),

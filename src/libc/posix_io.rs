@@ -349,16 +349,17 @@ pub fn open_direct(env: &mut Environment, path: ConstPtr<u8>, flags: i32) -> Fil
 
     let actual_path_string = case_insensitive_path(env, &path_string)
         .or_else(|| {
-            if path_string.starts_with('/') || (flags & O_CREAT) != 0 {
+            if (flags & O_CREAT) != 0 {
                 return None;
             }
 
-            let bundle_relative_path = format!(
-                "{}/{}",
-                env.bundle.bundle_path().as_str().trim_end_matches('/'),
-                path_string.trim_start_matches("./")
-            );
+            let bundle_root = env.bundle.bundle_path().as_str().trim_end_matches('/');
+            let relative_path = path_string.trim_start_matches("./");
+            let data_relative_path = relative_path.strip_prefix("Data/").unwrap_or(relative_path);
+            let bundle_relative_path = format!("{bundle_root}/{relative_path}");
+            let bundle_data_path = format!("{bundle_root}/Data/{data_relative_path}");
             case_insensitive_path(env, &bundle_relative_path)
+                .or_else(|| case_insensitive_path(env, &bundle_data_path))
         })
         .unwrap_or_else(|| path_string.clone());
 

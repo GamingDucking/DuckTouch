@@ -133,6 +133,28 @@ fn register_ext_audio_file(
 // Public API
 // ---------------------------------------------------------------------------
 
+pub fn ExtAudioFileCreateWithURL(
+    env: &mut Environment,
+    _in_url: CFURLRef,
+    _file_type: u32,
+    in_format: crate::mem::ConstPtr<AudioStreamBasicDescription>,
+    _in_channel_layout: crate::mem::ConstVoidPtr,
+    _in_flags: u32,
+    out_ext_audio_file: MutPtr<ExtAudioFileRef>,
+) -> OSStatus {
+    if in_format.is_null() || out_ext_audio_file.is_null() {
+        return -50;
+    }
+    let format = env.mem.read(in_format);
+    let audio_file = AudioFileHostObject::Writable {
+        format,
+        data: Vec::new(),
+        user_data: Vec::new(),
+    };
+    log_dbg!("ExtAudioFileCreateWithURL(): creating virtual writable audio file");
+    register_ext_audio_file(env, audio_file, None, out_ext_audio_file)
+}
+
 pub fn ExtAudioFileOpenURL(
     env: &mut Environment,
     in_url: CFURLRef,
@@ -660,6 +682,7 @@ fn build_asbd(audio_file: &AudioFileHostObject) -> AudioStreamBasicDescription {
 // ---------------------------------------------------------------------------
 
 pub const FUNCTIONS: FunctionExports = &[
+    export_c_func!(ExtAudioFileCreateWithURL(_, _, _, _, _, _)),
     export_c_func!(ExtAudioFileOpenURL(_, _)),
     export_c_func!(ExtAudioFileWrapAudioFileID(_, _, _)),
     export_c_func!(ExtAudioFileDispose(_)),

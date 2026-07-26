@@ -10,7 +10,7 @@
 use super::ns_dictionary::dict_from_keys_and_objects;
 use super::ns_run_loop::NSDefaultRunLoopMode;
 use super::ns_string::{from_rust_string, get_static_str, to_rust_string};
-use super::{NSTimeInterval, NSUInteger};
+use super::{NSInteger, NSTimeInterval, NSUInteger};
 // ДОБАВЛЕНЫ ИМПОРТЫ ДЛЯ ЭКСПОРТА ФУНКЦИИ И ОКРУЖЕНИЯ
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::frameworks::foundation::ns_thread::detach_new_thread_inner;
@@ -790,6 +790,39 @@ pub const CLASSES: ClassExports = objc_classes! {
         &key_str[1..]
     );
 
+    if key_str == "boolValue" {
+        let value: bool = msg![env; this boolValue];
+        return msg_class![env; NSNumber numberWithBool:value];
+    }
+    if key_str == "floatValue" {
+        let value: f32 = msg![env; this floatValue];
+        return msg_class![env; NSNumber numberWithFloat:value];
+    }
+    if key_str == "doubleValue" {
+        let value: f64 = msg![env; this doubleValue];
+        return msg_class![env; NSNumber numberWithDouble:value];
+    }
+    if key_str == "intValue" {
+        let value: i32 = msg![env; this intValue];
+        return msg_class![env; NSNumber numberWithInt:value];
+    }
+    if key_str == "integerValue" {
+        let value: NSInteger = msg![env; this integerValue];
+        return msg_class![env; NSNumber numberWithInteger:value];
+    }
+    if key_str == "longLongValue" {
+        let value: i64 = msg![env; this longLongValue];
+        return msg_class![env; NSNumber numberWithLongLong:value];
+    }
+    if key_str == "unsignedIntValue" {
+        let value: u32 = msg![env; this unsignedIntValue];
+        return msg_class![env; NSNumber numberWithUnsignedInt:value];
+    }
+    if key_str == "unsignedLongLongValue" {
+        let value: u64 = msg![env; this unsignedLongLongValue];
+        return msg_class![env; NSNumber numberWithUnsignedLongLong:value];
+    }
+
     // 1. Поиск геттеров (get<Key>, <key>, is<Key>)
     if let Some(sel) = env.objc.lookup_selector(&key_str) {
         if env.objc.object_has_method(&env.mem, this, sel) {
@@ -861,6 +894,40 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)valueForKeyPath:(id)key_path {
+    let key_path_string = to_rust_string(env, key_path).into_owned();
+    if key_path_string == "@count" {
+        return msg![env; this count];
+    }
+
+    if let Some((operator, remainder)) = key_path_string.split_once('.') {
+        if matches!(operator, "@sum" | "@avg" | "@min" | "@max") {
+            let remainder_id = from_rust_string(env, remainder.to_string());
+            let values: id = msg![env; this valueForKey:remainder_id];
+            let count: NSUInteger = if values == nil {
+                0
+            } else {
+                msg![env; values count]
+            };
+            let mut numbers = Vec::with_capacity(count as usize);
+            for index in 0..count {
+                let value: id = msg![env; values objectAtIndex:index];
+                if value != nil {
+                    numbers.push(msg![env; value doubleValue]);
+                }
+            }
+            let result = match operator {
+                "@sum" => numbers.iter().sum::<f64>(),
+                "@avg" => numbers
+                    .first()
+                    .map(|_| numbers.iter().sum::<f64>() / numbers.len() as f64)
+                    .unwrap_or(0.0),
+                "@min" => numbers.iter().copied().reduce(f64::min).unwrap_or(0.0),
+                "@max" => numbers.iter().copied().reduce(f64::max).unwrap_or(0.0),
+                _ => unreachable!(),
+            };
+            return msg_class![env; NSNumber numberWithDouble:result];
+        }
+    }
     msg![env; this valueForKey:key_path]
 }
 

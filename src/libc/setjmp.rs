@@ -20,13 +20,14 @@ use crate::{abi, Environment};
 // frames, but we do not have a good way to detect that right now.
 // Thus, those are exempted from the check.
 // You need to have a good reason to extend this list!
-const ALLOWED_FOR_LONGJMP_BYPASS: [&str; 6] = [
+const ALLOWED_FOR_LONGJMP_BYPASS: [&str; 7] = [
     "com.activision.CBNK2",
     "com.ea.fifa10.bv",
     "com.ea.fifa10inc",
     "com.ea.fifa10wc.bv",
     "com.ea.fifa10wc.inc",
     "com.shinmegamitensei.shinmegamitensei1",
+    "com.telltalegames.Grickle101Low",
 ];
 
 #[repr(C, packed)]
@@ -62,6 +63,12 @@ fn setjmp(env: &mut Environment, jmp_buf: MutPtr<JmpBuf>) -> i32 {
     };
     env.mem.write(jmp_buf, buf);
     0 // no longjmp() was performed
+}
+
+fn sigsetjmp(env: &mut Environment, jmp_buf: MutPtr<JmpBuf>, _save_mask: i32) -> i32 {
+    // Signal masks are not currently emulated, but the register/stack state is
+    // identical to setjmp for the apps supported here.
+    setjmp(env, jmp_buf)
 }
 
 fn longjmp(env: &mut Environment, jmp_buf: MutPtr<JmpBuf>, status: u32) {

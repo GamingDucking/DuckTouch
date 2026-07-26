@@ -81,6 +81,14 @@ fn usleep(env: &mut Environment, useconds: useconds_t) -> i32 {
     0 // success
 }
 
+fn alarm(_env: &mut Environment, seconds: u32) -> u32 {
+    // touchHLE does not currently deliver Unix signals. These games use alarm
+    // only around best-effort network/service checks, so accepting/cancelling
+    // it without a pending signal matches the non-blocking path they need.
+    log_dbg!("TODO: alarm({seconds}) -> 0 (signals are not emulated)");
+    0
+}
+
 #[allow(non_camel_case_types)]
 pub type pid_t = i32;
 #[allow(non_camel_case_types)]
@@ -139,7 +147,20 @@ fn access(env: &mut Environment, path: ConstPtr<u8>, mode: i32) -> i32 {
             return -1;
         }
     };
-    let guest_path = GuestPath::new(&binding);
+    let resolved_binding = if !binding.starts_with('/') && !env.fs.exists(GuestPath::new(&binding)) {
+        let bundle_root = env.bundle.bundle_path().as_str().trim_end_matches('/');
+        let relative = binding.strip_prefix("Data/").unwrap_or(&binding);
+        let relative = relative.strip_prefix("Data/").unwrap_or(relative);
+        let candidate = format!("{bundle_root}/Data/{relative}");
+        if env.fs.exists(GuestPath::new(&candidate)) {
+            candidate
+        } else {
+            binding.clone()
+        }
+    } else {
+        binding.clone()
+    };
+    let guest_path = GuestPath::new(&resolved_binding);
     let (exists, read, write, execute) = env.fs.access(guest_path);
     // TODO: support ORing
     match mode {
@@ -627,10 +648,15 @@ fn syscall(env: &mut Environment, number: i32, _args: DotDotDot) -> i32 {
 /// users into thinking persistence was broken.
 fn sync(_env: &mut Environment) {}
 
+fn setpriority(_env: &mut Environment, _which: i32, _who: i32, _priority: i32) -> i32 {
+    0
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(syscall(_, _)),
     export_c_func!(sleep(_)),
     export_c_func!(usleep(_)),
+    export_c_func!(alarm(_)),
     export_c_func!(getpid()),
     export_c_func!(getppid()),
     export_c_func!(getuid()),
@@ -654,4 +680,5 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(chmod(_, _)),
     export_c_func!(fchmod(_, _)),
     export_c_func!(sync()),
+    export_c_func!(setpriority(_, _, _)),
 ];

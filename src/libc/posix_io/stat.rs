@@ -224,7 +224,20 @@ fn stat(env: &mut Environment, path: ConstPtr<u8>, buf: MutPtr<stat>) -> i32 {
         }
     };
 
-    let guest_path = GuestPath::new(&path_str);
+    let resolved_path = if !path_str.starts_with('/') && !env.fs.exists(GuestPath::new(&path_str)) {
+        let bundle_root = env.bundle.bundle_path().as_str().trim_end_matches('/');
+        let relative = path_str.strip_prefix("Data/").unwrap_or(&path_str);
+        let relative = relative.strip_prefix("Data/").unwrap_or(relative);
+        let candidate = format!("{bundle_root}/Data/{relative}");
+        if env.fs.exists(GuestPath::new(&candidate)) {
+            candidate
+        } else {
+            path_str.clone()
+        }
+    } else {
+        path_str.clone()
+    };
+    let guest_path = GuestPath::new(&resolved_path);
     if !env.fs.exists(guest_path) {
         set_errno(env, ENOENT);
         return -1;
@@ -265,7 +278,7 @@ fn stat(env: &mut Environment, path: ConstPtr<u8>, buf: MutPtr<stat>) -> i32 {
     // env.mem свободен для записи: path_str — это String, а не ссылка.
     env.mem.write(buf, st);
 
-    log_dbg!("stat({:?} {:?}, {:?}) -> 0", path, path_str, buf);
+    log_dbg!("stat({:?} {:?}, {:?}) -> 0", path, resolved_path, buf);
     0
 }
 

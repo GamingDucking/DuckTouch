@@ -1038,6 +1038,24 @@ fn path_for_resource_helper(
         return path;
     }
 
+    // Unity iOS players keep their serialized data files in a sibling Data
+    // directory inside the app bundle rather than at the bundle root.
+    // NSBundle's normal lookup remains first; this fallback only applies when
+    // the requested resource is not found there.
+    let data_component = ns_string::get_static_str(env, "Data");
+    let data_path: id = msg![env; path stringByAppendingPathComponent:data_component];
+    let data_path: id = msg![env; data_path stringByAppendingPathComponent:name];
+    let data_path_exists: bool = msg![env; file_manager fileExistsAtPath:data_path];
+    log!(
+        "NSBundle resource lookup: {:?} missing, Unity Data fallback {:?} exists={}",
+        path,
+        data_path,
+        data_path_exists
+    );
+    if data_path_exists {
+        return data_path;
+    }
+
     // Case-insensitive fallback: scan the parent directory.
     let path_str = ns_string::to_rust_string(env, path);
     let rust_path = std::path::Path::new(path_str.as_ref());

@@ -13,7 +13,9 @@
 //! will be needed for the runtime of the app.
 
 use crate::gles::present::present_frame;
-use crate::gles::{create_gles1_ctx_no_parent_stack, GLESContext, GLES};
+use crate::gles::{
+    create_gles1_ctx_no_parent_stack, create_gles2_ctx_no_parent_stack, GLESContext, GLES,
+};
 use crate::image::Image;
 use crate::matrix::Matrix;
 use crate::options::Options;
@@ -641,6 +643,8 @@ pub struct Window {
     /// workarounds can be auto-enabled. See [Window::gl_driver_description].
     gl_driver_description: String,
     splash_image: Option<Image>,
+    /// Whether the selected image already targets the startup orientation.
+    splash_image_is_orientation_specific: bool,
     device_family: DeviceFamily,
     device_orientation: DeviceOrientation,
     controller_ctx: sdl2::GameControllerSubsystem,
@@ -666,10 +670,40 @@ impl Window {
     pub fn rotatable_fullscreen() -> bool {
         env::consts::OS == "android"
     }
+
+    fn toggle_fullscreen(&mut self) {
+        if Self::rotatable_fullscreen() {
+            return;
+        }
+
+        let new_fullscreen = !self.fullscreen;
+        let mode = if new_fullscreen {
+            sdl2::video::FullscreenType::Desktop
+        } else {
+            sdl2::video::FullscreenType::Off
+        };
+        match self.window.set_fullscreen(mode) {
+            Ok(()) => {
+                self.fullscreen = new_fullscreen;
+                log!(
+                    "Switched to {} mode.",
+                    if self.fullscreen {
+                        "fullscreen"
+                    } else {
+                        "windowed"
+                    }
+                );
+            }
+            Err(error) => {
+                log!("Could not toggle fullscreen mode: {error}");
+            }
+        }
+    }
+
     pub fn new(
         title: &str,
         icon: Option<Image>,
-        launch_image: Option<Image>,
+        launch_image: Option<(Image, bool)>,
         options: &Options,
     ) -> Window {
         let sdl_ctx = sdl2::init().unwrap();
@@ -763,6 +797,7 @@ impl Window {
             let window = video_ctx
                 .window(title, width, height)
                 .position_centered()
+                .resizable()
                 .opengl()
                 .build()
                 .unwrap();
@@ -801,6 +836,10 @@ impl Window {
         #[cfg(target_os = "macos")]
         let max_height = window.size().1;
 
+        let (splash_image, splash_image_is_orientation_specific) = launch_image
+            .map(|(image, orientation_specific)| (Some(image), orientation_specific))
+            .unwrap_or((None, false));
+
         let mut window = Window {
             _sdl_ctx: sdl_ctx,
             video_ctx,
@@ -819,7 +858,8 @@ impl Window {
             host_screen_size,
             internal_gl_ins: None,
             gl_driver_description: String::new(),
-            splash_image: launch_image,
+            splash_image,
+            splash_image_is_orientation_specific,
             device_family,
             device_orientation,
             controller_ctx,
@@ -844,7 +884,11 @@ impl Window {
         // (see src/frameworks/core_animation/composition.rs). OpenGL ES is used
         // because SDL2 won't let us use more than one graphics API in the same
         // window, and we also need OpenGL ES for the app's own rendering.
-        let mut gl_ins = create_gles1_ctx_no_parent_stack(&mut window, options);
+        let mut gl_ins = if options.prefer_gles2_context {
+            create_gles2_ctx_no_parent_stack(&mut window)
+        } else {
+            create_gles1_ctx_no_parent_stack(&mut window, options)
+        };
         let gl_driver_description = {
             let gl_ctx = gl_ins.make_current(&mut window);
             unsafe { gl_ctx.driver_description() }
@@ -1414,6 +1458,25 @@ impl Window {
                     }
                 }
                 E::KeyDown {
+                    keycode: Some(sdl2::keyboard::Keycode::F11),
+                    repeat: false,
+                    ..
+                } => {
+                    self.toggle_fullscreen();
+                    continue;
+                }
+                E::KeyDown {
+                    keycode: Some(sdl2::keyboard::Keycode::Return),
+                    keymod,
+                    repeat: false,
+                    ..
+                } if keymod
+                    .intersects(sdl2::keyboard::Mod::LALTMOD | sdl2::keyboard::Mod::RALTMOD) =>
+                {
+                    self.toggle_fullscreen();
+                    continue;
+                }
+                E::KeyDown {
                     keycode: Some(sdl2::keyboard::Keycode::F12),
                     ..
                 } => {
@@ -1820,13 +1883,31 @@ impl Window {
     fn display_splash(&mut self) {
         assert!(self.splash_image.is_some());
 
+        let image = self.splash_image.as_ref().unwrap();
+        let (image_width, image_height) = image.dimensions();
+
+        // Legacy iPhone landscape launch images are stored in a portrait-sized
+        // Default.png with their content already rotated. Applying the normal
+        // framebuffer rotation to such an image turns it upside down, so use
+        // the inverse rotation for that case. Native landscape-sized launch
+        // images and portrait launch images use the regular transform.
+        let is_landscape = matches!(
+            self.device_orientation,
+            DeviceOrientation::LandscapeLeft | DeviceOrientation::LandscapeRight
+        );
+        let rotation = if self.splash_image_is_orientation_specific {
+            Matrix::identity()
+        } else if is_landscape && image_height > image_width {
+            self.rotation_matrix().inverse().unwrap()
+        } else {
+            self.rotation_matrix()
+        };
+
         // OpenGL ES expects bottom-to-top row order for image data, but our
         // image data will be top-to-bottom. A reflection transform compensates.
-        let matrix = self.rotation_matrix().multiply(&Matrix::y_flip());
+        let matrix = rotation.multiply(&Matrix::y_flip());
         let (vx, vy, vw, vh) = self.viewport();
         let viewport = (vx, vy + self.viewport_y_offset(), vw, vh);
-
-        let image = self.splash_image.as_ref().unwrap();
 
         unsafe {
             let mut gl_ctx = self
@@ -1843,13 +1924,12 @@ impl Window {
             let mut texture = 0;
             gl_ctx.GenTextures(1, &mut texture);
             gl_ctx.BindTexture(gles11::TEXTURE_2D, texture);
-            let (width, height) = image.dimensions();
             gl_ctx.TexImage2D(
                 gles11::TEXTURE_2D,
                 0,
                 gles11::RGBA as _,
-                width as _,
-                height as _,
+                image_width as _,
+                image_height as _,
                 0,
                 gles11::RGBA,
                 gles11::UNSIGNED_BYTE,

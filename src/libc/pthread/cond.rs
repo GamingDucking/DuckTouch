@@ -13,7 +13,7 @@ use crate::libc::pthread::mutex::pthread_mutex_unlock;
 use crate::mem::{ConstPtr, MutPtr, Ptr, SafeRead};
 use crate::{export_c_func, Environment};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::environment::{MutexId, ThreadBlock, ThreadId};
 use crate::libc::time::timespec;
@@ -300,17 +300,24 @@ pub fn pthread_cond_timedwait_relative_np(
     mutex: MutPtr<pthread_mutex_t>,
     reltime: ConstPtr<timespec>,
 ) -> i32 {
-    if !reltime.is_null() {
+    let duration = if reltime.is_null() {
+        Duration::ZERO
+    } else {
         let ts = env.mem.read(reltime);
-        let sec = ts.tv_sec;
-        let nsec = ts.tv_nsec;
-        log_dbg!(
-            "pthread_cond_timedwait_relative_np: relative timeout tv_sec={} tv_nsec={} (ignored)",
-            sec,
-            nsec
-        );
-    }
-    pthread_cond_wait(env, cond, mutex)
+        Duration::from_secs(ts.tv_sec.max(0) as u64)
+            .saturating_add(Duration::from_nanos(ts.tv_nsec.max(0) as u64))
+    };
+    let abs_time = env.mem.alloc_and_write(timespec {
+        tv_sec: (SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .saturating_add(duration)
+            .as_secs()) as _,
+        tv_nsec: 0,
+    });
+    let result = pthread_cond_timedwait(env, cond, mutex, abs_time.cast_const());
+    env.mem.free(abs_time.cast());
+    result
 }
 
 /// pthread_condattr_init — initialise a cond attr object (always default).

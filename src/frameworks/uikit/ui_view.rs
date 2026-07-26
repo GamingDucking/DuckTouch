@@ -75,6 +75,7 @@ impl Default for AnimationBlockState {
 #[derive(Default)]
 pub struct State {
     pub(super) views: Vec<id>,
+    pub ui_image_view: ui_image_view::State,
     pub ui_window: ui_window::State,
     pub(super) animation_block: AnimationBlockState,
 }
@@ -84,6 +85,9 @@ pub(crate) struct UIViewHostObject {
     subviews: Vec<id>,
     superview: id,
     view_controller: id,
+    /// Only used by UIWindow. Strong reference for the iOS 4
+    /// rootViewController property.
+    root_view_controller: id,
     tag: NSInteger,
     content_mode: NSInteger,
     autoresizing_mask: NSUInteger,
@@ -138,6 +142,7 @@ impl Default for UIViewHostObject {
             subviews: Vec::new(),
             superview: nil,
             view_controller: nil,
+            root_view_controller: nil,
             tag: 0,
             content_mode: 0,      // UIViewContentModeScaleToFill
             autoresizing_mask: 0, // UIViewAutoresizingNone
@@ -170,6 +175,13 @@ impl Default for UIViewHostObject {
 pub fn set_view_controller(env: &mut Environment, view: id, controller: id) {
     let host_obj = env.objc.borrow_mut::<UIViewHostObject>(view);
     host_obj.view_controller = controller;
+}
+
+pub(super) fn gesture_recognizers(env: &Environment, view: id) -> Vec<id> {
+    env.objc
+        .borrow::<UIViewHostObject>(view)
+        .gesture_recognizers
+        .clone()
 }
 
 fn init_common(env: &mut Environment, this: id) -> id {
@@ -245,6 +257,7 @@ fn touchhle_cocos_should_force_landscape_view(env: &mut Environment, view: id) -
     if std::env::var_os("TOUCHHLE_COCOS_FORCE_LANDSCAPE_VIEW").is_some()
         || std::env::var_os("TOUCHHLE_UNITY_FORCE_LANDSCAPE_VIEW").is_some()
         || std::env::var_os("TOUCHHLE_ENGINE_FORCE_LANDSCAPE_VIEW").is_some()
+        || env.bundle.bundle_identifier() == "com.disney.SwampyGame"
         || std::env::var_os("TOUCHHLE_FORCE_LANDSCAPE_VIEW_BOUNDS").is_some()
     {
         return true;
@@ -958,6 +971,16 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow_mut::<UIViewHostObject>(this).should_group_accessibility_children = should;
 }
 
+- (())setTranslatesAutoresizingMaskIntoConstraints:(bool)_translates { }
+- (bool)translatesAutoresizingMaskIntoConstraints { true }
+- (())setNeedsLayout { }
+- (())layoutIfNeeded { }
+- (())addConstraint:(id)_constraint { }
+- (())addConstraints:(id)_constraints { }
+- (())removeConstraint:(id)_constraint { }
+- (())removeConstraints:(id)_constraints { }
+- (id)constraints { msg_class![env; NSArray array] }
+
 // Broad UIKit/Cocos compatibility. A lot of Cocos2D-era games call
 // these optional UIView hooks directly on their GL view subclasses. The default
 // UIView behavior is effectively no-op, but having the selectors prevents the
@@ -1386,8 +1409,10 @@ pub const CLASSES: ClassExports = objc_classes! {
         env.objc.borrow_mut::<UIViewHostObject>(subview).superview = nil;
         release(env, subview);
     }
-
-    for r in gesture_recognizers { release(env, r); }
+    for recognizer in gesture_recognizers {
+        super::ui_gesture_recognizer::set_view(env, recognizer, nil);
+        release(env, recognizer);
+    }
 
     // UIAccessibility informal protocol: properties are documented as
     // "copy" / "retain" — release them on teardown to match

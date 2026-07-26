@@ -560,11 +560,21 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())presentModalViewController:(id)modal_vc animated:(bool)animated {
-    // Logged at info level so we can confirm modal presentation actually
-    // happens at runtime even on builds without RUST_LOG=debug.
+    let modal_class_name = if modal_vc == nil {
+        "<nil>".to_string()
+    } else {
+        let modal_class: Class = msg![env; modal_vc class];
+        env.objc.get_class_name(modal_class).to_owned()
+    };
+    let presenter_class: Class = msg![env; this class];
+    let presenter_class_name = env.objc.get_class_name(presenter_class).to_owned();
     log!(
-        "[(UIViewController*){:?} presentModalViewController:{:?} animated:{}]",
-        this, modal_vc, animated
+        "[(UIViewController*){:?} {} presentModalViewController:{:?} {} animated:{}]",
+        this,
+        presenter_class_name,
+        modal_vc,
+        modal_class_name,
+        animated
     );
     if modal_vc == nil {
         return;
@@ -596,6 +606,20 @@ pub const CLASSES: ClassExports = objc_classes! {
             modal_vc
         );
         return;
+    }
+
+    if modal_class_name == "AgeGateView" {
+        if let Some(callback) = env.objc.lookup_selector("ageGateDidCompleted") {
+            let app: id = msg_class![env; UIApplication sharedApplication];
+            let delegate: id = msg![env; app delegate];
+            log!("AgeGateView detected: completing age gate automatically on app delegate {:?}", delegate);
+            if delegate != nil {
+                let _: () = crate::objc::msg_send_no_type_checking(env, (delegate, callback));
+                return;
+            }
+            log!("WARNING: UIApplication delegate is nil; cannot complete age gate");
+        }
+        log!("WARNING: AgeGateView callback ageGateDidCompleted is unavailable");
     }
 
     // Locate a window to host the modal view. Prefer the presenting view's

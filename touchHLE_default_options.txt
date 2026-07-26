@@ -219,7 +219,8 @@ com.ea.nfsucinc: --force-composition
 com.gameloft.BladesOfFury: --force-composition
 
 # MCPE LITE
-com.mojang.minecraftpe-demo: --force-composition
+com.mojang.minecraftpe:
+com.mojang.minecraftpe-demo:
 
 # Bruce Lee
 com.indiagames.brucelee:  --force-composition --ignore-gl-errors
@@ -317,3 +318,27 @@ com.tayasui.mrpoofree: --device-family=iphone --landscape-right --fullscreen --f
 # writes; --landscape-right fixes the orientation; --force-composition
 # prevents render artefacts on Adreno drivers.
 com.go.starwave.scarface: --landscape-right --force-composition
+
+# Hack, Slash, Loot (iPad)
+# Landscape iPad title; its first menu is rendered by the fixed-function GLES 1.1 path.
+com.DavidWilliamson.HackSlashLootiPad: --landscape-left --device-family=ipad --gles1=gles1_on_gl2
+
+# Super Battle Racers / Battle Racers
+# Unity 4.5 uses the GLES 1.1 compatibility path on this build.
+com.gamehivecorp.superbattleracers: --landscape-right --gles1=gles1_on_gl2
+
+# Animal Farm
+# iPad title; keep the legacy orientation and composition path used by its NIB UI.
+com.blackstoneaudio.enhancedaudioplayer.bsa-Animal-Farm: --device-family=ipad --landscape-right --force-composition
+
+# Minecraft: Story Mode
+com.telltalegames.MC100: --device-family=ipad --landscape-left --prefer-gles2-context
+
+# Drive Ahead! / Crash On Wheels requests an ES1 EAGL context but uses the Cocos2d GLES2 shader pipeline.
+com.dodreams.crashonwheels: --landscape-left --prefer-gles2-context --force-composition
+
+# Green Lantern: native 480x320 landscape OpenGL ES 2 profile.
+com.wb.GreenLantern: --landscape-left --prefer-gles2-context
+
+# Where's My Water?: iPhone portrait OpenGL ES 1 profile.
+com.disney.SwampyGame: --device-family=iphone-3gs

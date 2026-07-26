@@ -68,7 +68,7 @@ impl malloc_zone_t {
             batch_free: Ptr::null(),
             introspect: Ptr::null(),
             version: 0,
-            memalign: Ptr::null(),
+            memalign: fn_ptr(env, "_malloc_zone_memalign"),
         }
     }
 }
@@ -107,6 +107,9 @@ fn malloc_destroy_zone(env: &mut Environment, zone: MutPtr<malloc_zone_t>) {
 }
 
 fn malloc_zone_free(env: &mut Environment, _zone: MutPtr<malloc_zone_t>, ptr: MutVoidPtr) {
+    if ptr.is_null() || !env.mem.is_known_allocation(ptr.to_bits()) {
+        return;
+    }
     env.mem.free(ptr)
 }
 
@@ -138,6 +141,16 @@ fn malloc_zone_size(
     env.mem.malloc_size(ptr)
 }
 
+fn malloc_zone_from_ptr(
+    env: &mut Environment,
+    ptr: ConstVoidPtr,
+) -> MutPtr<malloc_zone_t> {
+    if ptr.is_null() || env.mem.malloc_size(ptr) == 0 {
+        return MutPtr::null();
+    }
+    malloc_default_zone(env)
+}
+
 /// Not a part of the API. However as such a function needs to be accessible in
 /// the zone struct, it has to be exported.
 fn malloc_set_zone_name(env: &mut Environment, zone: MutPtr<malloc_zone_t>, name: ConstPtr<u8>) {
@@ -147,13 +160,47 @@ fn malloc_set_zone_name(env: &mut Environment, zone: MutPtr<malloc_zone_t>, name
     env.mem.write(zone, zone_data);
 }
 
+fn malloc_zone_memalign(
+    env: &mut Environment,
+    _zone: MutPtr<malloc_zone_t>,
+    alignment: GuestUSize,
+    size: GuestUSize,
+) -> MutVoidPtr {
+    if size == 0 {
+        return env.mem.alloc(1);
+    }
+    if alignment <= 16 {
+        return env.mem.alloc(size);
+    }
+    if !alignment.is_power_of_two() {
+        return MutVoidPtr::null();
+    }
+    let header = std::mem::size_of::<u32>() as GuestUSize;
+    let Some(total) = size
+        .checked_add(alignment)
+        .and_then(|value| value.checked_add(header))
+    else {
+        return MutVoidPtr::null();
+    };
+    let raw = env.mem.alloc(total);
+    if raw.is_null() {
+        return raw;
+    }
+    let aligned_bits = (raw.to_bits() + header + alignment - 1) & !(alignment - 1);
+    let aligned = MutVoidPtr::from_bits(aligned_bits);
+    env.mem.write(MutPtr::from_bits(aligned_bits - header), raw.to_bits());
+    aligned
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(malloc_create_zone(_, _)),
     export_c_func!(malloc_default_zone()),
     export_c_func!(malloc_destroy_zone(_)),
     export_c_func!(malloc_zone_free(_, _)),
     export_c_func!(malloc_zone_malloc(_, _)),
+    export_c_func!(malloc_zone_memalign(_, _, _)),
     export_c_func!(malloc_zone_realloc(_, _, _)),
     export_c_func!(malloc_zone_size(_, _)),
     export_c_func!(malloc_set_zone_name(_, _)),
+    export_c_func!(malloc_zone_from_ptr(_)),
 ];

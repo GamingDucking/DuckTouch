@@ -764,6 +764,13 @@ fn pthread_setname_np(env: &mut Environment, name: ConstPtr<u8>) -> i32 {
     0
 }
 
+fn pthread_threadid_np(env: &mut Environment, _thread: pthread_t, thread_id: MutPtr<u64>) -> i32 {
+    if !thread_id.is_null() {
+        env.mem.write(thread_id, (env.current_thread as u64) + 1);
+    }
+    0
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     // Attributes
     export_c_func!(pthread_attr_init(_)),
@@ -802,4 +809,5 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(pthread_setschedparam(_, _, _)),
     export_c_func!(pthread_getname_np(_, _, _)),
     export_c_func!(pthread_setname_np(_)),
+    export_c_func!(pthread_threadid_np(_, _)),
 ];

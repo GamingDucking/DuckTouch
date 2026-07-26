@@ -14,8 +14,7 @@ use crate::objc::nil;
 use crate::Environment;
 use std::slice::from_raw_parts;
 use touchHLE_gl_bindings::gles11::{
-    ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER_BINDING, VERTEX_ARRAY_BUFFER_BINDING,
-    WRITE_ONLY_OES,
+    ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER_BINDING, WRITE_ONLY_OES,
 };
 
 use crate::gles::gles11_raw::types::{
@@ -450,6 +449,7 @@ fn glBlendFunc(env: &mut Environment, sfactor: GLenum, dfactor: GLenum) {
 fn glBlendEquationOES(env: &mut Environment, mode: GLenum) {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.BlendEquationOES(mode) })
 }
+
 fn glColorMask(
     env: &mut Environment,
     red: GLboolean,
@@ -779,7 +779,7 @@ fn glBufferData(
     usage: GLenum,
 ) {
     with_ctx_and_mem(env, |gles, mem| unsafe {
-        let data = if data.is_null() {
+        let data: *const GLvoid = if data.is_null() {
             std::ptr::null()
         } else {
             mem.ptr_at(data.cast::<u8>(), size.try_into().unwrap())
@@ -1316,6 +1316,14 @@ unsafe fn guard_client_vertex_arrays(gles: &mut dyn GLES, mem: &Mem) -> Vec<GLui
         }
         let mut ptr: *mut GLvoid = std::ptr::null_mut();
         gles.GetVertexAttribPointerv(index, VERTEX_ATTRIB_ARRAY_POINTER, &mut ptr);
+        if ptr.is_null() {
+            // A null client pointer is the OpenGL default for an array that
+            // has not been populated yet. Keep the enabled array state intact:
+            // the fixed-function backend supplies its normal default attribute
+            // values, while disabling it changes the guest-visible state and
+            // can make later draws lose their vertex streams.
+            continue;
+        }
         if mem.is_host_ptr_in_guest_mem(ptr) {
             // A legitimate client-side array pointing into guest memory.
             continue;
@@ -2588,7 +2596,7 @@ fn glGenerateMipmap(env: &mut Environment, target: GLenum) {
 
 fn _get_currently_bound_buffer_object_name(env: &mut Environment, target: GLenum) -> GLuint {
     let binding = match target {
-        ARRAY_BUFFER => VERTEX_ARRAY_BUFFER_BINDING,
+        ARRAY_BUFFER => gles11::ARRAY_BUFFER_BINDING,
         ELEMENT_ARRAY_BUFFER => ELEMENT_ARRAY_BUFFER_BINDING,
         other => {
             // Anything else is a malformed call from the guest. Real GL
@@ -3322,6 +3330,10 @@ fn glVertexAttribPointer(
 }
 fn glVertexAttrib1f(env: &mut Environment, index: GLuint, x: GLfloat) {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.VertexAttrib1f(index, x) });
+}
+fn glVertexAttrib1fv(env: &mut Environment, index: GLuint, values: ConstPtr<GLfloat>) {
+    let value = env.mem.read(values);
+    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.VertexAttrib1fv(index, &value) });
 }
 fn glVertexAttrib2f(env: &mut Environment, index: GLuint, x: GLfloat, y: GLfloat) {
     with_ctx_and_mem(env, |gles, _mem| unsafe {
@@ -5402,6 +5414,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(glDisableVertexAttribArray(_)),
     export_c_func!(glVertexAttribPointer(_, _, _, _, _, _)),
     export_c_func!(glVertexAttrib1f(_, _)),
+    export_c_func!(glVertexAttrib1fv(_, _)),
     export_c_func!(glVertexAttrib2f(_, _, _)),
     export_c_func!(glVertexAttrib3f(_, _, _, _)),
     export_c_func!(glVertexAttrib4f(_, _, _, _, _)),
@@ -5445,7 +5458,9 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(glIsVertexArray(_)),
     // OpenGL ES 3.0 entry points
     export_c_func!(glUnmapBuffer(_)),
+    export_c_func_aliased!("glMapBufferRangeEXT", glMapBufferRange(_, _, _, _)),
     export_c_func!(glMapBufferRange(_, _, _, _)),
+    export_c_func_aliased!("glFlushMappedBufferRangeEXT", glFlushMappedBufferRange(_, _, _)),
     export_c_func!(glFlushMappedBufferRange(_, _, _)),
     export_c_func!(glCopyBufferSubData(_, _, _, _, _)),
     export_c_func!(glBindBufferBase(_, _, _)),
