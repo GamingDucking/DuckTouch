@@ -8,7 +8,7 @@
 
 use super::ui_event;
 use super::ui_gesture_recognizer::{
-    fire_targets, UIGestureRecognizerHostObject, UIGestureRecognizerStatePossible,
+    UIGestureRecognizerHostObject, UIGestureRecognizerStatePossible,
     UIGestureRecognizerStateRecognized, UISwipeGestureRecognizerDirectionDown,
     UISwipeGestureRecognizerDirectionLeft, UISwipeGestureRecognizerDirectionRight,
     UISwipeGestureRecognizerDirectionUp,
@@ -759,8 +759,6 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     }
 
     let mut view_touches: HashMap<id, id> = HashMap::new();
-    // (view, start_location, end_location) for swipe gesture detection.
-    let mut swipe_candidates: Vec<(id, CGPoint, CGPoint)> = Vec::new();
     // Collect finger_ids to remove from current_touches AFTER touchesEnded is
     // delivered.  Some apps (e.g. Scarface) retain a UITouch pointer inside
     // touchesEnded: and then access it on the next run-loop turn.  Releasing
@@ -833,10 +831,6 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
             .remove(&finger_id);
         release(env, touch);
     }
-    for (view, start, end) in swipe_candidates {
-        recognize_taps(env, view, start, end);
-        recognize_swipes(env, view, start, end);
-    }
 
     // ULTRAHLE_MINIONJUMP_DRAIN_SELECT_BEGIN
     ultrahle_minionjump_drain_pending_callback(env, true);
@@ -846,150 +840,5 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     // ULTRAHLE_MINIONJUMP_DRAIN_POST_END
 
     release(env, pool);
-}
-
-// ---------------------------------------------------------------------------
-// Tap and swipe gesture recognition helpers (HyperHLE fork additions).
-// These are called from handle_touches after all touchesEnded: callbacks have
-// returned, using the deferred touches_to_remove / swipe_candidates approach.
-// ---------------------------------------------------------------------------
-
-fn recognize_taps(env: &mut Environment, view: id, start: CGPoint, end: CGPoint) {
-    const MAX_TAP_MOVE: f32 = 18.0;
-    let dx = end.x - start.x;
-    let dy = end.y - start.y;
-    if (dx * dx + dy * dy).sqrt() > MAX_TAP_MOVE {
-        return;
-    }
-
-    let mut current = view;
-    let mut depth = 0;
-    while current != nil && depth < 32 {
-        fire_matching_taps(env, current);
-        current = msg![env; current superview];
-        depth += 1;
-    }
-}
-
-fn fire_matching_taps(env: &mut Environment, view: id) {
-    let recognizers: id = msg![env; view gestureRecognizers];
-    if recognizers == nil {
-        return;
-    }
-    let count: NSUInteger = msg![env; recognizers count];
-    for i in 0..count {
-        let recognizer: id = msg![env; recognizers objectAtIndex:i];
-        if recognizer == nil {
-            continue;
-        }
-        let cls: crate::objc::Class = msg![env; recognizer class];
-        let class_name = env.objc.get_class_name(cls);
-        if !class_name.contains("TapGestureRecognizer") {
-            continue;
-        }
-        let enabled: bool = msg![env; recognizer isEnabled];
-        if !enabled {
-            continue;
-        }
-        {
-            let host = env
-                .objc
-                .borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
-            host.state = UIGestureRecognizerStateRecognized;
-        }
-        fire_targets(env, recognizer);
-        let host = env
-            .objc
-            .borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
-        host.state = UIGestureRecognizerStatePossible;
-    }
-}
-
-/// Minimal `UISwipeGestureRecognizer` support.
-///
-/// HyperHLE delivers raw touches directly to views and does not run the full
-/// iOS gesture-recognition state machine. Many apps attach a
-/// `UISwipeGestureRecognizer` to a view and rely on it firing — without this
-/// the swipe simply never happens.
-fn recognize_swipes(env: &mut Environment, view: id, start: CGPoint, end: CGPoint) {
-    const MIN_SWIPE_DISTANCE: f32 = 24.0;
-    const AXIS_DOMINANCE: f32 = 2.0;
-
-    let dx = end.x - start.x;
-    let dy = end.y - start.y;
-    let adx = dx.abs();
-    let ady = dy.abs();
-
-    if adx < MIN_SWIPE_DISTANCE && ady < MIN_SWIPE_DISTANCE {
-        return;
-    }
-
-    let detected_direction: NSInteger = if adx >= ady {
-        if adx < ady * AXIS_DOMINANCE && ady >= MIN_SWIPE_DISTANCE {
-            return;
-        }
-        if dx > 0.0 {
-            UISwipeGestureRecognizerDirectionRight
-        } else {
-            UISwipeGestureRecognizerDirectionLeft
-        }
-    } else {
-        if ady < adx * AXIS_DOMINANCE && adx >= MIN_SWIPE_DISTANCE {
-            return;
-        }
-        if dy > 0.0 {
-            UISwipeGestureRecognizerDirectionDown
-        } else {
-            UISwipeGestureRecognizerDirectionUp
-        }
-    };
-
-    let mut current = view;
-    let mut depth = 0;
-    while current != nil && depth < 32 {
-        fire_matching_swipes(env, current, detected_direction);
-        current = msg![env; current superview];
-        depth += 1;
-    }
-}
-
-fn fire_matching_swipes(env: &mut Environment, view: id, detected_direction: NSInteger) {
-    let recognizers: id = msg![env; view gestureRecognizers];
-    if recognizers == nil {
-        return;
-    }
-    let count: NSUInteger = msg![env; recognizers count];
-    let swipe_class = env
-        .objc
-        .get_known_class("UISwipeGestureRecognizer", &mut env.mem);
-    for i in 0..count {
-        let recognizer: id = msg![env; recognizers objectAtIndex:i];
-        if recognizer == nil {
-            continue;
-        }
-        let cls: crate::objc::Class = msg![env; recognizer class];
-        if !env.objc.class_is_subclass_of(cls, swipe_class) {
-            continue;
-        }
-        let enabled: bool = msg![env; recognizer isEnabled];
-        if !enabled {
-            continue;
-        }
-        let mask: NSInteger = msg![env; recognizer direction];
-        if mask & detected_direction == 0 {
-            continue;
-        }
-        {
-            let host = env
-                .objc
-                .borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
-            host.state = UIGestureRecognizerStateRecognized;
-        }
-        fire_targets(env, recognizer);
-        let host = env
-            .objc
-            .borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
-        host.state = UIGestureRecognizerStatePossible;
-    }
 }
 
