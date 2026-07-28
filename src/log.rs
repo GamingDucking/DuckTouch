@@ -117,9 +117,7 @@ pub const ENABLED_MODULES: &[&str] = &[
     "touchHLE::window",
     "touchHLE::frameworks::uikit::ui_touch",
     "touchHLE::frameworks::uikit::ui_view",
-    "touchHLE::frameworks::opengles::eagl",
     "touchHLE::frameworks::uikit::ui_view_controller",
-    "touchHLE::frameworks::foundation::ns_timer",
     "touchHLE::frameworks::foundation::ns_run_loop",
     "touchHLE::frameworks::core_animation::ca_display_link",
 ];
