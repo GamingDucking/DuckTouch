@@ -306,7 +306,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     for &object in &objects {
         retain(env, object);
     }
-    ns_array::from_vec(env, objects)
+    let array = ns_array::from_vec(env, objects);
+    autorelease(env, array)
 }
 
 // Apple: "Returns the object in the set that is equal to a given object, or
@@ -444,7 +445,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     for &object in &objects {
         retain(env, object);
     }
-    ns_array::from_vec(env, objects)
+    let array = ns_array::from_vec(env, objects);
+    autorelease(env, array)
 }
 
 - (id)member:(id)object {

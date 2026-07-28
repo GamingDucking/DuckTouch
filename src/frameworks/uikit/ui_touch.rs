@@ -424,12 +424,12 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
         autorelease(env, new_touch);
 
         let _: () = msg![env; touches addObject:new_touch];
+        retain(env, new_touch);
         env.framework_state
             .uikit
             .ui_touch
             .current_touches
             .insert(finger_id, new_touch);
-        retain(env, new_touch);
     }
 
     let all_touches_set: id = msg_class![env; NSMutableSet
@@ -824,12 +824,15 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     // addObject:, which retains), so they remain alive until those sets are
     // released when the autorelease pool drains.
     for (finger_id, touch) in touches_to_remove {
-        env.framework_state
+        if let Some(current_touch) = env
+            .framework_state
             .uikit
             .ui_touch
             .current_touches
-            .remove(&finger_id);
-        release(env, touch);
+            .remove(&finger_id)
+        {
+            release(env, current_touch);
+        }
     }
 
     // ULTRAHLE_MINIONJUMP_DRAIN_SELECT_BEGIN
