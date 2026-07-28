@@ -226,13 +226,19 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())fire {
-    let &NSTimerHostObject {
-        target,
-        selector,
-        invocation,
-        repeats,
-        ..
-    } = env.objc.borrow(this);
+    let (target, selector, invocation, repeats, is_valid) = {
+        let host = env.objc.borrow::<NSTimerHostObject>(this);
+        (
+            host.target,
+            host.selector,
+            host.invocation,
+            host.repeats,
+            host.due_by.is_some(),
+        )
+    };
+    if !is_valid {
+        return;
+    }
     let pool: id = msg_class![env; NSAutoreleasePool new];
 
     if invocation != nil {

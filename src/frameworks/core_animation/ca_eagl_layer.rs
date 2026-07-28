@@ -15,13 +15,13 @@ use crate::Environment;
 //
 // These are the keys apps put in the drawableProperties dictionary.
 // We export them as static strings so other modules can reference them.
-pub const kEAGLDrawablePropertyRetainedBacking: &str = "kEAGLDrawablePropertyRetainedBacking";
-pub const kEAGLDrawablePropertyColorFormat: &str = "kEAGLDrawablePropertyColorFormat";
+pub const kEAGLDrawablePropertyRetainedBacking: &str = "RetainedBacking";
+pub const kEAGLDrawablePropertyColorFormat: &str = "ColorFormat";
 
 // kEAGLColorFormat values
-pub const kEAGLColorFormatRGBA8: &str = "kEAGLColorFormatRGBA8";
-pub const kEAGLColorFormatRGB565: &str = "kEAGLColorFormatRGB565";
-pub const kEAGLColorFormatSRGBA8: &str = "kEAGLColorFormatSRGBA8";
+pub const kEAGLColorFormatRGBA8: &str = "RGBA8";
+pub const kEAGLColorFormatRGB565: &str = "RGB565";
+pub const kEAGLColorFormatSRGBA8: &str = "SRGBA8";
 
 pub const CLASSES: ClassExports = objc_classes! {
 

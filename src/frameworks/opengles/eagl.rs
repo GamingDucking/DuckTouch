@@ -255,7 +255,14 @@ pub const CLASSES: ClassExports = objc_classes! {
                fromDrawable:(id)drawable { // EAGLDrawable (always CAEAGLayer*)
     log!("[EAGLContext renderbufferStorage:{:#x} fromDrawable:{:?}]", target, drawable);
 
-    assert!(target == gles11::RENDERBUFFER_OES);
+    if target != gles11::RENDERBUFFER_OES {
+        log!(
+            "[EAGLContext renderbufferStorage:{:#x} fromDrawable:{:?}] invalid target; returning NO",
+            target,
+            drawable
+        );
+        return false;
+    }
 
     // Apple's `EAGLContext` documentation for
     // `-renderbufferStorage:fromDrawable:` states that passing `nil` for the
@@ -271,10 +278,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     // (renderbuffer -> drawable) map, and release the retained drawable.
     // No new storage is allocated in this case.
     if drawable == nil {
-        let window = env
-            .window
-            .as_mut()
-            .expect("OpenGL ES is not supported in headless mode");
+        let Some(window) = env.window.as_mut() else {
+            log_dbg!(
+                "[EAGLContext renderbufferStorage:{:#x} fromDrawable:nil] ignored in headless mode",
+                target
+            );
+            return true;
+        };
         let current_renderbuffer = {
             let Some(mut gles) = super::sync_context(
                 &mut env.framework_state.opengles,
@@ -586,7 +596,13 @@ pub const CLASSES: ClassExports = objc_classes! {
         }
     }
 
-    assert!(target == gles11::RENDERBUFFER_OES);
+    if target != gles11::RENDERBUFFER_OES {
+        log!(
+            "[EAGLContext presentRenderbuffer:{:#x}] invalid target; returning NO",
+            target
+        );
+        return false;
+    }
 
     // The presented frame should be displayed ASAP, but the next one must be
     // delayed, so this needs to be checked before returning.
@@ -605,7 +621,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     // Unclear from documentation if this method requires the context to be
     // current, but it would be weird if it didn't?
-    let window = env.window.as_mut().expect("OpenGL ES is not supported in headless mode");
+    let Some(window) = env.window.as_mut() else {
+        log_dbg!(
+            "[EAGLContext presentRenderbuffer:{:#x}] ignored in headless mode",
+            target
+        );
+        return false;
+    };
     let Some(mut gles) = super::sync_context(&mut env.framework_state.opengles, &mut env.objc, window, env.current_thread) else {
         // No current EAGL context. Apple's docs require the receiver to be
         // the current context for `presentRenderbuffer:` to succeed; the
