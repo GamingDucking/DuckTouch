@@ -45,6 +45,7 @@ pub struct OpaqueMTAudioProcessingTap {
 unsafe impl SafeRead for OpaqueMTAudioProcessingTap {}
 
 #[repr(C, packed)]
+#[derive(Copy, Clone)]
 pub struct MTAudioProcessingTapCallbacks {
     pub version: i32,
     pub client_info: MutVoidPtr,
@@ -89,11 +90,13 @@ fn create_tap(env: &mut Environment, callbacks: MutPtr<MTAudioProcessingTapCallb
     }
     let tap = env.mem.alloc(1u32).cast::<OpaqueMTAudioProcessingTap>();
     let id = tap_id(tap);
+    let init = callbacks.init;
+    let client_info = callbacks.client_info;
     state(env).taps.insert(id, TapState { callbacks, storage: MutVoidPtr::null(), prepared: false });
     env.mem.write(out, tap);
-    if !callback_is_null(callbacks.init) {
-        let storage = env.mem.alloc(0u32).cast::<std::ffi::c_void>();
-        let _: () = callbacks.init.call_from_host(env, (tap, callbacks.client_info, storage));
+    if !callback_is_null(init) {
+        let storage = env.mem.alloc(0u32).cast_void();
+        let _: () = init.call_from_host(env, (tap, client_info, storage));
         state(env).taps.get_mut(&id).unwrap().storage = storage;
     }
     0
@@ -108,7 +111,7 @@ fn prepare_tap(env: &mut Environment, tap: MTAudioProcessingTapRef, max_frames: 
     let callback = state(env).taps.get(&id).map(|entry| entry.callbacks.prepare);
     if let Some(callback) = callback {
         if !callback_is_null(callback) {
-            let _: () = callback.call_from_host(env, (tap, max_frames, format));
+            let _: () = <GuestFunction as CallFromHost<(), (MTAudioProcessingTapRef, i32, ConstVoidPtr)>>::call_from_host(&callback, env, (tap, max_frames, format));
         }
     }
     if let Some(entry) = state(env).taps.get_mut(&id) {
@@ -121,7 +124,7 @@ fn unprepare_tap(env: &mut Environment, tap: MTAudioProcessingTapRef) {
     let callback = state(env).taps.get(&id).map(|entry| (entry.callbacks.unprepare, entry.prepared));
     if let Some((callback, prepared)) = callback {
         if prepared && !callback_is_null(callback) {
-            let _: () = callback.call_from_host(env, (tap,));
+            let _: () = <GuestFunction as CallFromHost<(), (MTAudioProcessingTapRef,)>>::call_from_host(&callback, env, (tap,));
         }
     }
     if let Some(entry) = state(env).taps.get_mut(&id) {
@@ -131,11 +134,13 @@ fn unprepare_tap(env: &mut Environment, tap: MTAudioProcessingTapRef) {
 
 fn destroy_tap(env: &mut Environment, tap: MTAudioProcessingTapRef) {
     let Some(entry) = state(env).taps.remove(&tap_id(tap)) else { return };
-    if entry.prepared && !callback_is_null(entry.callbacks.unprepare) {
-        let _: () = entry.callbacks.unprepare.call_from_host(env, (tap,));
+    let unprepare = entry.callbacks.unprepare;
+    let finalize = entry.callbacks.finalize;
+    if entry.prepared && !callback_is_null(unprepare) {
+        let _: () = <GuestFunction as CallFromHost<(), (MTAudioProcessingTapRef,)>>::call_from_host(&unprepare, env, (tap,));
     }
-    if !callback_is_null(entry.callbacks.finalize) {
-        let _: () = entry.callbacks.finalize.call_from_host(env, (tap,));
+    if !callback_is_null(finalize) {
+        let _: () = <GuestFunction as CallFromHost<(), (MTAudioProcessingTapRef,)>>::call_from_host(&finalize, env, (tap,));
     }
 }
 
