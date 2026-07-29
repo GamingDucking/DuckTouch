@@ -62,6 +62,7 @@ struct TapState {
     prepared: bool,
 }
 
+#[derive(Default)]
 pub struct State {
     taps: HashMap<u32, TapState>,
 }
@@ -91,8 +92,8 @@ fn create_tap(env: &mut Environment, callbacks: MutPtr<MTAudioProcessingTapCallb
     state(env).taps.insert(id, TapState { callbacks, storage: MutVoidPtr::null(), prepared: false });
     env.mem.write(out, tap);
     if !callback_is_null(callbacks.init) {
-        let storage = env.mem.alloc(4u32).cast::<MutVoidPtr>();
-        callbacks.init.call_from_host(env, (tap, callbacks.client_info, storage));
+        let storage = env.mem.alloc(0u32).cast::<std::ffi::c_void>();
+        let _: () = callbacks.init.call_from_host(env, (tap, callbacks.client_info, storage));
         state(env).taps.get_mut(&id).unwrap().storage = storage;
     }
     0
@@ -107,7 +108,7 @@ fn prepare_tap(env: &mut Environment, tap: MTAudioProcessingTapRef, max_frames: 
     let callback = state(env).taps.get(&id).map(|entry| entry.callbacks.prepare);
     if let Some(callback) = callback {
         if !callback_is_null(callback) {
-            callback.call_from_host(env, (tap, max_frames, format));
+            let _: () = callback.call_from_host(env, (tap, max_frames, format));
         }
     }
     if let Some(entry) = state(env).taps.get_mut(&id) {
@@ -120,7 +121,7 @@ fn unprepare_tap(env: &mut Environment, tap: MTAudioProcessingTapRef) {
     let callback = state(env).taps.get(&id).map(|entry| (entry.callbacks.unprepare, entry.prepared));
     if let Some((callback, prepared)) = callback {
         if prepared && !callback_is_null(callback) {
-            callback.call_from_host(env, (tap,));
+            let _: () = callback.call_from_host(env, (tap,));
         }
     }
     if let Some(entry) = state(env).taps.get_mut(&id) {
@@ -131,10 +132,10 @@ fn unprepare_tap(env: &mut Environment, tap: MTAudioProcessingTapRef) {
 fn destroy_tap(env: &mut Environment, tap: MTAudioProcessingTapRef) {
     let Some(entry) = state(env).taps.remove(&tap_id(tap)) else { return };
     if entry.prepared && !callback_is_null(entry.callbacks.unprepare) {
-        entry.callbacks.unprepare.call_from_host(env, (tap,));
+        let _: () = entry.callbacks.unprepare.call_from_host(env, (tap,));
     }
     if !callback_is_null(entry.callbacks.finalize) {
-        entry.callbacks.finalize.call_from_host(env, (tap,));
+        let _: () = entry.callbacks.finalize.call_from_host(env, (tap,));
     }
 }
 
