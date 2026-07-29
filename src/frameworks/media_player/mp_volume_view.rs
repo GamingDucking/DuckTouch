@@ -43,7 +43,7 @@ fn set_volume(env: &mut Environment, value: f32) {
 fn update_slider(env: &mut Environment, this: id) {
     let slider = env.objc.borrow::<MPVolumeViewHostObject>(this).volume_slider;
     if slider != nil {
-        let _: () = msg![env; slider setValue:volume(env)];
+        let _: () = msg![env; slider setValue:(volume(env))];
     }
 }
 
@@ -86,10 +86,10 @@ fn release_images(env: &mut Environment, images: HashMap<u32, id>) {
 
 fn init_common(env: &mut Environment, this: id) -> id {
     let slider: id = msg_class![env; UISlider alloc];
-    let slider: id = msg![env; slider initWithFrame:CGRect::default()];
+    let slider: id = msg![env; slider initWithFrame:(CGRect::default())];
     let _: () = msg![env; slider setMinimumValue:0.0_f32];
     let _: () = msg![env; slider setMaximumValue:1.0_f32];
-    let _: () = msg![env; slider setValue:volume(env)];
+    let _: () = msg![env; slider setValue:(volume(env))];
 
     let action = env
         .objc
@@ -116,7 +116,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)init {
-    msg![env; this initWithFrame:CGRect::default()]
+    msg![env; this initWithFrame:(CGRect::default())]
 }
 
 - (id)initWithFrame:(CGRect)frame {
@@ -155,7 +155,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         host.volume_slider
     };
     if slider != nil {
-        let _: () = msg![env; slider setHidden:!shows];
+        let _: () = msg![env; slider setHidden:(!shows)];
     }
 }
 
