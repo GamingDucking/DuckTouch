@@ -70,14 +70,6 @@ fn replace_state_image(
     release(env, old);
 }
 
-fn state_image(images: &HashMap<u32, id>, state: u32) -> id {
-    images
-        .get(&state)
-        .copied()
-        .or_else(|| images.get(&0).copied())
-        .unwrap_or(nil)
-}
-
 fn release_images(env: &mut Environment, images: HashMap<u32, id>) {
     for image in images.into_values() {
         release(env, image);
@@ -97,8 +89,6 @@ fn init_common(env: &mut Environment, this: id) -> id {
         .expect("MPVolumeView action selector was not registered");
     let _: () = msg![env; slider addTarget:this action:action forControlEvents:UIControlEventValueChanged];
     let _: () = msg![env; this addSubview:slider];
-    release(env, slider);
-
     env.objc.borrow_mut::<MPVolumeViewHostObject>(this).volume_slider = slider;
     let _: () = msg![env; this setShowsVolumeSlider:true];
     let _: () = msg![env; this setShowsRouteButton:true];
@@ -213,11 +203,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())setVolumeThumbImage:(id)image forState:(u32)state {
-    let old = {
-        let host = env.objc.borrow_mut::<MPVolumeViewHostObject>(this);
-        replace_state_image(env, &mut host.volume_thumb_images, state, image);
-    };
-    let _ = old;
+    let host = env.objc.borrow_mut::<MPVolumeViewHostObject>(this);
+    replace_state_image(env, &mut host.volume_thumb_images, state, image);
 }
 
 - (id)volumeThumbImageForState:(u32)state {
