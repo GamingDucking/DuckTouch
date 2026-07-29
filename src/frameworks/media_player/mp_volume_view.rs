@@ -47,27 +47,35 @@ fn update_slider(env: &mut Environment, this: id) {
     }
 }
 
-fn set_state_image(
-    env: &mut Environment,
-    images: &mut HashMap<u32, id>,
-    state: u32,
-    image: id,
-) {
+fn replace_state_image(env: &mut Environment, this: id, state: u32, image: id, kind: u32) {
     retain(env, image);
-    if let Some(old) = images.insert(state, image) {
-        release(env, old);
-    }
+    let old = match kind {
+        0 => {
+            let host = env.objc.borrow_mut::<MPVolumeViewHostObject>(this);
+            host.volume_thumb_images.insert(state, image).unwrap_or(nil)
+        }
+        1 => {
+            let host = env.objc.borrow_mut::<MPVolumeViewHostObject>(this);
+            host.minimum_volume_slider_images.insert(state, image).unwrap_or(nil)
+        }
+        2 => {
+            let host = env.objc.borrow_mut::<MPVolumeViewHostObject>(this);
+            host.maximum_volume_slider_images.insert(state, image).unwrap_or(nil)
+        }
+        _ => {
+            let host = env.objc.borrow_mut::<MPVolumeViewHostObject>(this);
+            host.route_button_images.insert(state, image).unwrap_or(nil)
+        }
+    };
+    release(env, old);
 }
 
-fn replace_state_image(
-    env: &mut Environment,
-    images: &mut HashMap<u32, id>,
-    state: u32,
-    image: id,
-) {
-    retain(env, image);
-    let old = images.insert(state, image).unwrap_or(nil);
-    release(env, old);
+fn state_image(images: &HashMap<u32, id>, state: u32) -> id {
+    images
+        .get(&state)
+        .copied()
+        .or_else(|| images.get(&0).copied())
+        .unwrap_or(nil)
 }
 
 fn release_images(env: &mut Environment, images: HashMap<u32, id>) {
@@ -89,6 +97,7 @@ fn init_common(env: &mut Environment, this: id) -> id {
         .expect("MPVolumeView action selector was not registered");
     let _: () = msg![env; slider addTarget:this action:action forControlEvents:UIControlEventValueChanged];
     let _: () = msg![env; this addSubview:slider];
+    release(env, slider);
     env.objc.borrow_mut::<MPVolumeViewHostObject>(this).volume_slider = slider;
     let _: () = msg![env; this setShowsVolumeSlider:true];
     let _: () = msg![env; this setShowsRouteButton:true];
@@ -122,7 +131,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())dealloc {
     let host = std::mem::take(env.objc.borrow_mut::<MPVolumeViewHostObject>(this));
-    release(env, host.volume_slider);
     release_images(env, host.volume_thumb_images);
     release_images(env, host.minimum_volume_slider_images);
     release_images(env, host.maximum_volume_slider_images);
@@ -203,8 +211,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())setVolumeThumbImage:(id)image forState:(u32)state {
-    let host = env.objc.borrow_mut::<MPVolumeViewHostObject>(this);
-    replace_state_image(env, &mut host.volume_thumb_images, state, image);
+    replace_state_image(env, this, state, image, 0);
 }
 
 - (id)volumeThumbImageForState:(u32)state {
@@ -213,8 +220,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())setMinimumVolumeSliderImage:(id)image forState:(u32)state {
-    let host = env.objc.borrow_mut::<MPVolumeViewHostObject>(this);
-    replace_state_image(env, &mut host.minimum_volume_slider_images, state, image);
+    replace_state_image(env, this, state, image, 1);
 }
 
 - (id)minimumVolumeSliderImageForState:(u32)state {
@@ -223,8 +229,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())setMaximumVolumeSliderImage:(id)image forState:(u32)state {
-    let host = env.objc.borrow_mut::<MPVolumeViewHostObject>(this);
-    replace_state_image(env, &mut host.maximum_volume_slider_images, state, image);
+    replace_state_image(env, this, state, image, 2);
 }
 
 - (id)maximumVolumeSliderImageForState:(u32)state {
@@ -233,8 +238,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())setRouteButtonImage:(id)image forState:(u32)state {
-    let host = env.objc.borrow_mut::<MPVolumeViewHostObject>(this);
-    replace_state_image(env, &mut host.route_button_images, state, image);
+    replace_state_image(env, this, state, image, 3);
 }
 
 - (id)routeButtonImageForState:(u32)state {
