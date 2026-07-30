@@ -358,8 +358,12 @@ pub fn open_direct(env: &mut Environment, path: ConstPtr<u8>, flags: i32) -> Fil
             let data_relative_path = relative_path.strip_prefix("Data/").unwrap_or(relative_path);
             let bundle_relative_path = format!("{bundle_root}/{relative_path}");
             let bundle_data_path = format!("{bundle_root}/Data/{data_relative_path}");
-            case_insensitive_path(env, &bundle_relative_path)
-                .or_else(|| case_insensitive_path(env, &bundle_data_path))
+            let result = case_insensitive_path(env, &bundle_relative_path)
+                .or_else(|| case_insensitive_path(env, &bundle_data_path));
+            if let Some(ref resolved) = result {
+                log_dbg!("Resolved app resource path {:?} to {:?}", path_string, resolved);
+            }
+            result
         })
         .unwrap_or_else(|| path_string.clone());
 
