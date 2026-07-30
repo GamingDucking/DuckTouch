@@ -183,7 +183,15 @@ pub const CLASSES: ClassExports = objc_classes! {
         return nil;
     }
     let path_str = to_rust_string(env, path);
-    let Ok(bytes) = env.fs.read(GuestPath::new(&path_str)) else {
+    let mut candidates = vec![path_str.clone()];
+    if path_str == "Data/data.unity3d" || path_str == "data.unity3d" {
+        let bundle_root = env.bundle.bundle_path().as_str().trim_end_matches('/');
+        candidates.push(format!("{bundle_root}/Data/globalgamemanagers").into());
+    }
+    let bytes = candidates
+        .iter()
+        .find_map(|candidate| env.fs.read(GuestPath::new(candidate)).ok());
+    let Some(bytes) = bytes else {
         log_dbg!("NSData: Failed to read file at {:?}", path_str);
         release(env, this);
         return nil;
