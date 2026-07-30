@@ -361,11 +361,14 @@ pub fn open_direct(env: &mut Environment, path: ConstPtr<u8>, flags: i32) -> Fil
             let mut candidates = vec![bundle_relative_path, bundle_data_path];
             if relative_path == "Data/data.unity3d" || relative_path == "data.unity3d" {
                 candidates.push(format!("{bundle_root}/Data/globalgamemanagers"));
-                candidates.push(format!("{bundle_root}/Data/level0"));
             }
-            candidates
+            let result = candidates
                 .iter()
-                .find_map(|candidate| case_insensitive_path(env, candidate))
+                .find_map(|candidate| case_insensitive_path(env, candidate));
+            if let Some(ref resolved) = result {
+                log_dbg!("Resolved app resource path {:?} to {:?}", path_string, resolved);
+            }
+            result
         })
         .unwrap_or_else(|| path_string.clone());
 
