@@ -2191,6 +2191,17 @@ impl Window {
     pub fn on_main_stack(&self) -> bool {
         self.on_main_stack
     }
+<<<<<<< HEAD
+=======
+
+    /// Toggle FPS counter at runtime.
+    pub fn set_show_fps_counter(&mut self, enabled: bool) {
+        self.show_fps_counter.set(enabled);
+        // Also enable the on-screen FPS overlay so runtime toggles apply to
+        // the graphical overlay as well as the window title/console logging.
+        crate::gles::present::set_onscreen_fps_enabled(enabled);
+    }
+>>>>>>> c0e8443c (Wire Show FPS quick option & runtime toggle to on-screen overlay; add runtime API to enable on-screen FPS\n\n- present.rs: support runtime flag ONSCREEN_FPS_ENABLED, set_onscreen_fps_enabled(), consult flag for overlay and FPS text updates\n- window.rs: call set_onscreen_fps_enabled from set_show_fps_counter so runtime toggles also enable the overlay\n- app_picker.rs: when Show FPS quick option is chosen, set TOUCHHLE_ONSCREEN_FPS env var and enable runtime flag\n\nCo-authored-by: Copilot App <223556219+Copilot@users.noreply.github.com>)
 }
 
 pub fn open_url(env: &mut Environment, url: &str) -> Result<(), String> {
