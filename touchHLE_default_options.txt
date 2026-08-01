@@ -348,3 +348,7 @@ com.disney.SwampyGame: --device-family=iphone-3gs
 # physical phone resolution for the guest renderbuffer can exhaust memory
 # before the app creates its ES2 context; output scaling remains host-side.
 com.gameloft.asphalt8: --landscape-right --screen-size=480x320 --force-composition
+# LEGO Ninjago: The Final Battle
+# Uses OpenAL streaming audio; keep its fixed-function landscape profile and
+# force the compatibility texture filter on strict mobile GLES drivers.
+com.lego.ninjago.thefinalbattle: --landscape-left --fix-texture-min-filter
