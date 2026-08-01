@@ -1966,6 +1966,38 @@ impl Window {
     /// presented.
     pub fn swap_window(&self) {
         self.window.gl_swap_window();
+
+        // FPS logging / UI: count frames and print once per second if enabled.
+        if self.show_fps_counter.get() {
+            // Increment frame count.
+            let frames = self.fps_frame_count.get().saturating_add(1);
+            self.fps_frame_count.set(frames);
+
+            let now = Instant::now();
+            // Borrow last log time
+            let mut last = self.fps_last_log.borrow_mut();
+            let elapsed = now.duration_since(*last);
+            if elapsed >= Duration::from_secs(1) {
+                // Compute FPS (frames in elapsed duration)
+                let fps = (frames as f32) / (elapsed.as_secs_f32().max(1e-6));
+                // Log to stdout / echo
+                echo!("FPS: {:.1}", fps);
+                // Reset counters
+                *last = now;
+                self.fps_frame_count.set(0);
+
+                // Also show FPS in the window title so it's visible when the
+                // app is running fullscreen or without console.
+                let base_title = if crate::branding().is_empty() {
+                    format!("touchHLE {}", crate::VERSION)
+                } else {
+                    format!("touchHLE {} {}", crate::branding(), crate::VERSION)
+                };
+                let title = format!("{} - FPS: {:.1}", base_title, fps);
+                // Ignore any error setting the title.
+                let _ = self.window.set_title(&title);
+            }
+        }
     }
 
     /// Consider the emulated device to be rotated to a particular orientation.
