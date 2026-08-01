@@ -1476,6 +1476,20 @@ impl Window {
                     self.toggle_fullscreen();
                     continue;
                 }
+<<<<<<< HEAD
+=======
+                // Toggle FPS counter with F9
+                E::KeyDown {
+                    keycode: Some(sdl2::keyboard::Keycode::F9),
+                    repeat: false,
+                    ..
+                } => {
+                    let new = !self.show_fps_counter.get();
+                    self.set_show_fps_counter(new);
+                    echo!("FPS counter {}", if new { "enabled" } else { "disabled" });
+                    continue;
+                }
+>>>>>>> f8e8581a (Runtime on-screen FPS: wire F9 toggle and app-picker quick option to enable overlay (set env var + runtime flag)\n\n- call set_onscreen_fps_enabled when show-fps quick option chosen)
                 E::KeyDown {
                     keycode: Some(sdl2::keyboard::Keycode::F12),
                     ..
