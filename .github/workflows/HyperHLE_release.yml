@@ -1,4 +1,4 @@
-name: Build HyperHLe
+name: Build HyperHLE
 
 on:
   workflow_dispatch:
