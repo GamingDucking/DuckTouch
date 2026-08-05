@@ -2909,6 +2909,22 @@ fn glDetachShader(env: &mut Environment, program: GLuint, shader: GLuint) {
 }
 fn glLinkProgram(env: &mut Environment, program: GLuint) {
     with_ctx_and_mem(env, |gles, _mem| unsafe {
+        if gles.is_es2() {
+            for (index, names) in [
+                (0, &["position", "a_position", "aPosition", "inPosition", "rm_Vertex"][..]),
+                (1, &["normal", "a_normal", "aNormal", "inNormal", "rm_Normal"][..]),
+                (2, &["color", "a_color", "aColor", "inColor", "rm_Color"][..]),
+                (3, &["texCoord", "texcoord", "a_texCoord", "aTexCoord", "inTexCoord", "rm_TexCoord0"][..]),
+                (4, &["texCoord1", "a_texCoord1", "aTexCoord1", "inTexCoord1", "rm_TexCoord1"][..]),
+                (5, &["tangent", "a_tangent", "aTangent", "inTangent", "rm_Tangent"][..]),
+                (6, &["binormal", "a_binormal", "aBinormal", "inBinormal", "rm_Binormal"][..]),
+            ] {
+                for name in names {
+                    let name = std::ffi::CString::new(*name).unwrap();
+                    gles.BindAttribLocation(program, index, name.as_ptr());
+                }
+            }
+        }
         gles.LinkProgram(program);
         let mut ok: GLint = 0;
         gles.GetProgramiv(program, 0x8B82 /* GL_LINK_STATUS */, &mut ok);
@@ -3244,6 +3260,24 @@ fn normalize_shader_preprocessor_whitespace(source: &str) -> String {
     out
 }
 
+fn normalize_asphalt8_shader_source(source: &str) -> String {
+    source
+        .replace("#endif]", "#endif")
+        .replace("||\r\n", "|| ")
+        .replace("||\n", "|| ")
+        .replace("|| \r\n", "|| ")
+        .replace("|| \n", "|| ")
+        .replace("&&\r\n", "&& ")
+        .replace("&&\n", "&& ")
+        .replace("&& \r\n", "&& ")
+        .replace("&& \n", "&& ")
+        .replace("vec3(1,1,1)", "vec3(1.0, 1.0, 1.0)")
+        .replace("vec4(0.5, 0, 0, 0)", "vec4(0.5, 0.0, 0.0, 0.0)")
+        .replace("vec4(0, 0.5, 0, 0)", "vec4(0.0, 0.5, 0.0, 0.0)")
+        .replace("vec4(0, 0, 0.5, 0)", "vec4(0.0, 0.0, 0.5, 0.0)")
+        .replace("vec4(0.5, 0.5, 0.5, 1)", "vec4(0.5, 0.5, 0.5, 1.0)")
+}
+
 fn glShaderSource(
     env: &mut Environment,
     shader: GLuint,
@@ -3307,6 +3341,7 @@ fn glShaderSource(
     //    uniform `CC_PMatrix` declared as type `f16mat4` and type `mat4`.
     let src = String::from_utf8_lossy(&raw_source);
     let src = normalize_shader_preprocessor_whitespace(&src);
+    let src = normalize_asphalt8_shader_source(&src);
     let bytes_vec = strip_captain_tomato_shader_precision(&src).into_bytes();
 
     let cs = std::ffi::CString::new(bytes_vec).unwrap_or_default();
@@ -5601,7 +5636,18 @@ pub const FUNCTIONS: FunctionExports = &[
 
 #[cfg(test)]
 mod shader_preprocessor_normalization_tests {
-    use super::normalize_shader_preprocessor_whitespace;
+    use super::{normalize_asphalt8_shader_source, normalize_shader_preprocessor_whitespace};
+
+    #[test]
+    fn normalizes_asphalt8_multiline_and_numeric_shader_tokens() {
+        let src = "#if FOO ||\n BAR\n#endif]\nvec3(1,1,1); vec4(0.5, 0, 0, 0);";
+        let out = normalize_asphalt8_shader_source(src);
+        assert!(out.contains("FOO ||"));
+        assert!(!out.contains("||\n"));
+        assert!(out.contains("#endif\n"));
+        assert!(out.contains("vec3(1.0, 1.0, 1.0)"));
+        assert!(out.contains("vec4(0.5, 0.0, 0.0, 0.0)"));
+    }
 
     #[test]
     fn inserts_space_before_comment_on_endif() {
