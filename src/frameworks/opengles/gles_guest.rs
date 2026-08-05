@@ -407,7 +407,7 @@ fn glGetString(env: &mut Environment, name: GLenum) -> ConstPtr<GLubyte> {
             // skinning CPU-side (see gles1_on_gl2's skin_vertices). Games such
             // as LEGO Ninjago: Rise of the Snakes feature-test this string and
             // use the palette path for skinned character meshes.
-            gles11::EXTENSIONS => b"GL_APPLE_framebuffer_multisample GL_APPLE_texture_max_level GL_EXT_discard_framebuffer GL_EXT_texture_filter_anisotropic GL_EXT_texture_lod_bias GL_IMG_read_format GL_IMG_texture_compression_pvrtc GL_IMG_texture_format_BGRA8888 GL_OES_blend_subtract GL_OES_compressed_paletted_texture GL_OES_depth24 GL_OES_draw_texture GL_OES_framebuffer_object GL_OES_mapbuffer GL_OES_matrix_palette GL_OES_point_size_array GL_OES_point_sprite GL_OES_read_format GL_OES_rgb8_rgba8 GL_OES_texture_mirrored_repeat GL_OES_vertex_array_object ",
+            gles11::EXTENSIONS => b"GL_APPLE_texture_max_level GL_EXT_discard_framebuffer GL_EXT_texture_filter_anisotropic GL_EXT_texture_lod_bias GL_IMG_read_format GL_IMG_texture_compression_pvrtc GL_IMG_texture_format_BGRA8888 GL_OES_blend_subtract GL_OES_compressed_paletted_texture GL_OES_depth24 GL_OES_draw_texture GL_OES_framebuffer_object GL_OES_mapbuffer GL_OES_matrix_palette GL_OES_point_size_array GL_OES_point_sprite GL_OES_read_format GL_OES_rgb8_rgba8 GL_OES_texture_mirrored_repeat GL_OES_vertex_array_object ",
             _ => b"Unknown",
         }
     } else {
@@ -423,7 +423,7 @@ fn glGetString(env: &mut Environment, name: GLenum) -> ConstPtr<GLubyte> {
             // desktop GL; reference it by numeric literal so we don't have
             // to pull in the ES 2.0 enum table here.
             0x8B8C => b"OpenGL ES GLSL ES 1.00",
-            gles11::EXTENSIONS => b"GL_APPLE_framebuffer_multisample GL_APPLE_texture_max_level GL_EXT_debug_label GL_EXT_discard_framebuffer GL_EXT_occlusion_query_boolean GL_EXT_texture_filter_anisotropic GL_EXT_texture_lod_bias GL_IMG_read_format GL_IMG_texture_compression_pvrtc GL_IMG_texture_format_BGRA8888 GL_OES_depth24 GL_OES_depth_texture GL_OES_packed_depth_stencil GL_OES_rgb8_rgba8 GL_OES_standard_derivatives GL_OES_texture_float GL_OES_texture_half_float GL_OES_vertex_array_object GL_OES_vertex_half_float ",
+            gles11::EXTENSIONS => b"GL_APPLE_texture_max_level GL_EXT_debug_label GL_EXT_discard_framebuffer GL_EXT_occlusion_query_boolean GL_EXT_texture_filter_anisotropic GL_EXT_texture_lod_bias GL_IMG_read_format GL_IMG_texture_compression_pvrtc GL_IMG_texture_format_BGRA8888 GL_OES_depth24 GL_OES_depth_texture GL_OES_packed_depth_stencil GL_OES_rgb8_rgba8 GL_OES_standard_derivatives GL_OES_texture_float GL_OES_texture_half_float GL_OES_vertex_array_object GL_OES_vertex_half_float ",
             _ => b"Unknown",
         }
     };
@@ -2146,9 +2146,34 @@ fn glCompressedTexImage2D(
             }
         }
 
-        let data = mem
+        let data: *const GLvoid = mem
             .ptr_at(data.cast::<u8>(), image_size.try_into().unwrap())
             .cast();
+        let is_pvrtc = matches!(
+            internalformat,
+            gles11::COMPRESSED_RGBA_PVRTC_2BPPV1_IMG
+                | gles11::COMPRESSED_RGBA_PVRTC_4BPPV1_IMG
+                | gles11::COMPRESSED_RGB_PVRTC_2BPPV1_IMG
+                | gles11::COMPRESSED_RGB_PVRTC_4BPPV1_IMG
+        );
+        if is_pvrtc && !data.is_null() && image_size > 0 {
+            let payload = std::slice::from_raw_parts(data.cast::<u8>(), image_size as usize);
+            if crate::gles::try_decode_pvrtc(
+                gles,
+                target,
+                level,
+                internalformat,
+                width,
+                height,
+                border,
+                payload,
+            ) {
+                if fix_filter {
+                    gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
+                }
+                return;
+            }
+        }
         gles.CompressedTexImage2D(
             target,
             level,
@@ -2884,6 +2909,22 @@ fn glDetachShader(env: &mut Environment, program: GLuint, shader: GLuint) {
 }
 fn glLinkProgram(env: &mut Environment, program: GLuint) {
     with_ctx_and_mem(env, |gles, _mem| unsafe {
+        if gles.is_es2() {
+            for (index, names) in [
+                (0, &["position", "a_position", "aPosition", "inPosition", "rm_Vertex"][..]),
+                (1, &["normal", "a_normal", "aNormal", "inNormal", "rm_Normal"][..]),
+                (2, &["color", "a_color", "aColor", "inColor", "rm_Color"][..]),
+                (3, &["texCoord", "texcoord", "a_texCoord", "aTexCoord", "inTexCoord", "rm_TexCoord0"][..]),
+                (4, &["texCoord1", "a_texCoord1", "aTexCoord1", "inTexCoord1", "rm_TexCoord1"][..]),
+                (5, &["tangent", "a_tangent", "aTangent", "inTangent", "rm_Tangent"][..]),
+                (6, &["binormal", "a_binormal", "aBinormal", "inBinormal", "rm_Binormal"][..]),
+            ] {
+                for name in names {
+                    let name = std::ffi::CString::new(*name).unwrap();
+                    gles.BindAttribLocation(program, index, name.as_ptr());
+                }
+            }
+        }
         gles.LinkProgram(program);
         let mut ok: GLint = 0;
         gles.GetProgramiv(program, 0x8B82 /* GL_LINK_STATUS */, &mut ok);
@@ -3219,6 +3260,24 @@ fn normalize_shader_preprocessor_whitespace(source: &str) -> String {
     out
 }
 
+fn normalize_asphalt8_shader_source(source: &str) -> String {
+    source
+        .replace("#endif]", "#endif")
+        .replace("||\r\n", "|| ")
+        .replace("||\n", "|| ")
+        .replace("|| \r\n", "|| ")
+        .replace("|| \n", "|| ")
+        .replace("&&\r\n", "&& ")
+        .replace("&&\n", "&& ")
+        .replace("&& \r\n", "&& ")
+        .replace("&& \n", "&& ")
+        .replace("vec3(1,1,1)", "vec3(1.0, 1.0, 1.0)")
+        .replace("vec4(0.5, 0, 0, 0)", "vec4(0.5, 0.0, 0.0, 0.0)")
+        .replace("vec4(0, 0.5, 0, 0)", "vec4(0.0, 0.5, 0.0, 0.0)")
+        .replace("vec4(0, 0, 0.5, 0)", "vec4(0.0, 0.0, 0.5, 0.0)")
+        .replace("vec4(0.5, 0.5, 0.5, 1)", "vec4(0.5, 0.5, 0.5, 1.0)")
+}
+
 fn glShaderSource(
     env: &mut Environment,
     shader: GLuint,
@@ -3282,6 +3341,7 @@ fn glShaderSource(
     //    uniform `CC_PMatrix` declared as type `f16mat4` and type `mat4`.
     let src = String::from_utf8_lossy(&raw_source);
     let src = normalize_shader_preprocessor_whitespace(&src);
+    let src = normalize_asphalt8_shader_source(&src);
     let bytes_vec = strip_captain_tomato_shader_precision(&src).into_bytes();
 
     let cs = std::ffi::CString::new(bytes_vec).unwrap_or_default();
@@ -5576,7 +5636,18 @@ pub const FUNCTIONS: FunctionExports = &[
 
 #[cfg(test)]
 mod shader_preprocessor_normalization_tests {
-    use super::normalize_shader_preprocessor_whitespace;
+    use super::{normalize_asphalt8_shader_source, normalize_shader_preprocessor_whitespace};
+
+    #[test]
+    fn normalizes_asphalt8_multiline_and_numeric_shader_tokens() {
+        let src = "#if FOO ||\n BAR\n#endif]\nvec3(1,1,1); vec4(0.5, 0, 0, 0);";
+        let out = normalize_asphalt8_shader_source(src);
+        assert!(out.contains("FOO ||"));
+        assert!(!out.contains("||\n"));
+        assert!(out.contains("#endif\n"));
+        assert!(out.contains("vec3(1.0, 1.0, 1.0)"));
+        assert!(out.contains("vec4(0.5, 0.0, 0.0, 0.0)"));
+    }
 
     #[test]
     fn inserts_space_before_comment_on_endif() {
