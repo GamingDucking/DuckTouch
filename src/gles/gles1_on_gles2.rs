@@ -104,6 +104,27 @@ struct TranslatorState {
     fog_start: GLfloat,
     fog_end: GLfloat,
     fog_color: [GLfloat; 4],
+    lighting_enabled: bool,
+    light0_enabled: bool,
+    color_material_enabled: bool,
+    normalize_enabled: bool,
+    light0_ambient: [GLfloat; 4],
+    light0_diffuse: [GLfloat; 4],
+    light0_specular: [GLfloat; 4],
+    light0_position: [GLfloat; 4],
+    material_ambient: [GLfloat; 4],
+    material_diffuse: [GLfloat; 4],
+    material_specular: [GLfloat; 4],
+    material_shininess: GLfloat,
+    light0_spot_direction: [GLfloat; 3],
+    light0_spot_cutoff: GLfloat,
+    light0_spot_exponent: GLfloat,
+    light0_constant_attenuation: GLfloat,
+    light0_linear_attenuation: GLfloat,
+    light0_quadratic_attenuation: GLfloat,
+    model_ambient: [GLfloat; 4],
+    texture_crop_rect: [GLint; 4],
+    viewport: [GLint; 4],
     program: Option<GLuint>,
 }
 
@@ -139,6 +160,27 @@ impl TranslatorState {
             fog_start: 0.0,
             fog_end: 1.0,
             fog_color: [0.0, 0.0, 0.0, 1.0],
+            lighting_enabled: false,
+            light0_enabled: false,
+            color_material_enabled: false,
+            normalize_enabled: false,
+            light0_ambient: [0.0, 0.0, 0.0, 1.0],
+            light0_diffuse: [1.0, 1.0, 1.0, 1.0],
+            light0_specular: [1.0, 1.0, 1.0, 1.0],
+            light0_position: [0.0, 0.0, 1.0, 0.0],
+            material_ambient: [0.2, 0.2, 0.2, 1.0],
+            material_diffuse: [0.8, 0.8, 0.8, 1.0],
+            material_specular: [0.0, 0.0, 0.0, 1.0],
+            material_shininess: 0.0,
+            light0_spot_direction: [0.0, 0.0, -1.0],
+            light0_spot_cutoff: 180.0,
+            light0_spot_exponent: 0.0,
+            light0_constant_attenuation: 1.0,
+            light0_linear_attenuation: 0.0,
+            light0_quadratic_attenuation: 0.0,
+            model_ambient: [0.2, 0.2, 0.2, 1.0],
+            texture_crop_rect: [0, 0, 0, 0],
+            viewport: [0, 0, 0, 0],
             program: None,
         }
     }
@@ -311,6 +353,22 @@ uniform mat4 u_modelview;
 uniform mat4 u_texture_matrix0;
 uniform vec4 u_color;
 uniform float u_point_size;
+uniform int u_lighting_enabled;
+uniform int u_light0_enabled;
+uniform int u_color_material_enabled;
+uniform int u_normalize_enabled;
+uniform vec4 u_light0_ambient;
+uniform vec4 u_light0_diffuse;
+uniform vec4 u_light0_position;
+uniform vec3 u_light0_spot_direction;
+uniform float u_light0_spot_cutoff;
+uniform float u_light0_spot_exponent;
+uniform float u_light0_constant_attenuation;
+uniform float u_light0_linear_attenuation;
+uniform float u_light0_quadratic_attenuation;
+uniform vec4 u_material_ambient;
+uniform vec4 u_material_diffuse;
+uniform vec4 u_model_ambient;
 varying vec4 v_color;
 varying vec2 v_tex0;
 varying float v_fog_coord;
@@ -318,7 +376,26 @@ void main() {
     vec4 eye_position = u_modelview * a_position;
     gl_Position = u_mvp * a_position;
     gl_PointSize = u_point_size;
-    v_color = a_color * u_color;
+    vec3 transformed_normal = (u_modelview * vec4(a_normal, 0.0)).xyz;
+    if (u_normalize_enabled != 0) transformed_normal = normalize(transformed_normal);
+    vec4 base_color = a_color * u_color;
+    if (u_lighting_enabled != 0 && u_light0_enabled != 0) {
+        vec3 light_direction = u_light0_position.w == 0.0 ? normalize(u_light0_position.xyz) : normalize(u_light0_position.xyz - eye_position.xyz);
+        float distance_to_light = u_light0_position.w == 0.0 ? 1.0 : length(u_light0_position.xyz - eye_position.xyz);
+        float attenuation = 1.0 / (u_light0_constant_attenuation + u_light0_linear_attenuation * distance_to_light + u_light0_quadratic_attenuation * distance_to_light * distance_to_light);
+        float spot_factor = 1.0;
+        if (u_light0_position.w != 0.0 && u_light0_spot_cutoff < 180.0) {
+            float spot_cos = dot(normalize(u_light0_spot_direction), normalize(eye_position.xyz - u_light0_position.xyz));
+            spot_factor = spot_cos < cos(radians(u_light0_spot_cutoff)) ? 0.0 : pow(max(spot_cos, 0.0), u_light0_spot_exponent);
+        }
+        float diffuse_factor = max(dot(normalize(transformed_normal), light_direction), 0.0) * attenuation * spot_factor;
+        vec4 material_diffuse = u_color_material_enabled != 0 ? base_color : u_material_diffuse;
+        vec4 material_ambient = u_color_material_enabled != 0 ? base_color : u_material_ambient;
+        vec3 lit_rgb = u_model_ambient.rgb * material_ambient.rgb + u_light0_ambient.rgb * material_ambient.rgb + u_light0_diffuse.rgb * material_diffuse.rgb * diffuse_factor;
+        v_color = vec4(lit_rgb, material_diffuse.a);
+    } else {
+        v_color = base_color;
+    }
     v_tex0 = (u_texture_matrix0 * a_tex0).xy;
     v_fog_coord = abs(eye_position.z);
 }
@@ -423,7 +500,10 @@ impl GLES for GLES1OnGLES2<'_> {
             es1::TEXTURE_2D => *params = if self.state.texture_enabled[self.state.active_texture] { gl::TRUE } else { gl::FALSE },
             es1::ALPHA_TEST => *params = if self.state.alpha_test_enabled { gl::TRUE } else { gl::FALSE },
             es1::FOG => *params = if self.state.fog_enabled { gl::TRUE } else { gl::FALSE },
-            es1::LIGHTING => *params = gl::FALSE,
+            es1::LIGHTING => *params = if self.state.lighting_enabled { gl::TRUE } else { gl::FALSE },
+            es1::LIGHT0 => *params = if self.state.light0_enabled { gl::TRUE } else { gl::FALSE },
+            es1::COLOR_MATERIAL => *params = if self.state.color_material_enabled { gl::TRUE } else { gl::FALSE },
+            es1::NORMALIZE => *params = if self.state.normalize_enabled { gl::TRUE } else { gl::FALSE },
             _ => gl::GetBooleanv(pname, params),
         }
     }
@@ -467,6 +547,44 @@ impl GLES for GLES1OnGLES2<'_> {
             *params.add(index) = float_to_fixed(*value);
         }
     }
+    unsafe fn GetLightfv(&mut self, light: GLenum, pname: GLenum, params: *mut GLfloat) {
+        if light != es1::LIGHT0 || params.is_null() { return; }
+        match pname {
+            es1::AMBIENT => params.copy_from(self.state.light0_ambient.as_ptr(), 4),
+            es1::DIFFUSE => params.copy_from(self.state.light0_diffuse.as_ptr(), 4),
+            es1::SPECULAR => params.copy_from(self.state.light0_specular.as_ptr(), 4),
+            es1::POSITION => params.copy_from(self.state.light0_position.as_ptr(), 4),
+            es1::SPOT_DIRECTION => params.copy_from(self.state.light0_spot_direction.as_ptr(), 3),
+            es1::SPOT_CUTOFF => *params = self.state.light0_spot_cutoff,
+            es1::SPOT_EXPONENT => *params = self.state.light0_spot_exponent,
+            es1::CONSTANT_ATTENUATION => *params = self.state.light0_constant_attenuation,
+            es1::LINEAR_ATTENUATION => *params = self.state.light0_linear_attenuation,
+            es1::QUADRATIC_ATTENUATION => *params = self.state.light0_quadratic_attenuation,
+            _ => {}
+        }
+    }
+    unsafe fn GetLightxv(&mut self, light: GLenum, pname: GLenum, params: *mut GLfixed) {
+        let count = if pname == es1::SPOT_DIRECTION { 3 } else if matches!(pname, es1::AMBIENT | es1::DIFFUSE | es1::SPECULAR | es1::POSITION) { 4 } else { 1 };
+        let mut values = [0.0; 4];
+        self.GetLightfv(light, pname, values.as_mut_ptr());
+        for i in 0..count { *params.add(i) = float_to_fixed(values[i]); }
+    }
+    unsafe fn GetMaterialfv(&mut self, face: GLenum, pname: GLenum, params: *mut GLfloat) {
+        if face != es1::FRONT_AND_BACK || params.is_null() { return; }
+        match pname {
+            es1::AMBIENT => params.copy_from(self.state.material_ambient.as_ptr(), 4),
+            es1::DIFFUSE => params.copy_from(self.state.material_diffuse.as_ptr(), 4),
+            es1::SPECULAR => params.copy_from(self.state.material_specular.as_ptr(), 4),
+            es1::SHININESS => *params = self.state.material_shininess,
+            _ => {}
+        }
+    }
+    unsafe fn GetMaterialxv(&mut self, face: GLenum, pname: GLenum, params: *mut GLfixed) {
+        let mut values = [0.0; 4];
+        self.GetMaterialfv(face, pname, values.as_mut_ptr());
+        let count = if pname == es1::SHININESS { 1 } else { 4 };
+        for i in 0..count { *params.add(i) = float_to_fixed(values[i]); }
+    }
     unsafe fn GetTexParameteriv(&mut self, target: GLenum, pname: GLenum, params: *mut GLint) { gl::GetTexParameteriv(target, pname, params); }
     unsafe fn GetTexParameterfv(&mut self, target: GLenum, pname: GLenum, params: *mut GLfloat) { gl::GetTexParameterfv(target, pname, params); }
     unsafe fn GetTexParameterxv(&mut self, target: GLenum, pname: GLenum, params: *mut GLfixed) {
@@ -481,7 +599,15 @@ impl GLES for GLES1OnGLES2<'_> {
             self.state.alpha_test_enabled = true;
         } else if cap == es1::FOG {
             self.state.fog_enabled = true;
-        } else if cap != es1::LIGHTING {
+        } else if cap == es1::LIGHTING {
+            self.state.lighting_enabled = true;
+        } else if cap == es1::LIGHT0 {
+            self.state.light0_enabled = true;
+        } else if cap == es1::COLOR_MATERIAL {
+            self.state.color_material_enabled = true;
+        } else if cap == es1::NORMALIZE {
+            self.state.normalize_enabled = true;
+        } else {
             gl::Enable(cap);
         }
     }
@@ -492,7 +618,15 @@ impl GLES for GLES1OnGLES2<'_> {
             self.state.alpha_test_enabled = false;
         } else if cap == es1::FOG {
             self.state.fog_enabled = false;
-        } else if cap != es1::LIGHTING {
+        } else if cap == es1::LIGHTING {
+            self.state.lighting_enabled = false;
+        } else if cap == es1::LIGHT0 {
+            self.state.light0_enabled = false;
+        } else if cap == es1::COLOR_MATERIAL {
+            self.state.color_material_enabled = false;
+        } else if cap == es1::NORMALIZE {
+            self.state.normalize_enabled = false;
+        } else {
             gl::Disable(cap);
         }
     }
@@ -507,7 +641,16 @@ impl GLES for GLES1OnGLES2<'_> {
             return if self.state.fog_enabled { gl::TRUE } else { gl::FALSE };
         }
         if cap == es1::LIGHTING {
-            return gl::FALSE;
+            return if self.state.lighting_enabled { gl::TRUE } else { gl::FALSE };
+        }
+        if cap == es1::LIGHT0 {
+            return if self.state.light0_enabled { gl::TRUE } else { gl::FALSE };
+        }
+        if cap == es1::COLOR_MATERIAL {
+            return if self.state.color_material_enabled { gl::TRUE } else { gl::FALSE };
+        }
+        if cap == es1::NORMALIZE {
+            return if self.state.normalize_enabled { gl::TRUE } else { gl::FALSE };
         }
         gl::IsEnabled(cap)
     }
@@ -560,6 +703,81 @@ impl GLES for GLES1OnGLES2<'_> {
     }
     unsafe fn SampleCoveragex(&mut self, value: GLclampx, invert: GLboolean) {
         self.SampleCoverage(fixed_to_float(value), invert);
+    }
+    unsafe fn ShadeModel(&mut self, mode: GLenum) {
+        if mode != es1::FLAT && mode != es1::SMOOTH { return; }
+    }
+    unsafe fn Lightf(&mut self, light: GLenum, pname: GLenum, param: GLfloat) {
+        if light != es1::LIGHT0 { return; }
+        match pname {
+            es1::SPOT_CUTOFF => self.state.light0_spot_cutoff = param,
+            es1::SPOT_EXPONENT => self.state.light0_spot_exponent = param,
+            es1::CONSTANT_ATTENUATION => self.state.light0_constant_attenuation = param,
+            es1::LINEAR_ATTENUATION => self.state.light0_linear_attenuation = param,
+            es1::QUADRATIC_ATTENUATION => self.state.light0_quadratic_attenuation = param,
+            _ => {}
+        }
+    }
+    unsafe fn Lightx(&mut self, light: GLenum, pname: GLenum, param: GLfixed) {
+        self.Lightf(light, pname, fixed_to_float(param));
+    }
+    unsafe fn Lightfv(&mut self, light: GLenum, pname: GLenum, params: *const GLfloat) {
+        if light != es1::LIGHT0 || params.is_null() { return; }
+        match pname {
+            es1::AMBIENT => self.state.light0_ambient = std::slice::from_raw_parts(params, 4).try_into().unwrap(),
+            es1::DIFFUSE => self.state.light0_diffuse = std::slice::from_raw_parts(params, 4).try_into().unwrap(),
+            es1::SPECULAR => self.state.light0_specular = std::slice::from_raw_parts(params, 4).try_into().unwrap(),
+            es1::POSITION => self.state.light0_position = std::slice::from_raw_parts(params, 4).try_into().unwrap(),
+            _ => {}
+        }
+    }
+    unsafe fn Lightxv(&mut self, light: GLenum, pname: GLenum, params: *const GLfixed) {
+        if params.is_null() { return; }
+        let count = if pname == es1::SPOT_DIRECTION { 3 } else { 4 };
+        let values: Vec<GLfloat> = std::slice::from_raw_parts(params, count).iter().map(|v| fixed_to_float(*v)).collect();
+        if pname == es1::SPOT_DIRECTION {
+            if light == es1::LIGHT0 { self.state.light0_spot_direction = values.try_into().unwrap(); }
+        } else {
+            self.Lightfv(light, pname, values.as_ptr());
+        }
+    }
+    unsafe fn LightModelf(&mut self, pname: GLenum, param: GLfloat) {
+        if pname == es1::LIGHT_MODEL_TWO_SIDE { return; }
+    }
+    unsafe fn LightModelx(&mut self, pname: GLenum, param: GLfixed) {
+        self.LightModelf(pname, fixed_to_float(param));
+    }
+    unsafe fn LightModelfv(&mut self, pname: GLenum, params: *const GLfloat) {
+        if pname == es1::LIGHT_MODEL_AMBIENT && !params.is_null() {
+            self.state.model_ambient = std::slice::from_raw_parts(params, 4).try_into().unwrap();
+        }
+    }
+    unsafe fn LightModelxv(&mut self, pname: GLenum, params: *const GLfixed) {
+        if pname == es1::LIGHT_MODEL_AMBIENT && !params.is_null() {
+            self.state.model_ambient = std::slice::from_raw_parts(params, 4).iter().map(|v| fixed_to_float(*v)).collect::<Vec<_>>().try_into().unwrap();
+        }
+    }
+    unsafe fn Materialf(&mut self, face: GLenum, pname: GLenum, param: GLfloat) {
+        if face != es1::FRONT_AND_BACK { return; }
+        if pname == es1::SHININESS { self.state.material_shininess = param; }
+    }
+    unsafe fn Materialx(&mut self, face: GLenum, pname: GLenum, param: GLfixed) {
+        self.Materialf(face, pname, fixed_to_float(param));
+    }
+    unsafe fn Materialfv(&mut self, face: GLenum, pname: GLenum, params: *const GLfloat) {
+        if face != es1::FRONT_AND_BACK || params.is_null() { return; }
+        let values: [GLfloat; 4] = std::slice::from_raw_parts(params, 4).try_into().unwrap();
+        match pname {
+            es1::AMBIENT => self.state.material_ambient = values,
+            es1::DIFFUSE | es1::AMBIENT_AND_DIFFUSE => self.state.material_diffuse = values,
+            es1::SPECULAR => self.state.material_specular = values,
+            _ => {}
+        }
+    }
+    unsafe fn Materialxv(&mut self, face: GLenum, pname: GLenum, params: *const GLfixed) {
+        if params.is_null() { return; }
+        let values: [GLfloat; 4] = std::slice::from_raw_parts(params, 4).iter().map(|v| fixed_to_float(*v)).collect::<Vec<_>>().try_into().unwrap();
+        self.Materialfv(face, pname, values.as_ptr());
     }
     unsafe fn Color4f(&mut self, r: GLfloat, g: GLfloat, b: GLfloat, a: GLfloat) { self.state.color = [r, g, b, a]; }
     unsafe fn Color4x(&mut self, r: GLfixed, g: GLfixed, b: GLfixed, a: GLfixed) { self.Color4f(fixed_to_float(r), fixed_to_float(g), fixed_to_float(b), fixed_to_float(a)); }
@@ -642,9 +860,58 @@ impl GLES for GLES1OnGLES2<'_> {
     unsafe fn TexParameteri(&mut self, target: GLenum, pname: GLenum, param: GLint) { gl::TexParameteri(target, pname, param); }
     unsafe fn TexParameterf(&mut self, target: GLenum, pname: GLenum, param: GLfloat) { gl::TexParameterf(target, pname, param); }
     unsafe fn TexParameterx(&mut self, target: GLenum, pname: GLenum, param: GLfixed) { gl::TexParameterf(target, pname, fixed_to_float(param)); }
-    unsafe fn TexParameteriv(&mut self, target: GLenum, pname: GLenum, params: *const GLint) { gl::TexParameteriv(target, pname, params); }
-    unsafe fn TexParameterfv(&mut self, target: GLenum, pname: GLenum, params: *const GLfloat) { gl::TexParameterfv(target, pname, params); }
-    unsafe fn TexParameterxv(&mut self, target: GLenum, pname: GLenum, params: *const GLfixed) { let v = fixed_to_float(*params); gl::TexParameterf(target, pname, v); }
+    unsafe fn TexParameteriv(&mut self, target: GLenum, pname: GLenum, params: *const GLint) {
+        if pname == es1::TEXTURE_CROP_RECT_OES && !params.is_null() { self.state.texture_crop_rect = std::slice::from_raw_parts(params, 4).try_into().unwrap(); return; }
+        gl::TexParameteriv(target, pname, params);
+    }
+    unsafe fn TexParameterfv(&mut self, target: GLenum, pname: GLenum, params: *const GLfloat) {
+        if pname == es1::TEXTURE_CROP_RECT_OES && !params.is_null() { self.state.texture_crop_rect = std::slice::from_raw_parts(params, 4).iter().map(|v| *v as GLint).collect::<Vec<_>>().try_into().unwrap(); return; }
+        gl::TexParameterfv(target, pname, params);
+    }
+    unsafe fn TexParameterxv(&mut self, target: GLenum, pname: GLenum, params: *const GLfixed) {
+        if pname == es1::TEXTURE_CROP_RECT_OES && !params.is_null() { self.state.texture_crop_rect = std::slice::from_raw_parts(params, 4).try_into().unwrap(); return; }
+        let v = fixed_to_float(*params); gl::TexParameterf(target, pname, v);
+    }
+    unsafe fn DrawTexfOES(&mut self, x: GLfloat, y: GLfloat, z: GLfloat, width: GLfloat, height: GLfloat) {
+        let program = match self.state.program {
+            Some(program) => program,
+            None => { let Ok(program) = create_program() else { return; }; self.state.program = Some(program); program }
+        };
+        let crop = self.state.texture_crop_rect;
+        let viewport = self.state.viewport;
+        if width <= 0.0 || height <= 0.0 || viewport[2] <= 0 || viewport[3] <= 0 { return; }
+        let sx = 2.0 / viewport[2] as GLfloat;
+        let sy = 2.0 / viewport[3] as GLfloat;
+        let x0 = x * sx - 1.0;
+        let y0 = y * sy - 1.0;
+        let x1 = (x + width) * sx - 1.0;
+        let y1 = (y + height) * sy - 1.0;
+        let vertices = [x0, y0, z, 1.0, x1, y0, z, 1.0, x0, y1, z, 1.0, x1, y1, z, 1.0];
+        let tex_w = crop[2].max(1) as GLfloat;
+        let tex_h = crop[3].max(1) as GLfloat;
+        let u0 = crop[0] as GLfloat / tex_w;
+        let v0 = crop[1] as GLfloat / tex_h;
+        let u1 = (crop[0] + crop[2]) as GLfloat / tex_w;
+        let v1 = (crop[1] + crop[3]) as GLfloat / tex_h;
+        let texcoords = [u0, v1, u1, v1, u0, v0, u1, v0];
+        gl::UseProgram(program);
+        gl::UniformMatrix4fv(gl::GetUniformLocation(program, b"u_mvp\0".as_ptr() as *const _), 1, gl::FALSE, MATRIX_IDENTITY.as_ptr());
+        gl::Uniform4f(gl::GetUniformLocation(program, b"u_color\0".as_ptr() as *const _), 1.0, 1.0, 1.0, 1.0);
+        gl::Uniform1i(gl::GetUniformLocation(program, b"u_tex_enabled0\0".as_ptr() as *const _), 1);
+        gl::Uniform1i(gl::GetUniformLocation(program, b"u_tex_mode0\0".as_ptr() as *const _), 1);
+        gl::Uniform1i(gl::GetUniformLocation(program, b"u_tex0\0".as_ptr() as *const _), 0);
+        gl::DisableVertexAttribArray(ATTR_COLOR);
+        gl::VertexAttrib4f(ATTR_COLOR, 1.0, 1.0, 1.0, 1.0);
+        gl::DisableVertexAttribArray(ATTR_NORMAL);
+        gl::DisableVertexAttribArray(ATTR_TEX0);
+        gl::EnableVertexAttribArray(ATTR_POSITION);
+        gl::EnableVertexAttribArray(ATTR_TEX0);
+        gl::VertexAttribPointer(ATTR_POSITION, 4, gl::FLOAT, gl::FALSE, 0, vertices.as_ptr().cast());
+        gl::VertexAttribPointer(ATTR_TEX0, 2, gl::FLOAT, gl::FALSE, 0, texcoords.as_ptr().cast());
+        gl::DrawArrays(gl::TRIANGLE_STRIP, 0, 4);
+        gl::DisableVertexAttribArray(ATTR_POSITION);
+        gl::DisableVertexAttribArray(ATTR_TEX0);
+    }
     unsafe fn TexImage2D(&mut self, target: GLenum, level: GLint, internalformat: GLint, width: GLsizei, height: GLsizei, border: GLint, format: GLenum, type_: GLenum, pixels: *const GLvoid) { gl::TexImage2D(target, level, internalformat, width, height, border, format, type_, pixels); }
     unsafe fn TexSubImage2D(&mut self, target: GLenum, level: GLint, x: GLint, y: GLint, width: GLsizei, height: GLsizei, format: GLenum, type_: GLenum, pixels: *const GLvoid) { gl::TexSubImage2D(target, level, x, y, width, height, format, type_, pixels); }
     unsafe fn CompressedTexImage2D(&mut self, target: GLenum, level: GLint, internalformat: GLenum, width: GLsizei, height: GLsizei, border: GLint, image_size: GLsizei, data: *const GLvoid) {
@@ -690,7 +957,7 @@ impl GLES for GLES1OnGLES2<'_> {
     unsafe fn Scalex(&mut self, x: GLfixed, y: GLfixed, z: GLfixed) { self.Scalef(fixed_to_float(x), fixed_to_float(y), fixed_to_float(z)); }
     unsafe fn Rotatef(&mut self, a: GLfloat, x: GLfloat, y: GLfloat, z: GLfloat) { let m = self.state.matrix_mut().current; self.state.matrix_mut().current = multiply(&m, &rotation(a, x, y, z)); }
     unsafe fn Rotatex(&mut self, a: GLfixed, x: GLfixed, y: GLfixed, z: GLfixed) { self.Rotatef(fixed_to_float(a), fixed_to_float(x), fixed_to_float(y), fixed_to_float(z)); }
-    unsafe fn Viewport(&mut self, x: GLint, y: GLint, w: GLsizei, h: GLsizei) { gl::Viewport(x, y, w, h); }
+    unsafe fn Viewport(&mut self, x: GLint, y: GLint, w: GLsizei, h: GLsizei) { self.state.viewport = [x, y, w, h]; gl::Viewport(x, y, w, h); }
     unsafe fn Scissor(&mut self, x: GLint, y: GLint, w: GLsizei, h: GLsizei) { gl::Scissor(x, y, w, h); }
     unsafe fn Clear(&mut self, mask: GLbitfield) { gl::Clear(mask); }
     unsafe fn ClearColor(&mut self, r: GLclampf, g: GLclampf, b: GLclampf, a: GLclampf) { gl::ClearColor(r, g, b, a); }
@@ -707,7 +974,14 @@ impl GLES for GLES1OnGLES2<'_> {
     unsafe fn Fogxv(&mut self, pname: GLenum, params: *const GLfixed) {
         if pname == es1::FOG_COLOR { self.state.fog_color = std::slice::from_raw_parts(params, 4).iter().map(|v| fixed_to_float(*v)).collect::<Vec<_>>().try_into().unwrap(); } else { self.Fogx(pname, *params); }
     }
-    unsafe fn GetIntegerv(&mut self, pname: GLenum, params: *mut GLint) { gl::GetIntegerv(pname, params); }
+    unsafe fn GetIntegerv(&mut self, pname: GLenum, params: *mut GLint) {
+        if params.is_null() { return; }
+        match pname {
+            es1::VIEWPORT => params.copy_from(self.state.viewport.as_ptr(), 4),
+            es1::TEXTURE_CROP_RECT_OES => params.copy_from(self.state.texture_crop_rect.as_ptr(), 4),
+            _ => gl::GetIntegerv(pname, params),
+        }
+    }
     unsafe fn DepthFunc(&mut self, f: GLenum) { gl::DepthFunc(f); }
     unsafe fn DepthMask(&mut self, f: GLboolean) { gl::DepthMask(f); }
     unsafe fn CullFace(&mut self, f: GLenum) { gl::CullFace(f); }
@@ -773,6 +1047,22 @@ impl GLES for GLES1OnGLES2<'_> {
         gl::UniformMatrix4fv(texture_matrix_loc, 1, gl::FALSE, self.state.texture[0].current.as_ptr());
         let color_loc = gl::GetUniformLocation(program, b"u_color\0".as_ptr() as *const _);
         gl::Uniform4fv(color_loc, 1, self.state.color.as_ptr());
+        gl::Uniform1i(gl::GetUniformLocation(program, b"u_lighting_enabled\0".as_ptr() as *const _), self.state.lighting_enabled as GLint);
+        gl::Uniform1i(gl::GetUniformLocation(program, b"u_light0_enabled\0".as_ptr() as *const _), self.state.light0_enabled as GLint);
+        gl::Uniform1i(gl::GetUniformLocation(program, b"u_color_material_enabled\0".as_ptr() as *const _), self.state.color_material_enabled as GLint);
+        gl::Uniform1i(gl::GetUniformLocation(program, b"u_normalize_enabled\0".as_ptr() as *const _), self.state.normalize_enabled as GLint);
+        gl::Uniform4fv(gl::GetUniformLocation(program, b"u_light0_ambient\0".as_ptr() as *const _), 1, self.state.light0_ambient.as_ptr());
+        gl::Uniform4fv(gl::GetUniformLocation(program, b"u_light0_diffuse\0".as_ptr() as *const _), 1, self.state.light0_diffuse.as_ptr());
+        gl::Uniform4fv(gl::GetUniformLocation(program, b"u_light0_position\0".as_ptr() as *const _), 1, self.state.light0_position.as_ptr());
+        gl::Uniform3fv(gl::GetUniformLocation(program, b"u_light0_spot_direction\0".as_ptr() as *const _), 1, self.state.light0_spot_direction.as_ptr());
+        gl::Uniform1f(gl::GetUniformLocation(program, b"u_light0_spot_cutoff\0".as_ptr() as *const _), self.state.light0_spot_cutoff);
+        gl::Uniform1f(gl::GetUniformLocation(program, b"u_light0_spot_exponent\0".as_ptr() as *const _), self.state.light0_spot_exponent);
+        gl::Uniform1f(gl::GetUniformLocation(program, b"u_light0_constant_attenuation\0".as_ptr() as *const _), self.state.light0_constant_attenuation);
+        gl::Uniform1f(gl::GetUniformLocation(program, b"u_light0_linear_attenuation\0".as_ptr() as *const _), self.state.light0_linear_attenuation);
+        gl::Uniform1f(gl::GetUniformLocation(program, b"u_light0_quadratic_attenuation\0".as_ptr() as *const _), self.state.light0_quadratic_attenuation);
+        gl::Uniform4fv(gl::GetUniformLocation(program, b"u_material_ambient\0".as_ptr() as *const _), 1, self.state.material_ambient.as_ptr());
+        gl::Uniform4fv(gl::GetUniformLocation(program, b"u_material_diffuse\0".as_ptr() as *const _), 1, self.state.material_diffuse.as_ptr());
+        gl::Uniform4fv(gl::GetUniformLocation(program, b"u_model_ambient\0".as_ptr() as *const _), 1, self.state.model_ambient.as_ptr());
         let alpha_test_loc = gl::GetUniformLocation(program, b"u_alpha_test_enabled\0".as_ptr() as *const _);
         gl::Uniform1i(alpha_test_loc, if self.state.alpha_test_enabled { 1 } else { 0 });
         let alpha_func_loc = gl::GetUniformLocation(program, b"u_alpha_func\0".as_ptr() as *const _);
@@ -833,6 +1123,22 @@ impl GLES for GLES1OnGLES2<'_> {
         gl::UniformMatrix4fv(texture_matrix_loc, 1, gl::FALSE, self.state.texture[0].current.as_ptr());
         let color_loc = gl::GetUniformLocation(program, b"u_color\0".as_ptr() as *const _);
         gl::Uniform4fv(color_loc, 1, self.state.color.as_ptr());
+        gl::Uniform1i(gl::GetUniformLocation(program, b"u_lighting_enabled\0".as_ptr() as *const _), self.state.lighting_enabled as GLint);
+        gl::Uniform1i(gl::GetUniformLocation(program, b"u_light0_enabled\0".as_ptr() as *const _), self.state.light0_enabled as GLint);
+        gl::Uniform1i(gl::GetUniformLocation(program, b"u_color_material_enabled\0".as_ptr() as *const _), self.state.color_material_enabled as GLint);
+        gl::Uniform1i(gl::GetUniformLocation(program, b"u_normalize_enabled\0".as_ptr() as *const _), self.state.normalize_enabled as GLint);
+        gl::Uniform4fv(gl::GetUniformLocation(program, b"u_light0_ambient\0".as_ptr() as *const _), 1, self.state.light0_ambient.as_ptr());
+        gl::Uniform4fv(gl::GetUniformLocation(program, b"u_light0_diffuse\0".as_ptr() as *const _), 1, self.state.light0_diffuse.as_ptr());
+        gl::Uniform4fv(gl::GetUniformLocation(program, b"u_light0_position\0".as_ptr() as *const _), 1, self.state.light0_position.as_ptr());
+        gl::Uniform3fv(gl::GetUniformLocation(program, b"u_light0_spot_direction\0".as_ptr() as *const _), 1, self.state.light0_spot_direction.as_ptr());
+        gl::Uniform1f(gl::GetUniformLocation(program, b"u_light0_spot_cutoff\0".as_ptr() as *const _), self.state.light0_spot_cutoff);
+        gl::Uniform1f(gl::GetUniformLocation(program, b"u_light0_spot_exponent\0".as_ptr() as *const _), self.state.light0_spot_exponent);
+        gl::Uniform1f(gl::GetUniformLocation(program, b"u_light0_constant_attenuation\0".as_ptr() as *const _), self.state.light0_constant_attenuation);
+        gl::Uniform1f(gl::GetUniformLocation(program, b"u_light0_linear_attenuation\0".as_ptr() as *const _), self.state.light0_linear_attenuation);
+        gl::Uniform1f(gl::GetUniformLocation(program, b"u_light0_quadratic_attenuation\0".as_ptr() as *const _), self.state.light0_quadratic_attenuation);
+        gl::Uniform4fv(gl::GetUniformLocation(program, b"u_material_ambient\0".as_ptr() as *const _), 1, self.state.material_ambient.as_ptr());
+        gl::Uniform4fv(gl::GetUniformLocation(program, b"u_material_diffuse\0".as_ptr() as *const _), 1, self.state.material_diffuse.as_ptr());
+        gl::Uniform4fv(gl::GetUniformLocation(program, b"u_model_ambient\0".as_ptr() as *const _), 1, self.state.model_ambient.as_ptr());
         let point_size_loc = gl::GetUniformLocation(program, b"u_point_size\0".as_ptr() as *const _);
         gl::Uniform1f(point_size_loc, self.state.point_size);
         let tex_enabled = self.state.texture_enabled[0];
@@ -857,7 +1163,7 @@ impl GLES1OnGLES2<'_> {
     unsafe fn bind_array(&mut self, index: GLuint, array: &ArrayState) {
         if !array.enabled {
             gl::DisableVertexAttribArray(index);
-            let value = if index == ATTR_COLOR { self.state.color } else if index == ATTR_TEX0 { self.state.texcoords[0] } else if index == ATTR_NORMAL { [self.state.normal[0], self.state.normal[1], self.state.normal[2], 1.0] } else { [0.0, 0.0, 0.0, 1.0] };
+            let value = if index == ATTR_COLOR { [1.0, 1.0, 1.0, 1.0] } else if index == ATTR_TEX0 { self.state.texcoords[0] } else if index == ATTR_NORMAL { [self.state.normal[0], self.state.normal[1], self.state.normal[2], 1.0] } else { [0.0, 0.0, 0.0, 1.0] };
             gl::VertexAttrib4fv(index, value.as_ptr());
             return;
         }
