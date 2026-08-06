@@ -451,6 +451,7 @@ impl GLES for GLES1OnGLES2<'_> {
     unsafe fn ClearColorx(&mut self, r: GLclampx, g: GLclampx, b: GLclampx, a: GLclampx) { self.ClearColor(fixed_to_float(r), fixed_to_float(g), fixed_to_float(b), fixed_to_float(a)); }
     unsafe fn ClearDepthf(&mut self, d: GLclampf) { gl::ClearDepthf(d); }
     unsafe fn ClearStencil(&mut self, s: GLint) { gl::ClearStencil(s); }
+    unsafe fn GetIntegerv(&mut self, pname: GLenum, params: *mut GLint) { gl::GetIntegerv(pname, params); }
     unsafe fn DepthFunc(&mut self, f: GLenum) { gl::DepthFunc(f); }
     unsafe fn DepthMask(&mut self, f: GLboolean) { gl::DepthMask(f); }
     unsafe fn CullFace(&mut self, f: GLenum) { gl::CullFace(f); }
