@@ -588,6 +588,36 @@ impl GLES for GLES1OnGLES2<'_> {
     unsafe fn GetUniformLocation(&mut self, program: GLuint, name: *const GLchar) -> GLint { gl::GetUniformLocation(program, name) }
     unsafe fn GetActiveAttrib(&mut self, program: GLuint, index: GLuint, buf_size: GLsizei, length: *mut GLsizei, size: *mut GLint, type_: *mut GLenum, name: *mut GLchar) { gl::GetActiveAttrib(program, index, buf_size, length, size, type_, name); }
     unsafe fn GetActiveUniform(&mut self, program: GLuint, index: GLuint, buf_size: GLsizei, length: *mut GLsizei, size: *mut GLint, type_: *mut GLenum, name: *mut GLchar) { gl::GetActiveUniform(program, index, buf_size, length, size, type_, name); }
+    unsafe fn EnableVertexAttribArray(&mut self, index: GLuint) { gl::EnableVertexAttribArray(index); }
+    unsafe fn DisableVertexAttribArray(&mut self, index: GLuint) { gl::DisableVertexAttribArray(index); }
+    unsafe fn VertexAttribPointer(&mut self, index: GLuint, size: GLint, type_: GLenum, normalized: GLboolean, stride: GLsizei, pointer: *const GLvoid) { gl::VertexAttribPointer(index, size, type_, normalized, stride, pointer); }
+    unsafe fn VertexAttrib1f(&mut self, index: GLuint, x: GLfloat) { gl::VertexAttrib1f(index, x); }
+    unsafe fn VertexAttrib2f(&mut self, index: GLuint, x: GLfloat, y: GLfloat) { gl::VertexAttrib2f(index, x, y); }
+    unsafe fn VertexAttrib3f(&mut self, index: GLuint, x: GLfloat, y: GLfloat, z: GLfloat) { gl::VertexAttrib3f(index, x, y, z); }
+    unsafe fn VertexAttrib4f(&mut self, index: GLuint, x: GLfloat, y: GLfloat, z: GLfloat, w: GLfloat) { gl::VertexAttrib4f(index, x, y, z, w); }
+    unsafe fn VertexAttrib1fv(&mut self, index: GLuint, v: *const GLfloat) { gl::VertexAttrib1fv(index, v); }
+    unsafe fn VertexAttrib2fv(&mut self, index: GLuint, v: *const GLfloat) { gl::VertexAttrib2fv(index, v); }
+    unsafe fn VertexAttrib3fv(&mut self, index: GLuint, v: *const GLfloat) { gl::VertexAttrib3fv(index, v); }
+    unsafe fn VertexAttrib4fv(&mut self, index: GLuint, v: *const GLfloat) { gl::VertexAttrib4fv(index, v); }
+    unsafe fn Uniform1f(&mut self, location: GLint, v0: GLfloat) { gl::Uniform1f(location, v0); }
+    unsafe fn Uniform2f(&mut self, location: GLint, v0: GLfloat, v1: GLfloat) { gl::Uniform2f(location, v0, v1); }
+    unsafe fn Uniform3f(&mut self, location: GLint, v0: GLfloat, v1: GLfloat, v2: GLfloat) { gl::Uniform3f(location, v0, v1, v2); }
+    unsafe fn Uniform4f(&mut self, location: GLint, v0: GLfloat, v1: GLfloat, v2: GLfloat, v3: GLfloat) { gl::Uniform4f(location, v0, v1, v2, v3); }
+    unsafe fn Uniform1i(&mut self, location: GLint, v0: GLint) { gl::Uniform1i(location, v0); }
+    unsafe fn Uniform2i(&mut self, location: GLint, v0: GLint, v1: GLint) { gl::Uniform2i(location, v0, v1); }
+    unsafe fn Uniform3i(&mut self, location: GLint, v0: GLint, v1: GLint, v2: GLint) { gl::Uniform3i(location, v0, v1, v2); }
+    unsafe fn Uniform4i(&mut self, location: GLint, v0: GLint, v1: GLint, v2: GLint, v3: GLint) { gl::Uniform4i(location, v0, v1, v2, v3); }
+    unsafe fn Uniform1fv(&mut self, location: GLint, count: GLsizei, value: *const GLfloat) { gl::Uniform1fv(location, count, value); }
+    unsafe fn Uniform2fv(&mut self, location: GLint, count: GLsizei, value: *const GLfloat) { gl::Uniform2fv(location, count, value); }
+    unsafe fn Uniform3fv(&mut self, location: GLint, count: GLsizei, value: *const GLfloat) { gl::Uniform3fv(location, count, value); }
+    unsafe fn Uniform4fv(&mut self, location: GLint, count: GLsizei, value: *const GLfloat) { gl::Uniform4fv(location, count, value); }
+    unsafe fn Uniform1iv(&mut self, location: GLint, count: GLsizei, value: *const GLint) { gl::Uniform1iv(location, count, value); }
+    unsafe fn Uniform2iv(&mut self, location: GLint, count: GLsizei, value: *const GLint) { gl::Uniform2iv(location, count, value); }
+    unsafe fn Uniform3iv(&mut self, location: GLint, count: GLsizei, value: *const GLint) { gl::Uniform3iv(location, count, value); }
+    unsafe fn Uniform4iv(&mut self, location: GLint, count: GLsizei, value: *const GLint) { gl::Uniform4iv(location, count, value); }
+    unsafe fn UniformMatrix2fv(&mut self, location: GLint, count: GLsizei, transpose: GLboolean, value: *const GLfloat) { gl::UniformMatrix2fv(location, count, transpose, value); }
+    unsafe fn UniformMatrix3fv(&mut self, location: GLint, count: GLsizei, transpose: GLboolean, value: *const GLfloat) { gl::UniformMatrix3fv(location, count, transpose, value); }
+    unsafe fn UniformMatrix4fv(&mut self, location: GLint, count: GLsizei, transpose: GLboolean, value: *const GLfloat) { gl::UniformMatrix4fv(location, count, transpose, value); }
     unsafe fn GetShaderSource(&mut self, shader: GLuint, buf_size: GLsizei, length: *mut GLsizei, source: *mut GLchar) { gl::GetShaderSource(shader, buf_size, length, source); }
     unsafe fn GetAttachedShaders(&mut self, program: GLuint, max_count: GLsizei, count: *mut GLsizei, shaders: *mut GLuint) { gl::GetAttachedShaders(program, max_count, count, shaders); }
     unsafe fn GetUniformiv(&mut self, program: GLuint, location: GLint, params: *mut GLint) { gl::GetUniformiv(program, location, params); }
