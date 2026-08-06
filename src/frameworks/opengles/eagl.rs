@@ -668,14 +668,33 @@ pub const CLASSES: ClassExports = objc_classes! {
     // We're presenting to the opaque CAEAGLLayer that covers the screen.
     // We can use the fast path where we skip composition and present directly.
     if drawable == fullscreen_layer {
-        log_dbg!(
-            "Layer {:?} is the fullscreen layer, presenting renderbuffer {:?} directly (fast path).",
-            drawable,
-            renderbuffer,
-        );
-        // re-borrow
-        unsafe {
-            present_renderbuffer(env);
+        let native_es1 = {
+            let maybe_gles = super::sync_context(
+                &mut env.framework_state.opengles,
+                &mut env.objc,
+                env.window.as_mut().unwrap(),
+                env.current_thread,
+            );
+            maybe_gles.is_some_and(|gles| gles.is_native_es1())
+        };
+        if native_es1 {
+            log!(
+                "Layer {:?} uses native ES1; presenting renderbuffer {:?} through resolved RAM readback to avoid empty tile-buffer copies.",
+                drawable,
+                renderbuffer,
+            );
+            unsafe {
+                present_renderbuffer_readback(env, drawable);
+            }
+        } else {
+            log_dbg!(
+                "Layer {:?} is the fullscreen layer, presenting renderbuffer {:?} directly (fast path).",
+                drawable,
+                renderbuffer,
+            );
+            unsafe {
+                present_renderbuffer(env);
+            }
         }
     } else {
         if fullscreen_layer != nil {
@@ -766,6 +785,27 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 };
+
+unsafe fn present_renderbuffer_readback(env: &mut Environment, drawable: id) {
+    let read_result = {
+        let maybe_gles = super::sync_context(
+            &mut env.framework_state.opengles,
+            &mut env.objc,
+            env.window.as_mut().unwrap(),
+            env.current_thread,
+        );
+        match maybe_gles {
+            Some(mut gles) => Some(read_renderbuffer(gles.as_mut(), Vec::new())),
+            None => None,
+        }
+    };
+    let Some((pixels, width, height)) = read_result else {
+        log!("Native ES1 readback skipped because the GL context disappeared.");
+        return;
+    };
+    present_pixels(env, drawable, pixels, width, height);
+    crate::frameworks::core_animation::recomposite_if_necessary(env, true);
+}
 
 /// Implement framerate limiting.
 ///
@@ -900,16 +940,18 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, mut pixel_buffer: Vec<u8>) -> (
     // state changes we make.
     let old_framebuffer: GLuint = get_int(gles, gles11::FRAMEBUFFER_BINDING_OES) as _;
 
-    // Create a framebuffer we can use to read from the renderbuffer
+    let use_bound_framebuffer = old_framebuffer != 0;
     let mut src_framebuffer = 0;
-    gles.GenFramebuffersOES(1, &mut src_framebuffer);
-    gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, src_framebuffer);
-    gles.FramebufferRenderbufferOES(
-        gles11::FRAMEBUFFER_OES,
-        gles11::COLOR_ATTACHMENT0_OES,
-        gles11::RENDERBUFFER_OES,
-        renderbuffer,
-    );
+    if !use_bound_framebuffer {
+        gles.GenFramebuffersOES(1, &mut src_framebuffer);
+        gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, src_framebuffer);
+        gles.FramebufferRenderbufferOES(
+            gles11::FRAMEBUFFER_OES,
+            gles11::COLOR_ATTACHMENT0_OES,
+            gles11::RENDERBUFFER_OES,
+            renderbuffer,
+        );
+    }
 
     // On tile-based GPUs (Mali, Adreno, PowerVR) the per-tile color buffer
     // isn't guaranteed to be resolved to the renderbuffer's main memory
@@ -945,11 +987,10 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, mut pixel_buffer: Vec<u8>) -> (
     );
     pixel_buffer.set_len(size);
 
-    // Clean up the framebuffer object since we no longer need it.
-    gles.DeleteFramebuffersOES(1, &src_framebuffer);
-
-    // Restore the framebuffer binding
-    gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, old_framebuffer);
+    if !use_bound_framebuffer {
+        gles.DeleteFramebuffersOES(1, &src_framebuffer);
+        gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, old_framebuffer);
+    }
 
     (pixel_buffer, width_u32, height_u32)
 }

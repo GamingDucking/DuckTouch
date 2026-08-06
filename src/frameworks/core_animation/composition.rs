@@ -81,10 +81,21 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     // Advance any UIImageView frame animations before compositing.
     crate::frameworks::uikit::ui_view::ui_image_view::update_animations(env);
 
-    if find_fullscreen_eagl_layer(env) != nil {
-        // No composition done, EAGLContext will present directly.
-        log_dbg!("Using CAEAGLLayer fast path, skipping composition");
-        return None;
+    let fullscreen_eagl_layer = find_fullscreen_eagl_layer(env);
+    if fullscreen_eagl_layer != nil {
+        let has_presented_pixels = env
+            .objc
+            .borrow::<CALayerHostObject>(fullscreen_eagl_layer)
+            .presented_pixels
+            .is_some();
+        if !force || !has_presented_pixels {
+            // No composition is needed during the normal run-loop tick:
+            // EAGLContext presents the fullscreen drawable directly. A forced
+            // tick only composes this layer when native ES1 readback has stored
+            // a resolved frame in its RAM-backed pixel buffer.
+            log_dbg!("Using CAEAGLLayer fast path, skipping composition");
+            return None;
+        }
     }
 
     if env.options.print_fps {
