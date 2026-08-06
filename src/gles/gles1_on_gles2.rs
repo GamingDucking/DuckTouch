@@ -140,6 +140,7 @@ struct TranslatorState {
     texture_crop_rect: [GLint; 4],
     viewport: [GLint; 4],
     program: Option<GLuint>,
+    program_creation_failed: bool,
     logic_op_enabled: bool,
     logic_op: GLenum,
 }
@@ -208,6 +209,7 @@ impl TranslatorState {
             texture_crop_rect: [0, 0, 0, 0],
             viewport: [0, 0, 0, 0],
             program: None,
+            program_creation_failed: false,
             logic_op_enabled: false,
             logic_op: es1::COPY,
         }
@@ -1327,16 +1329,9 @@ impl GLES for GLES1OnGLES2<'_> {
         self.state.palette_weight_array.fixed = type_ == es1::FIXED;
     }
     unsafe fn DrawArrays(&mut self, mode: GLenum, first: GLint, count: GLsizei) {
-        let program = match self.state.program {
+        let program = match self.ensure_program() {
             Some(program) => program,
-            None => {
-                let Ok(program) = create_program() else {
-                    log!("Warning: GLES1-on-GLES2 shader program unavailable; skipping draw");
-                    return;
-                };
-                self.state.program = Some(program);
-                program
-            }
+            None => return,
         };
         gl::UseProgram(program);
         let mvp = unsafe { self.state.mvp() };
@@ -1421,16 +1416,9 @@ impl GLES for GLES1OnGLES2<'_> {
         gl::DrawArrays(mode, first, count);
     }
     unsafe fn DrawElements(&mut self, mode: GLenum, count: GLsizei, type_: GLenum, indices: *const GLvoid) {
-        let program = match self.state.program {
+        let program = match self.ensure_program() {
             Some(program) => program,
-            None => {
-                let Ok(program) = create_program() else {
-                    log!("Warning: GLES1-on-GLES2 shader program unavailable; skipping indexed draw");
-                    return;
-                };
-                self.state.program = Some(program);
-                program
-            }
+            None => return,
         };
         gl::UseProgram(program);
         let mvp = self.state.mvp();
@@ -1489,6 +1477,44 @@ impl GLES for GLES1OnGLES2<'_> {
 }
 
 impl GLES1OnGLES2<'_> {
+    fn ensure_program(&mut self) -> Option<GLuint> {
+        if let Some(program) = self.state.program {
+            return Some(program);
+        }
+        match create_program() {
+            Ok(program) => {
+                self.state.program = Some(program);
+                Some(program)
+            }
+            Err(error) => {
+                if !self.state.program_creation_failed {
+                    self.state.program_creation_failed = true;
+                    unsafe {
+                        let version = CStr::from_ptr(gl::GetString(gl::VERSION) as *const _);
+                        let vendor = CStr::from_ptr(gl::GetString(gl::VENDOR) as *const _);
+                        let renderer = CStr::from_ptr(gl::GetString(gl::RENDERER) as *const _);
+                        log!(
+                            "GLES1-on-GLES2 host: version={}, vendor={}, renderer={}",
+                            version.to_string_lossy(),
+                            vendor.to_string_lossy(),
+                            renderer.to_string_lossy(),
+                        );
+                    }
+                    log!(
+                        "Error: GLES1-on-GLES2 shader program unavailable; texture_enabled={}, lighting_enabled={}, fog_enabled={}, alpha_test_enabled={}, matrix_palette_enabled={}; {}",
+                        self.state.texture_enabled.iter().any(|enabled| *enabled),
+                        self.state.lighting_enabled,
+                        self.state.fog_enabled,
+                        self.state.alpha_test_enabled,
+                        self.state.matrix_palette_enabled,
+                        error
+                    );
+                }
+                None
+            }
+        }
+    }
+
     unsafe fn bind_array(&mut self, index: GLuint, array: &ArrayState) {
         if !array.enabled {
             gl::DisableVertexAttribArray(index);
