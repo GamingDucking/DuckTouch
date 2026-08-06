@@ -477,6 +477,7 @@ uniform float u_fog_density;
 uniform float u_fog_start;
 uniform float u_fog_end;
 uniform int u_fog_mode;
+uniform int u_clip_enabled[6];
 uniform int u_logic_op_enabled;
 uniform int u_logic_op;
 float fog_factor() {
