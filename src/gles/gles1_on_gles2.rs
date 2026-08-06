@@ -472,6 +472,7 @@ impl GLES for GLES1OnGLES2<'_> {
     unsafe fn RenderbufferStorageOES(&mut self, t: GLenum, f: GLenum, w: GLsizei, h: GLsizei) { gl::RenderbufferStorage(t, f, w, h); }
     unsafe fn FramebufferRenderbufferOES(&mut self, t: GLenum, a: GLenum, rt: GLenum, r: GLuint) { gl::FramebufferRenderbuffer(t, a, rt, r); }
     unsafe fn FramebufferTexture2DOES(&mut self, t: GLenum, a: GLenum, tt: GLenum, tex: GLuint, level: GLint) { gl::FramebufferTexture2D(t, a, tt, tex, level); }
+    unsafe fn GetFramebufferAttachmentParameterivOES(&mut self, t: GLenum, a: GLenum, p: GLenum, params: *mut GLint) { gl::GetFramebufferAttachmentParameteriv(t, a, p, params); }
     unsafe fn GenerateMipmapOES(&mut self, t: GLenum) { gl::GenerateMipmap(t); }
     unsafe fn CheckFramebufferStatus(&mut self, t: GLenum) -> GLenum { gl::CheckFramebufferStatus(t) }
     unsafe fn BindFramebuffer(&mut self, t: GLenum, f: GLuint) { gl::BindFramebuffer(t, f); }
