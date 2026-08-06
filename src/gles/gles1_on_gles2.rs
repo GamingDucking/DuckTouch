@@ -258,7 +258,7 @@ fn compile_shader(kind: GLenum, source: &str) -> Result<GLuint, String> {
         if ok == 0 {
             let mut log = [0i8; 2048];
             let mut len = 0;
-            gl::GetShaderInfoLog(shader, log.len() as GLsizei, &mut len, log.as_mut_ptr());
+            gl::GetShaderInfoLog(shader, log.len() as GLsizei, &mut len, log.as_mut_ptr() as _);
             return Err(format!(
                 "GLES1-on-GLES2 shader compilation failed: {}",
                 String::from_utf8_lossy(std::slice::from_raw_parts(log.as_ptr() as *const u8, len.max(0) as usize))
@@ -321,7 +321,7 @@ void main() {
         if ok == 0 {
             let mut log = [0i8; 2048];
             let mut len = 0;
-            gl::GetProgramInfoLog(program, log.len() as GLsizei, &mut len, log.as_mut_ptr());
+            gl::GetProgramInfoLog(program, log.len() as GLsizei, &mut len, log.as_mut_ptr() as _);
             gl::DeleteShader(vertex);
             gl::DeleteShader(fragment);
             return Err(format!(
