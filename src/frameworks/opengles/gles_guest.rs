@@ -2729,26 +2729,33 @@ fn glMapBufferOES(env: &mut Environment, target: GLenum, access: GLenum) -> MutP
 }
 fn glUnmapBufferOES(env: &mut Environment, target: GLenum) -> GLboolean {
     let buffer_object_name = _get_currently_bound_buffer_object_name(env, target);
-    let current_ctx = env
+    let Some(current_ctx) = env
         .framework_state
         .opengles
-        .current_ctx_for_thread(env.current_thread);
-    let current_ctx_host_object = env
+        .current_ctx_for_thread(env.current_thread)
+    else {
+        return gles11::FALSE;
+    };
+    let mapping = env
         .objc
-        .borrow_mut::<EAGLContextHostObject>(current_ctx.unwrap());
-    if let Some((guest_buffer, host_buffer)) = current_ctx_host_object
+        .borrow_mut::<EAGLContextHostObject>(*current_ctx)
         .mapped_buffers
-        .remove(&buffer_object_name)
-    {
-        let buffer_size = _get_buffer_size(env, target) as u32;
-        unsafe {
-            host_buffer.copy_from(
-                env.mem.bytes_at(guest_buffer.cast(), buffer_size).as_ptr() as *mut GLvoid,
-                buffer_size as usize,
-            );
-        }
-        env.mem.free(guest_buffer);
+        .remove(&buffer_object_name);
+    let Some((guest_buffer, host_buffer)) = mapping else {
+        log!(
+            "Warning: glUnmapBufferOES called for buffer {} without a tracked mapping; skipping host unmap",
+            buffer_object_name
+        );
+        return gles11::FALSE;
+    };
+    let buffer_size = _get_buffer_size(env, target).max(0) as u32;
+    unsafe {
+        host_buffer.copy_from(
+            env.mem.bytes_at(guest_buffer.cast(), buffer_size).as_ptr() as *mut GLvoid,
+            buffer_size as usize,
+        );
     }
+    env.mem.free(guest_buffer);
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.UnmapBufferOES(target) })
 }
 
