@@ -566,6 +566,36 @@ impl GLES for GLES1OnGLES2<'_> {
         format!("GLES1 translated by GLES2 / {} / {} / {}", version.to_string_lossy(), vendor.to_string_lossy(), renderer.to_string_lossy())
     }
 
+    unsafe fn CreateShader(&mut self, type_: GLenum) -> GLuint { gl::CreateShader(type_) }
+    unsafe fn DeleteShader(&mut self, shader: GLuint) { gl::DeleteShader(shader); }
+    unsafe fn ShaderSource(&mut self, shader: GLuint, count: GLsizei, string: *const *const GLchar, length: *const GLint) { gl::ShaderSource(shader, count, string, length); }
+    unsafe fn CompileShader(&mut self, shader: GLuint) { gl::CompileShader(shader); }
+    unsafe fn GetShaderiv(&mut self, shader: GLuint, pname: GLenum, params: *mut GLint) { gl::GetShaderiv(shader, pname, params); }
+    unsafe fn GetShaderInfoLog(&mut self, shader: GLuint, max_length: GLsizei, length: *mut GLsizei, info_log: *mut GLchar) { gl::GetShaderInfoLog(shader, max_length, length, info_log); }
+    unsafe fn IsShader(&mut self, shader: GLuint) -> GLboolean { gl::IsShader(shader) }
+    unsafe fn CreateProgram(&mut self) -> GLuint { gl::CreateProgram() }
+    unsafe fn DeleteProgram(&mut self, program: GLuint) { gl::DeleteProgram(program); }
+    unsafe fn AttachShader(&mut self, program: GLuint, shader: GLuint) { gl::AttachShader(program, shader); }
+    unsafe fn DetachShader(&mut self, program: GLuint, shader: GLuint) { gl::DetachShader(program, shader); }
+    unsafe fn LinkProgram(&mut self, program: GLuint) { gl::LinkProgram(program); }
+    unsafe fn UseProgram(&mut self, program: GLuint) { gl::UseProgram(program); }
+    unsafe fn GetProgramiv(&mut self, program: GLuint, pname: GLenum, params: *mut GLint) { gl::GetProgramiv(program, pname, params); }
+    unsafe fn GetProgramInfoLog(&mut self, program: GLuint, max_length: GLsizei, length: *mut GLsizei, info_log: *mut GLchar) { gl::GetProgramInfoLog(program, max_length, length, info_log); }
+    unsafe fn IsProgram(&mut self, program: GLuint) -> GLboolean { gl::IsProgram(program) }
+    unsafe fn ValidateProgram(&mut self, program: GLuint) { gl::ValidateProgram(program); }
+    unsafe fn BindAttribLocation(&mut self, program: GLuint, index: GLuint, name: *const GLchar) { gl::BindAttribLocation(program, index, name); }
+    unsafe fn GetAttribLocation(&mut self, program: GLuint, name: *const GLchar) -> GLint { gl::GetAttribLocation(program, name) }
+    unsafe fn GetUniformLocation(&mut self, program: GLuint, name: *const GLchar) -> GLint { gl::GetUniformLocation(program, name) }
+    unsafe fn GetActiveAttrib(&mut self, program: GLuint, index: GLuint, buf_size: GLsizei, length: *mut GLsizei, size: *mut GLint, type_: *mut GLenum, name: *mut GLchar) { gl::GetActiveAttrib(program, index, buf_size, length, size, type_, name); }
+    unsafe fn GetActiveUniform(&mut self, program: GLuint, index: GLuint, buf_size: GLsizei, length: *mut GLsizei, size: *mut GLint, type_: *mut GLenum, name: *mut GLchar) { gl::GetActiveUniform(program, index, buf_size, length, size, type_, name); }
+    unsafe fn GetShaderSource(&mut self, shader: GLuint, buf_size: GLsizei, length: *mut GLsizei, source: *mut GLchar) { gl::GetShaderSource(shader, buf_size, length, source); }
+    unsafe fn GetAttachedShaders(&mut self, program: GLuint, max_count: GLsizei, count: *mut GLsizei, shaders: *mut GLuint) { gl::GetAttachedShaders(program, max_count, count, shaders); }
+    unsafe fn GetUniformiv(&mut self, program: GLuint, location: GLint, params: *mut GLint) { gl::GetUniformiv(program, location, params); }
+    unsafe fn GetUniformfv(&mut self, program: GLuint, location: GLint, params: *mut GLfloat) { gl::GetUniformfv(program, location, params); }
+    unsafe fn GetShaderPrecisionFormat(&mut self, shader_type: GLenum, precision_type: GLenum, range: *mut GLint, precision: *mut GLint) { gl::GetShaderPrecisionFormat(shader_type, precision_type, range, precision); }
+    unsafe fn ReleaseShaderCompiler(&mut self) { gl::ReleaseShaderCompiler(); }
+    unsafe fn ShaderBinary(&mut self, count: GLsizei, shaders: *const GLuint, binary_format: GLenum, binary: *const GLvoid, length: GLsizei) { gl::ShaderBinary(count, shaders, binary_format, binary, length); }
+
     unsafe fn GetError(&mut self) -> GLenum { gl::GetError() }
     unsafe fn GetString(&mut self, name: GLenum) -> *const GLubyte { gl::GetString(name) }
     unsafe fn GetBooleanv(&mut self, pname: GLenum, params: *mut GLboolean) {
