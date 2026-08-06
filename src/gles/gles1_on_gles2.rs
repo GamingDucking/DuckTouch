@@ -123,9 +123,15 @@ struct TranslatorState {
     light0_linear_attenuation: GLfloat,
     light0_quadratic_attenuation: GLfloat,
     model_ambient: [GLfloat; 4],
+    clip_planes: [[GLfloat; 4]; 6],
+    clip_plane_enabled: [bool; 6],
+    point_distance_attenuation: [GLfloat; 3],
+    point_fade_threshold: GLfloat,
     texture_crop_rect: [GLint; 4],
     viewport: [GLint; 4],
     program: Option<GLuint>,
+    logic_op_enabled: bool,
+    logic_op: GLenum,
 }
 
 impl TranslatorState {
@@ -179,9 +185,15 @@ impl TranslatorState {
             light0_linear_attenuation: 0.0,
             light0_quadratic_attenuation: 0.0,
             model_ambient: [0.2, 0.2, 0.2, 1.0],
+            clip_planes: [[0.0, 0.0, 0.0, 0.0]; 6],
+            clip_plane_enabled: [false; 6],
+            point_distance_attenuation: [1.0, 0.0, 0.0],
+            point_fade_threshold: 1.0,
             texture_crop_rect: [0, 0, 0, 0],
             viewport: [0, 0, 0, 0],
             program: None,
+            logic_op_enabled: false,
+            logic_op: es1::COPY,
         }
     }
 
@@ -369,13 +381,21 @@ uniform float u_light0_quadratic_attenuation;
 uniform vec4 u_material_ambient;
 uniform vec4 u_material_diffuse;
 uniform vec4 u_model_ambient;
+uniform vec4 u_clip_planes[6];
+uniform int u_clip_enabled[6];
+uniform vec3 u_point_distance_attenuation;
+uniform float u_point_fade_threshold;
 varying vec4 v_color;
 varying vec2 v_tex0;
 varying float v_fog_coord;
+varying vec4 v_clip_distances0;
+varying vec2 v_clip_distances1;
 void main() {
     vec4 eye_position = u_modelview * a_position;
     gl_Position = u_mvp * a_position;
-    gl_PointSize = u_point_size;
+    float point_distance = length(eye_position.xyz);
+    float point_attenuation = sqrt(max(u_point_distance_attenuation.x + u_point_distance_attenuation.y * point_distance + u_point_distance_attenuation.z * point_distance * point_distance, 0.0001));
+    gl_PointSize = u_point_size / point_attenuation;
     vec3 transformed_normal = (u_modelview * vec4(a_normal, 0.0)).xyz;
     if (u_normalize_enabled != 0) transformed_normal = normalize(transformed_normal);
     vec4 base_color = a_color * u_color;
@@ -398,6 +418,8 @@ void main() {
     }
     v_tex0 = (u_texture_matrix0 * a_tex0).xy;
     v_fog_coord = abs(eye_position.z);
+    v_clip_distances0 = vec4(dot(u_clip_planes[0], eye_position), dot(u_clip_planes[1], eye_position), dot(u_clip_planes[2], eye_position), dot(u_clip_planes[3], eye_position));
+    v_clip_distances1 = vec2(dot(u_clip_planes[4], eye_position), dot(u_clip_planes[5], eye_position));
 }
 "#)?;
     let fragment = compile_shader(gl::FRAGMENT_SHADER, r#"#version 100
@@ -405,6 +427,8 @@ precision mediump float;
 varying vec4 v_color;
 varying vec2 v_tex0;
 varying float v_fog_coord;
+varying vec4 v_clip_distances0;
+varying vec2 v_clip_distances1;
 uniform sampler2D u_tex0;
 uniform vec4 u_env_color0;
 uniform int u_tex_enabled0;
@@ -418,6 +442,8 @@ uniform float u_fog_density;
 uniform float u_fog_start;
 uniform float u_fog_end;
 uniform int u_fog_mode;
+uniform int u_logic_op_enabled;
+uniform int u_logic_op;
 float fog_factor() {
     if (u_fog_mode == 2048) return exp(-u_fog_density * v_fog_coord);
     if (u_fog_mode == 2049) {
@@ -446,9 +472,20 @@ void main() {
         else if (u_tex_mode0 == 4) color = vec4(mix(color.rgb, texel.rgb, texel.a), color.a);
     }
     if (u_alpha_test_enabled != 0 && !alpha_pass(color.a)) discard;
+    if (u_clip_enabled[0] != 0 && v_clip_distances0.x < 0.0) discard;
+    if (u_clip_enabled[1] != 0 && v_clip_distances0.y < 0.0) discard;
+    if (u_clip_enabled[2] != 0 && v_clip_distances0.z < 0.0) discard;
+    if (u_clip_enabled[3] != 0 && v_clip_distances0.w < 0.0) discard;
+    if (u_clip_enabled[4] != 0 && v_clip_distances1.x < 0.0) discard;
+    if (u_clip_enabled[5] != 0 && v_clip_distances1.y < 0.0) discard;
     if (u_fog_enabled != 0) {
         float factor = clamp(fog_factor(), 0.0, 1.0);
         color = mix(u_fog_color, color, factor);
+    }
+    if (u_logic_op_enabled != 0) {
+        vec4 rounded = floor(color * 255.0 + 0.5) / 255.0;
+        if (u_logic_op == 538) color = vec4(1.0) - rounded;
+        else if (u_logic_op == 539) color = rounded;
     }
     gl_FragColor = color;
 }
@@ -504,6 +541,10 @@ impl GLES for GLES1OnGLES2<'_> {
             es1::LIGHT0 => *params = if self.state.light0_enabled { gl::TRUE } else { gl::FALSE },
             es1::COLOR_MATERIAL => *params = if self.state.color_material_enabled { gl::TRUE } else { gl::FALSE },
             es1::NORMALIZE => *params = if self.state.normalize_enabled { gl::TRUE } else { gl::FALSE },
+            es1::CLIP_PLANE0..=es1::CLIP_PLANE5 => {
+                let index = (pname - es1::CLIP_PLANE0) as usize;
+                *params = if self.state.clip_plane_enabled[index] { gl::TRUE } else { gl::FALSE };
+            }
             _ => gl::GetBooleanv(pname, params),
         }
     }
@@ -519,6 +560,13 @@ impl GLES for GLES1OnGLES2<'_> {
             es1::FOG_START => *params = self.state.fog_start,
             es1::FOG_END => *params = self.state.fog_end,
             es1::POINT_SIZE => *params = self.state.point_size,
+            es1::CURRENT_TEXTURE_COORDS => params.copy_from(self.state.texcoords[self.state.active_texture].as_ptr(), 4),
+            es1::POINT_DISTANCE_ATTENUATION => params.copy_from(self.state.point_distance_attenuation.as_ptr(), 3),
+            es1::POINT_FADE_THRESHOLD_SIZE => *params = self.state.point_fade_threshold,
+            es1::CLIP_PLANE0..=es1::CLIP_PLANE5 => {
+                let index = (pname - es1::CLIP_PLANE0) as usize;
+                params.copy_from(self.state.clip_planes[index].as_ptr(), 4);
+            }
             _ => gl::GetFloatv(pname, params),
         }
     }
@@ -593,7 +641,9 @@ impl GLES for GLES1OnGLES2<'_> {
         *params = float_to_fixed(value);
     }
     unsafe fn Enable(&mut self, cap: GLenum) {
-        if cap == es1::TEXTURE_2D {
+        if cap == es1::COLOR_LOGIC_OP {
+            self.state.logic_op_enabled = true;
+        } else if cap == es1::TEXTURE_2D {
             self.state.texture_enabled[self.state.active_texture] = true;
         } else if cap == es1::ALPHA_TEST {
             self.state.alpha_test_enabled = true;
@@ -607,12 +657,16 @@ impl GLES for GLES1OnGLES2<'_> {
             self.state.color_material_enabled = true;
         } else if cap == es1::NORMALIZE {
             self.state.normalize_enabled = true;
+        } else if (es1::CLIP_PLANE0..=es1::CLIP_PLANE5).contains(&cap) {
+            self.state.clip_plane_enabled[(cap - es1::CLIP_PLANE0) as usize] = true;
         } else {
             gl::Enable(cap);
         }
     }
     unsafe fn Disable(&mut self, cap: GLenum) {
-        if cap == es1::TEXTURE_2D {
+        if cap == es1::COLOR_LOGIC_OP {
+            self.state.logic_op_enabled = false;
+        } else if cap == es1::TEXTURE_2D {
             self.state.texture_enabled[self.state.active_texture] = false;
         } else if cap == es1::ALPHA_TEST {
             self.state.alpha_test_enabled = false;
@@ -626,11 +680,16 @@ impl GLES for GLES1OnGLES2<'_> {
             self.state.color_material_enabled = false;
         } else if cap == es1::NORMALIZE {
             self.state.normalize_enabled = false;
+        } else if (es1::CLIP_PLANE0..=es1::CLIP_PLANE5).contains(&cap) {
+            self.state.clip_plane_enabled[(cap - es1::CLIP_PLANE0) as usize] = false;
         } else {
             gl::Disable(cap);
         }
     }
     unsafe fn IsEnabled(&mut self, cap: GLenum) -> GLboolean {
+        if cap == es1::COLOR_LOGIC_OP {
+            return if self.state.logic_op_enabled { gl::TRUE } else { gl::FALSE };
+        }
         if cap == es1::TEXTURE_2D {
             return if self.state.texture_enabled[self.state.active_texture] { gl::TRUE } else { gl::FALSE };
         }
@@ -651,6 +710,9 @@ impl GLES for GLES1OnGLES2<'_> {
         }
         if cap == es1::NORMALIZE {
             return if self.state.normalize_enabled { gl::TRUE } else { gl::FALSE };
+        }
+        if (es1::CLIP_PLANE0..=es1::CLIP_PLANE5).contains(&cap) {
+            return if self.state.clip_plane_enabled[(cap - es1::CLIP_PLANE0) as usize] { gl::TRUE } else { gl::FALSE };
         }
         gl::IsEnabled(cap)
     }
@@ -678,6 +740,49 @@ impl GLES for GLES1OnGLES2<'_> {
             es1::TEXTURE_COORD_ARRAY => self.state.texcoord_arrays[self.state.client_active_texture].enabled = false,
             _ => {}
         }
+    }
+    unsafe fn GetFixedv(&mut self, pname: GLenum, params: *mut GLfixed) {
+        if params.is_null() { return; }
+        let count = if matches!(pname, es1::MODELVIEW_MATRIX | es1::PROJECTION_MATRIX | es1::TEXTURE_MATRIX) { 16 } else if pname == es1::CURRENT_NORMAL { 3 } else { 4 };
+        let mut values = [0.0; 16];
+        self.GetFloatv(pname, values.as_mut_ptr());
+        for i in 0..count { *params.add(i) = float_to_fixed(values[i]); }
+    }
+    unsafe fn GetPointerv(&mut self, pname: GLenum, params: *mut *const GLvoid) {
+        if params.is_null() { return; }
+        *params = match pname {
+            es1::VERTEX_ARRAY_POINTER => self.state.arrays[0].pointer,
+            es1::COLOR_ARRAY_POINTER => self.state.arrays[1].pointer,
+            es1::NORMAL_ARRAY_POINTER => self.state.arrays[2].pointer,
+            es1::TEXTURE_COORD_ARRAY_POINTER => self.state.texcoord_arrays[self.state.client_active_texture].pointer,
+            _ => std::ptr::null(),
+        };
+    }
+    unsafe fn Hint(&mut self, _target: GLenum, _mode: GLenum) {}
+    unsafe fn ClipPlanef(&mut self, plane: GLenum, equation: *const GLfloat) {
+        if equation.is_null() || !(es1::CLIP_PLANE0..=es1::CLIP_PLANE5).contains(&plane) { return; }
+        self.state.clip_planes[(plane - es1::CLIP_PLANE0) as usize] = std::slice::from_raw_parts(equation, 4).try_into().unwrap();
+    }
+    unsafe fn ClipPlanex(&mut self, plane: GLenum, equation: *const GLfixed) {
+        if equation.is_null() || !(es1::CLIP_PLANE0..=es1::CLIP_PLANE5).contains(&plane) { return; }
+        self.state.clip_planes[(plane - es1::CLIP_PLANE0) as usize] = std::slice::from_raw_parts(equation, 4).iter().map(|v| fixed_to_float(*v)).collect::<Vec<_>>().try_into().unwrap();
+    }
+    unsafe fn ClearDepthx(&mut self, depth: GLclampx) { self.ClearDepthf(fixed_to_float(depth)); }
+    unsafe fn LineWidthx(&mut self, width: GLfixed) { self.LineWidth(fixed_to_float(width)); }
+    unsafe fn StencilFunc(&mut self, func: GLenum, ref_: GLint, mask: GLuint) { gl::StencilFunc(func, ref_, mask); }
+    unsafe fn StencilOp(&mut self, sfail: GLenum, dpfail: GLenum, dppass: GLenum) { gl::StencilOp(sfail, dpfail, dppass); }
+    unsafe fn StencilMask(&mut self, mask: GLuint) { gl::StencilMask(mask); }
+    unsafe fn PointParameterf(&mut self, pname: GLenum, param: GLfloat) {
+        match pname { es1::POINT_SIZE_MIN | es1::POINT_SIZE_MAX => {}, es1::POINT_FADE_THRESHOLD_SIZE => self.state.point_fade_threshold = param, _ => {} }
+    }
+    unsafe fn PointParameterx(&mut self, pname: GLenum, param: GLfixed) { self.PointParameterf(pname, fixed_to_float(param)); }
+    unsafe fn PointParameterfv(&mut self, pname: GLenum, params: *const GLfloat) {
+        if params.is_null() { return; }
+        if pname == es1::POINT_DISTANCE_ATTENUATION { self.state.point_distance_attenuation = std::slice::from_raw_parts(params, 3).try_into().unwrap(); } else { self.PointParameterf(pname, *params); }
+    }
+    unsafe fn PointParameterxv(&mut self, pname: GLenum, params: *const GLfixed) {
+        if params.is_null() { return; }
+        if pname == es1::POINT_DISTANCE_ATTENUATION { self.state.point_distance_attenuation = std::slice::from_raw_parts(params, 3).iter().map(|v| fixed_to_float(*v)).collect::<Vec<_>>().try_into().unwrap(); } else { self.PointParameterx(pname, *params); }
     }
     unsafe fn AlphaFunc(&mut self, func: GLenum, ref_: GLclampf) {
         self.state.alpha_func = func;
@@ -872,6 +977,13 @@ impl GLES for GLES1OnGLES2<'_> {
         if pname == es1::TEXTURE_CROP_RECT_OES && !params.is_null() { self.state.texture_crop_rect = std::slice::from_raw_parts(params, 4).try_into().unwrap(); return; }
         let v = fixed_to_float(*params); gl::TexParameterf(target, pname, v);
     }
+    unsafe fn DrawTexsOES(&mut self, x: i16, y: i16, z: i16, width: i16, height: i16) { self.DrawTexfOES(x as GLfloat, y as GLfloat, z as GLfloat, width as GLfloat, height as GLfloat); }
+    unsafe fn DrawTexiOES(&mut self, x: GLint, y: GLint, z: GLint, width: GLint, height: GLint) { self.DrawTexfOES(x as GLfloat, y as GLfloat, z as GLfloat, width as GLfloat, height as GLfloat); }
+    unsafe fn DrawTexxOES(&mut self, x: GLfixed, y: GLfixed, z: GLfixed, width: GLfixed, height: GLfixed) { self.DrawTexfOES(fixed_to_float(x), fixed_to_float(y), fixed_to_float(z), fixed_to_float(width), fixed_to_float(height)); }
+    unsafe fn DrawTexsvOES(&mut self, coords: *const i16) { if !coords.is_null() { self.DrawTexsOES(coords.read_unaligned(), coords.add(1).read_unaligned(), coords.add(2).read_unaligned(), coords.add(3).read_unaligned(), coords.add(4).read_unaligned()); } }
+    unsafe fn DrawTexivOES(&mut self, coords: *const GLint) { if !coords.is_null() { self.DrawTexiOES(coords.read_unaligned(), coords.add(1).read_unaligned(), coords.add(2).read_unaligned(), coords.add(3).read_unaligned(), coords.add(4).read_unaligned()); } }
+    unsafe fn DrawTexxvOES(&mut self, coords: *const GLfixed) { if !coords.is_null() { self.DrawTexxOES(coords.read_unaligned(), coords.add(1).read_unaligned(), coords.add(2).read_unaligned(), coords.add(3).read_unaligned(), coords.add(4).read_unaligned()); } }
+    unsafe fn DrawTexfvOES(&mut self, coords: *const GLfloat) { if !coords.is_null() { self.DrawTexfOES(coords.read_unaligned(), coords.add(1).read_unaligned(), coords.add(2).read_unaligned(), coords.add(3).read_unaligned(), coords.add(4).read_unaligned()); } }
     unsafe fn DrawTexfOES(&mut self, x: GLfloat, y: GLfloat, z: GLfloat, width: GLfloat, height: GLfloat) {
         let program = match self.state.program {
             Some(program) => program,
@@ -914,6 +1026,12 @@ impl GLES for GLES1OnGLES2<'_> {
     }
     unsafe fn TexImage2D(&mut self, target: GLenum, level: GLint, internalformat: GLint, width: GLsizei, height: GLsizei, border: GLint, format: GLenum, type_: GLenum, pixels: *const GLvoid) { gl::TexImage2D(target, level, internalformat, width, height, border, format, type_, pixels); }
     unsafe fn TexSubImage2D(&mut self, target: GLenum, level: GLint, x: GLint, y: GLint, width: GLsizei, height: GLsizei, format: GLenum, type_: GLenum, pixels: *const GLvoid) { gl::TexSubImage2D(target, level, x, y, width, height, format, type_, pixels); }
+    unsafe fn CompressedTexSubImage2D(&mut self, target: GLenum, level: GLint, x: GLint, y: GLint, width: GLsizei, height: GLsizei, format: GLenum, image_size: GLsizei, data: *const GLvoid) { gl::CompressedTexSubImage2D(target, level, x, y, width, height, format, image_size, data); }
+    unsafe fn GetBufferParameteriv(&mut self, target: GLenum, pname: GLenum, params: *mut GLint) { if !params.is_null() { gl::GetBufferParameteriv(target, pname, params); } }
+    unsafe fn MapBufferOES(&mut self, target: GLenum, access: GLenum) -> *mut GLvoid { if gl::MapBufferOES::is_loaded() { gl::MapBufferOES(target, access) } else { std::ptr::null_mut() } }
+    unsafe fn UnmapBufferOES(&mut self, target: GLenum) -> GLboolean { if gl::UnmapBufferOES::is_loaded() { gl::UnmapBufferOES(target) } else { gl::FALSE } }
+    unsafe fn CopyTexImage2D(&mut self, target: GLenum, level: GLint, internalformat: GLenum, x: GLint, y: GLint, width: GLsizei, height: GLsizei, border: GLint) { gl::CopyTexImage2D(target, level, internalformat, x, y, width, height, border); }
+    unsafe fn CopyTexSubImage2D(&mut self, target: GLenum, level: GLint, xoffset: GLint, yoffset: GLint, x: GLint, y: GLint, width: GLsizei, height: GLsizei) { gl::CopyTexSubImage2D(target, level, xoffset, yoffset, x, y, width, height); }
     unsafe fn CompressedTexImage2D(&mut self, target: GLenum, level: GLint, internalformat: GLenum, width: GLsizei, height: GLsizei, border: GLint, image_size: GLsizei, data: *const GLvoid) {
         if !data.is_null() && image_size > 0 && try_decode_pvrtc(self, target, level, internalformat, width, height, border, std::slice::from_raw_parts(data.cast::<u8>(), image_size as usize)) {
             return;
@@ -974,11 +1092,25 @@ impl GLES for GLES1OnGLES2<'_> {
     unsafe fn Fogxv(&mut self, pname: GLenum, params: *const GLfixed) {
         if pname == es1::FOG_COLOR { self.state.fog_color = std::slice::from_raw_parts(params, 4).iter().map(|v| fixed_to_float(*v)).collect::<Vec<_>>().try_into().unwrap(); } else { self.Fogx(pname, *params); }
     }
+    unsafe fn GetClipPlanef(&mut self, plane: GLenum, equation: *mut GLfloat) {
+        if equation.is_null() || !(es1::CLIP_PLANE0..=es1::CLIP_PLANE5).contains(&plane) { return; }
+        equation.copy_from(self.state.clip_planes[(plane - es1::CLIP_PLANE0) as usize].as_ptr(), 4);
+    }
+    unsafe fn GetClipPlanex(&mut self, plane: GLenum, equation: *mut GLfixed) {
+        if equation.is_null() || !(es1::CLIP_PLANE0..=es1::CLIP_PLANE5).contains(&plane) { return; }
+        for (i, value) in self.state.clip_planes[(plane - es1::CLIP_PLANE0) as usize].iter().enumerate() { *equation.add(i) = float_to_fixed(*value); }
+    }
     unsafe fn GetIntegerv(&mut self, pname: GLenum, params: *mut GLint) {
         if params.is_null() { return; }
         match pname {
             es1::VIEWPORT => params.copy_from(self.state.viewport.as_ptr(), 4),
             es1::TEXTURE_CROP_RECT_OES => params.copy_from(self.state.texture_crop_rect.as_ptr(), 4),
+            es1::ACTIVE_TEXTURE => *params = es1::TEXTURE0 as GLint + self.state.active_texture as GLint,
+            es1::CLIENT_ACTIVE_TEXTURE => *params = es1::TEXTURE0 as GLint + self.state.client_active_texture as GLint,
+            es1::MATRIX_MODE => *params = self.state.matrix_mode as GLint,
+            es1::ARRAY_BUFFER_BINDING => *params = self.state.array_buffer_binding as GLint,
+            es1::ELEMENT_ARRAY_BUFFER_BINDING => *params = self.state.element_array_buffer_binding as GLint,
+            es1::POINT_SIZE_ARRAY_OES => *params = gl::FALSE as GLint,
             _ => gl::GetIntegerv(pname, params),
         }
     }
@@ -987,7 +1119,15 @@ impl GLES for GLES1OnGLES2<'_> {
     unsafe fn CullFace(&mut self, f: GLenum) { gl::CullFace(f); }
     unsafe fn FrontFace(&mut self, f: GLenum) { gl::FrontFace(f); }
     unsafe fn BlendFunc(&mut self, s: GLenum, d: GLenum) { gl::BlendFunc(s, d); }
+    unsafe fn BlendEquation(&mut self, mode: GLenum) { gl::BlendEquation(mode); }
+    unsafe fn BlendEquationSeparate(&mut self, mode_rgb: GLenum, mode_alpha: GLenum) { gl::BlendEquationSeparate(mode_rgb, mode_alpha); }
+    unsafe fn BlendFuncSeparate(&mut self, src_rgb: GLenum, dst_rgb: GLenum, src_alpha: GLenum, dst_alpha: GLenum) { gl::BlendFuncSeparate(src_rgb, dst_rgb, src_alpha, dst_alpha); }
+    unsafe fn StencilFuncSeparate(&mut self, face: GLenum, func: GLenum, ref_: GLint, mask: GLuint) { gl::StencilFuncSeparate(face, func, ref_, mask); }
+    unsafe fn StencilOpSeparate(&mut self, face: GLenum, sfail: GLenum, dpfail: GLenum, dppass: GLenum) { gl::StencilOpSeparate(face, sfail, dpfail, dppass); }
+    unsafe fn StencilMaskSeparate(&mut self, face: GLenum, mask: GLuint) { gl::StencilMaskSeparate(face, mask); }
+    unsafe fn BlendColor(&mut self, r: GLclampf, g: GLclampf, b: GLclampf, a: GLclampf) { gl::BlendColor(r, g, b, a); }
     unsafe fn BlendEquationOES(&mut self, m: GLenum) { gl::BlendEquation(m); }
+    unsafe fn LogicOp(&mut self, opcode: GLenum) { self.state.logic_op = opcode; }
     unsafe fn ColorMask(&mut self, r: GLboolean, g: GLboolean, b: GLboolean, a: GLboolean) { gl::ColorMask(r, g, b, a); }
     unsafe fn LineWidth(&mut self, w: GLfloat) { gl::LineWidth(w); }
     unsafe fn Finish(&mut self) { gl::Finish(); }
@@ -1063,6 +1203,10 @@ impl GLES for GLES1OnGLES2<'_> {
         gl::Uniform4fv(gl::GetUniformLocation(program, b"u_material_ambient\0".as_ptr() as *const _), 1, self.state.material_ambient.as_ptr());
         gl::Uniform4fv(gl::GetUniformLocation(program, b"u_material_diffuse\0".as_ptr() as *const _), 1, self.state.material_diffuse.as_ptr());
         gl::Uniform4fv(gl::GetUniformLocation(program, b"u_model_ambient\0".as_ptr() as *const _), 1, self.state.model_ambient.as_ptr());
+        gl::Uniform4fv(gl::GetUniformLocation(program, b"u_clip_planes\0".as_ptr() as *const _), 6, self.state.clip_planes.as_ptr().cast());
+        gl::Uniform1iv(gl::GetUniformLocation(program, b"u_clip_enabled\0".as_ptr() as *const _), 6, self.state.clip_plane_enabled.as_ptr().cast());
+        gl::Uniform3fv(gl::GetUniformLocation(program, b"u_point_distance_attenuation\0".as_ptr() as *const _), 1, self.state.point_distance_attenuation.as_ptr());
+        gl::Uniform1f(gl::GetUniformLocation(program, b"u_point_fade_threshold\0".as_ptr() as *const _), self.state.point_fade_threshold);
         let alpha_test_loc = gl::GetUniformLocation(program, b"u_alpha_test_enabled\0".as_ptr() as *const _);
         gl::Uniform1i(alpha_test_loc, if self.state.alpha_test_enabled { 1 } else { 0 });
         let alpha_func_loc = gl::GetUniformLocation(program, b"u_alpha_func\0".as_ptr() as *const _);
@@ -1091,6 +1235,8 @@ impl GLES for GLES1OnGLES2<'_> {
         let env_color_loc = gl::GetUniformLocation(program, b"u_env_color0\0".as_ptr() as *const _);
         gl::Uniform4fv(env_color_loc, 1, self.state.texture_env_color[0].as_ptr());
         gl::Uniform1i(gl::GetUniformLocation(program, b"u_tex0\0".as_ptr() as *const _), 0);
+        gl::Uniform1i(gl::GetUniformLocation(program, b"u_logic_op_enabled\0".as_ptr() as *const _), self.state.logic_op_enabled as GLint);
+        gl::Uniform1i(gl::GetUniformLocation(program, b"u_logic_op\0".as_ptr() as *const _), self.state.logic_op as GLint);
         let position = self.state.arrays[0];
         let color = self.state.arrays[1];
         let normal = self.state.arrays[2];
@@ -1139,6 +1285,10 @@ impl GLES for GLES1OnGLES2<'_> {
         gl::Uniform4fv(gl::GetUniformLocation(program, b"u_material_ambient\0".as_ptr() as *const _), 1, self.state.material_ambient.as_ptr());
         gl::Uniform4fv(gl::GetUniformLocation(program, b"u_material_diffuse\0".as_ptr() as *const _), 1, self.state.material_diffuse.as_ptr());
         gl::Uniform4fv(gl::GetUniformLocation(program, b"u_model_ambient\0".as_ptr() as *const _), 1, self.state.model_ambient.as_ptr());
+        gl::Uniform4fv(gl::GetUniformLocation(program, b"u_clip_planes\0".as_ptr() as *const _), 6, self.state.clip_planes.as_ptr().cast());
+        gl::Uniform1iv(gl::GetUniformLocation(program, b"u_clip_enabled\0".as_ptr() as *const _), 6, self.state.clip_plane_enabled.as_ptr().cast());
+        gl::Uniform3fv(gl::GetUniformLocation(program, b"u_point_distance_attenuation\0".as_ptr() as *const _), 1, self.state.point_distance_attenuation.as_ptr());
+        gl::Uniform1f(gl::GetUniformLocation(program, b"u_point_fade_threshold\0".as_ptr() as *const _), self.state.point_fade_threshold);
         let point_size_loc = gl::GetUniformLocation(program, b"u_point_size\0".as_ptr() as *const _);
         gl::Uniform1f(point_size_loc, self.state.point_size);
         let tex_enabled = self.state.texture_enabled[0];
