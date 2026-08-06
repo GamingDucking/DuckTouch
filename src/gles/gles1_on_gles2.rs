@@ -14,9 +14,10 @@ use super::gles2_raw as gl;
 use super::gles2_raw::types::*;
 use super::gles11_raw as es1;
 use super::gles_generic::{GLchar, GLES};
-use super::util::{fixed_to_float, float_to_fixed};
+use super::util::{fixed_to_float, float_to_fixed, try_decode_pvrtc};
 use super::GLESContext;
 use crate::window::{GLContext, GLVersion, Window};
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
 
@@ -38,8 +39,10 @@ struct ArrayState {
     type_: GLenum,
     stride: GLsizei,
     pointer: *const GLvoid,
+    buffer_binding: GLuint,
     enabled: bool,
     fixed: bool,
+    normalized: bool,
 }
 
 impl Default for ArrayState {
@@ -49,8 +52,10 @@ impl Default for ArrayState {
             type_: gl::FLOAT,
             stride: 0,
             pointer: std::ptr::null(),
+            buffer_binding: 0,
             enabled: false,
             fixed: false,
+            normalized: false,
         }
     }
 }
@@ -85,7 +90,20 @@ struct TranslatorState {
     texture_env_mode: [GLint; MAX_TEXTURE_UNITS],
     texture_env_color: [[GLfloat; 4]; MAX_TEXTURE_UNITS],
     fixed_buffers: [Vec<GLfloat>; 3],
+    array_buffer_binding: GLuint,
+    element_array_buffer_binding: GLuint,
+    array_buffer_data: HashMap<GLuint, Vec<u8>>,
+    element_array_buffer_data: HashMap<GLuint, Vec<u8>>,
     point_size: GLfloat,
+    alpha_test_enabled: bool,
+    alpha_func: GLenum,
+    alpha_ref: GLclampf,
+    fog_enabled: bool,
+    fog_mode: GLenum,
+    fog_density: GLfloat,
+    fog_start: GLfloat,
+    fog_end: GLfloat,
+    fog_color: [GLfloat; 4],
     program: Option<GLuint>,
 }
 
@@ -107,7 +125,20 @@ impl TranslatorState {
             texture_env_mode: [es1::MODULATE as GLint; MAX_TEXTURE_UNITS],
             texture_env_color: [[0.0, 0.0, 0.0, 0.0]; MAX_TEXTURE_UNITS],
             fixed_buffers: std::array::from_fn(|_| Vec::new()),
+            array_buffer_binding: 0,
+            element_array_buffer_binding: 0,
+            array_buffer_data: HashMap::new(),
+            element_array_buffer_data: HashMap::new(),
             point_size: 1.0,
+            alpha_test_enabled: false,
+            alpha_func: es1::ALWAYS,
+            alpha_ref: 0.0,
+            fog_enabled: false,
+            fog_mode: es1::EXP,
+            fog_density: 1.0,
+            fog_start: 0.0,
+            fog_end: 1.0,
+            fog_color: [0.0, 0.0, 0.0, 1.0],
             program: None,
         }
     }
@@ -276,33 +307,71 @@ attribute vec4 a_color;
 attribute vec3 a_normal;
 attribute vec4 a_tex0;
 uniform mat4 u_mvp;
+uniform mat4 u_modelview;
+uniform mat4 u_texture_matrix0;
 uniform vec4 u_color;
 uniform float u_point_size;
 varying vec4 v_color;
 varying vec2 v_tex0;
+varying float v_fog_coord;
 void main() {
+    vec4 eye_position = u_modelview * a_position;
     gl_Position = u_mvp * a_position;
     gl_PointSize = u_point_size;
     v_color = a_color * u_color;
-    v_tex0 = a_tex0.xy;
+    v_tex0 = (u_texture_matrix0 * a_tex0).xy;
+    v_fog_coord = abs(eye_position.z);
 }
 "#)?;
     let fragment = compile_shader(gl::FRAGMENT_SHADER, r#"#version 100
 precision mediump float;
 varying vec4 v_color;
 varying vec2 v_tex0;
+varying float v_fog_coord;
 uniform sampler2D u_tex0;
 uniform vec4 u_env_color0;
 uniform int u_tex_enabled0;
 uniform int u_tex_mode0;
+uniform int u_alpha_test_enabled;
+uniform int u_alpha_func;
+uniform float u_alpha_ref;
+uniform int u_fog_enabled;
+uniform vec4 u_fog_color;
+uniform float u_fog_density;
+uniform float u_fog_start;
+uniform float u_fog_end;
+uniform int u_fog_mode;
+float fog_factor() {
+    if (u_fog_mode == 2048) return exp(-u_fog_density * v_fog_coord);
+    if (u_fog_mode == 2049) {
+        float d = u_fog_density * v_fog_coord;
+        return exp(-d * d);
+    }
+    return (u_fog_end - v_fog_coord) / (u_fog_end - u_fog_start);
+}
+bool alpha_pass(float alpha) {
+    if (u_alpha_func == 512) return false;
+    if (u_alpha_func == 513) return alpha < u_alpha_ref;
+    if (u_alpha_func == 514) return alpha == u_alpha_ref;
+    if (u_alpha_func == 515) return alpha <= u_alpha_ref;
+    if (u_alpha_func == 516) return alpha > u_alpha_ref;
+    if (u_alpha_func == 517) return alpha != u_alpha_ref;
+    if (u_alpha_func == 518) return alpha >= u_alpha_ref;
+    return true;
+}
 void main() {
     vec4 color = v_color;
     if (u_tex_enabled0 != 0) {
         vec4 texel = texture2D(u_tex0, v_tex0);
         if (u_tex_mode0 == 1) color = texel;
-        else if (u_tex_mode0 == 2) color = vec4(color.rgb * texel.rgb, color.a * texel.a);
+        else if (u_tex_mode0 == 2) color = color * texel;
         else if (u_tex_mode0 == 3) color = vec4(color.rgb + texel.rgb, color.a * texel.a);
-        else color = color * texel;
+        else if (u_tex_mode0 == 4) color = vec4(mix(color.rgb, texel.rgb, texel.a), color.a);
+    }
+    if (u_alpha_test_enabled != 0 && !alpha_pass(color.a)) discard;
+    if (u_fog_enabled != 0) {
+        float factor = clamp(fog_factor(), 0.0, 1.0);
+        color = mix(u_fog_color, color, factor);
     }
     gl_FragColor = color;
 }
@@ -349,8 +418,30 @@ impl GLES for GLES1OnGLES2<'_> {
 
     unsafe fn GetError(&mut self) -> GLenum { gl::GetError() }
     unsafe fn GetString(&mut self, name: GLenum) -> *const GLubyte { gl::GetString(name) }
-    unsafe fn GetBooleanv(&mut self, pname: GLenum, params: *mut GLboolean) { gl::GetBooleanv(pname, params); }
-    unsafe fn GetFloatv(&mut self, pname: GLenum, params: *mut GLfloat) { gl::GetFloatv(pname, params); }
+    unsafe fn GetBooleanv(&mut self, pname: GLenum, params: *mut GLboolean) {
+        match pname {
+            es1::TEXTURE_2D => *params = if self.state.texture_enabled[self.state.active_texture] { gl::TRUE } else { gl::FALSE },
+            es1::ALPHA_TEST => *params = if self.state.alpha_test_enabled { gl::TRUE } else { gl::FALSE },
+            es1::FOG => *params = if self.state.fog_enabled { gl::TRUE } else { gl::FALSE },
+            es1::LIGHTING => *params = gl::FALSE,
+            _ => gl::GetBooleanv(pname, params),
+        }
+    }
+    unsafe fn GetFloatv(&mut self, pname: GLenum, params: *mut GLfloat) {
+        match pname {
+            es1::MODELVIEW_MATRIX => params.copy_from(self.state.modelview.current.as_ptr(), 16),
+            es1::PROJECTION_MATRIX => params.copy_from(self.state.projection.current.as_ptr(), 16),
+            es1::TEXTURE_MATRIX => params.copy_from(self.state.texture[self.state.active_texture].current.as_ptr(), 16),
+            es1::CURRENT_COLOR => params.copy_from(self.state.color.as_ptr(), 4),
+            es1::CURRENT_NORMAL => params.copy_from(self.state.normal.as_ptr(), 3),
+            es1::FOG_COLOR => params.copy_from(self.state.fog_color.as_ptr(), 4),
+            es1::FOG_DENSITY => *params = self.state.fog_density,
+            es1::FOG_START => *params = self.state.fog_start,
+            es1::FOG_END => *params = self.state.fog_end,
+            es1::POINT_SIZE => *params = self.state.point_size,
+            _ => gl::GetFloatv(pname, params),
+        }
+    }
     unsafe fn GetTexEnviv(&mut self, target: GLenum, pname: GLenum, params: *mut GLint) {
         assert_eq!(target, es1::TEXTURE_ENV);
         if pname == es1::TEXTURE_ENV_MODE {
@@ -386,27 +477,46 @@ impl GLES for GLES1OnGLES2<'_> {
     unsafe fn Enable(&mut self, cap: GLenum) {
         if cap == es1::TEXTURE_2D {
             self.state.texture_enabled[self.state.active_texture] = true;
-        } else if cap != es1::LIGHTING && cap != es1::FOG && cap != es1::ALPHA_TEST {
+        } else if cap == es1::ALPHA_TEST {
+            self.state.alpha_test_enabled = true;
+        } else if cap == es1::FOG {
+            self.state.fog_enabled = true;
+        } else if cap != es1::LIGHTING {
             gl::Enable(cap);
         }
     }
     unsafe fn Disable(&mut self, cap: GLenum) {
         if cap == es1::TEXTURE_2D {
             self.state.texture_enabled[self.state.active_texture] = false;
-        } else if cap != es1::LIGHTING && cap != es1::FOG && cap != es1::ALPHA_TEST {
+        } else if cap == es1::ALPHA_TEST {
+            self.state.alpha_test_enabled = false;
+        } else if cap == es1::FOG {
+            self.state.fog_enabled = false;
+        } else if cap != es1::LIGHTING {
             gl::Disable(cap);
         }
     }
     unsafe fn IsEnabled(&mut self, cap: GLenum) -> GLboolean {
-        if cap == es1::TEXTURE_2D { return if self.state.texture_enabled[self.state.active_texture] { gl::TRUE } else { gl::FALSE }; }
+        if cap == es1::TEXTURE_2D {
+            return if self.state.texture_enabled[self.state.active_texture] { gl::TRUE } else { gl::FALSE };
+        }
+        if cap == es1::ALPHA_TEST {
+            return if self.state.alpha_test_enabled { gl::TRUE } else { gl::FALSE };
+        }
+        if cap == es1::FOG {
+            return if self.state.fog_enabled { gl::TRUE } else { gl::FALSE };
+        }
+        if cap == es1::LIGHTING {
+            return gl::FALSE;
+        }
         gl::IsEnabled(cap)
     }
     unsafe fn ClientActiveTexture(&mut self, texture: GLenum) {
         self.state.client_active_texture = (texture - es1::TEXTURE0).min((MAX_TEXTURE_UNITS - 1) as GLenum) as usize;
     }
     unsafe fn ActiveTexture(&mut self, texture: GLenum) {
-        self.state.active_texture = (texture - es1::TEXTURE0).min((MAX_TEXTURE_UNITS - 1) as GLenum) as usize;
-        gl::ActiveTexture(texture);
+        self.state.active_texture = texture.saturating_sub(es1::TEXTURE0).min((MAX_TEXTURE_UNITS - 1) as GLenum) as usize;
+        gl::ActiveTexture(es1::TEXTURE0 + self.state.active_texture as GLenum);
     }
     unsafe fn EnableClientState(&mut self, array: GLenum) {
         match array {
@@ -426,6 +536,31 @@ impl GLES for GLES1OnGLES2<'_> {
             _ => {}
         }
     }
+    unsafe fn AlphaFunc(&mut self, func: GLenum, ref_: GLclampf) {
+        self.state.alpha_func = func;
+        self.state.alpha_ref = ref_;
+    }
+    unsafe fn AlphaFuncx(&mut self, func: GLenum, ref_: GLclampx) {
+        self.AlphaFunc(func, fixed_to_float(ref_));
+    }
+    unsafe fn DepthRangef(&mut self, near: GLclampf, far: GLclampf) {
+        gl::DepthRangef(near, far);
+    }
+    unsafe fn DepthRangex(&mut self, near: GLclampx, far: GLclampx) {
+        self.DepthRangef(fixed_to_float(near), fixed_to_float(far));
+    }
+    unsafe fn PolygonOffset(&mut self, factor: GLfloat, units: GLfloat) {
+        gl::PolygonOffset(factor, units);
+    }
+    unsafe fn PolygonOffsetx(&mut self, factor: GLfixed, units: GLfixed) {
+        self.PolygonOffset(fixed_to_float(factor), fixed_to_float(units));
+    }
+    unsafe fn SampleCoverage(&mut self, value: GLclampf, invert: GLboolean) {
+        gl::SampleCoverage(value, invert);
+    }
+    unsafe fn SampleCoveragex(&mut self, value: GLclampx, invert: GLboolean) {
+        self.SampleCoverage(fixed_to_float(value), invert);
+    }
     unsafe fn Color4f(&mut self, r: GLfloat, g: GLfloat, b: GLfloat, a: GLfloat) { self.state.color = [r, g, b, a]; }
     unsafe fn Color4x(&mut self, r: GLfixed, g: GLfixed, b: GLfixed, a: GLfixed) { self.Color4f(fixed_to_float(r), fixed_to_float(g), fixed_to_float(b), fixed_to_float(a)); }
     unsafe fn Color4ub(&mut self, r: GLubyte, g: GLubyte, b: GLubyte, a: GLubyte) { self.state.color = [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a as f32 / 255.0]; }
@@ -433,15 +568,74 @@ impl GLES for GLES1OnGLES2<'_> {
     unsafe fn Normal3x(&mut self, x: GLfixed, y: GLfixed, z: GLfixed) { self.Normal3f(fixed_to_float(x), fixed_to_float(y), fixed_to_float(z)); }
     unsafe fn MultiTexCoord4f(&mut self, texture: GLenum, s: GLfloat, t: GLfloat, r: GLfloat, q: GLfloat) { let i = (texture - es1::TEXTURE0).min((MAX_TEXTURE_UNITS - 1) as GLenum) as usize; self.state.texcoords[i] = [s, t, r, q]; }
     unsafe fn MultiTexCoord4x(&mut self, texture: GLenum, s: GLfixed, t: GLfixed, r: GLfixed, q: GLfixed) { self.MultiTexCoord4f(texture, fixed_to_float(s), fixed_to_float(t), fixed_to_float(r), fixed_to_float(q)); }
-    unsafe fn TexCoordPointer(&mut self, size: GLint, type_: GLenum, stride: GLsizei, pointer: *const GLvoid) { let a = &mut self.state.texcoord_arrays[self.state.client_active_texture]; *a = ArrayState { size, type_, stride, pointer, enabled: a.enabled, fixed: type_ == es1::FIXED }; }
-    unsafe fn ColorPointer(&mut self, size: GLint, type_: GLenum, stride: GLsizei, pointer: *const GLvoid) { let enabled = self.state.arrays[1].enabled; self.state.arrays[1] = ArrayState { size, type_, stride, pointer, enabled, fixed: type_ == es1::FIXED }; }
-    unsafe fn NormalPointer(&mut self, type_: GLenum, stride: GLsizei, pointer: *const GLvoid) { let enabled = self.state.arrays[2].enabled; self.state.arrays[2] = ArrayState { size: 3, type_, stride, pointer, enabled, fixed: type_ == es1::FIXED }; }
-    unsafe fn VertexPointer(&mut self, size: GLint, type_: GLenum, stride: GLsizei, pointer: *const GLvoid) { let enabled = self.state.arrays[0].enabled; self.state.arrays[0] = ArrayState { size, type_, stride, pointer, enabled, fixed: type_ == es1::FIXED }; }
-    unsafe fn BindBuffer(&mut self, target: GLenum, buffer: GLuint) { gl::BindBuffer(target, buffer); }
+    unsafe fn TexCoordPointer(&mut self, size: GLint, type_: GLenum, stride: GLsizei, pointer: *const GLvoid) {
+        let enabled = self.state.texcoord_arrays[self.state.client_active_texture].enabled;
+        let buffer_binding = self.state.array_buffer_binding;
+        self.state.texcoord_arrays[self.state.client_active_texture] = ArrayState { size, type_, stride, pointer, buffer_binding, enabled, fixed: type_ == es1::FIXED, normalized: false };
+    }
+    unsafe fn ColorPointer(&mut self, size: GLint, type_: GLenum, stride: GLsizei, pointer: *const GLvoid) {
+        let enabled = self.state.arrays[1].enabled;
+        let buffer_binding = self.state.array_buffer_binding;
+        self.state.arrays[1] = ArrayState { size, type_, stride, pointer, buffer_binding, enabled, fixed: type_ == es1::FIXED, normalized: true };
+    }
+    unsafe fn NormalPointer(&mut self, type_: GLenum, stride: GLsizei, pointer: *const GLvoid) {
+        let enabled = self.state.arrays[2].enabled;
+        let buffer_binding = self.state.array_buffer_binding;
+        self.state.arrays[2] = ArrayState { size: 3, type_, stride, pointer, buffer_binding, enabled, fixed: type_ == es1::FIXED, normalized: false };
+    }
+    unsafe fn VertexPointer(&mut self, size: GLint, type_: GLenum, stride: GLsizei, pointer: *const GLvoid) {
+        let enabled = self.state.arrays[0].enabled;
+        let buffer_binding = self.state.array_buffer_binding;
+        self.state.arrays[0] = ArrayState { size, type_, stride, pointer, buffer_binding, enabled, fixed: type_ == es1::FIXED, normalized: false };
+    }
+    unsafe fn BindBuffer(&mut self, target: GLenum, buffer: GLuint) {
+        match target {
+            gl::ARRAY_BUFFER => self.state.array_buffer_binding = buffer,
+            gl::ELEMENT_ARRAY_BUFFER => self.state.element_array_buffer_binding = buffer,
+            _ => {}
+        }
+        gl::BindBuffer(target, buffer);
+    }
     unsafe fn GenBuffers(&mut self, n: GLsizei, buffers: *mut GLuint) { gl::GenBuffers(n, buffers); }
-    unsafe fn DeleteBuffers(&mut self, n: GLsizei, buffers: *const GLuint) { gl::DeleteBuffers(n, buffers); }
-    unsafe fn BufferData(&mut self, target: GLenum, size: GLsizeiptr, data: *const GLvoid, usage: GLenum) { gl::BufferData(target, size, data, usage); }
-    unsafe fn BufferSubData(&mut self, target: GLenum, offset: GLintptr, size: GLsizeiptr, data: *const GLvoid) { gl::BufferSubData(target, offset, size, data); }
+    unsafe fn DeleteBuffers(&mut self, n: GLsizei, buffers: *const GLuint) {
+        if !buffers.is_null() {
+            for i in 0..n.max(0) as usize {
+                let buffer = buffers.add(i).read();
+                self.state.array_buffer_data.remove(&buffer);
+                self.state.element_array_buffer_data.remove(&buffer);
+            }
+        }
+        gl::DeleteBuffers(n, buffers);
+    }
+    unsafe fn BufferData(&mut self, target: GLenum, size: GLsizeiptr, data: *const GLvoid, usage: GLenum) {
+        let binding = match target {
+            gl::ARRAY_BUFFER => self.state.array_buffer_binding,
+            gl::ELEMENT_ARRAY_BUFFER => self.state.element_array_buffer_binding,
+            _ => 0,
+        };
+        if binding != 0 && size >= 0 {
+            let store = if target == gl::ARRAY_BUFFER { &mut self.state.array_buffer_data } else { &mut self.state.element_array_buffer_data };
+            let bytes = store.entry(binding).or_default();
+            bytes.resize(size as usize, 0);
+            if !data.is_null() { std::ptr::copy_nonoverlapping(data.cast::<u8>(), bytes.as_mut_ptr(), size as usize); }
+        }
+        gl::BufferData(target, size, data, usage);
+    }
+    unsafe fn BufferSubData(&mut self, target: GLenum, offset: GLintptr, size: GLsizeiptr, data: *const GLvoid) {
+        let binding = match target {
+            gl::ARRAY_BUFFER => self.state.array_buffer_binding,
+            gl::ELEMENT_ARRAY_BUFFER => self.state.element_array_buffer_binding,
+            _ => 0,
+        };
+        if binding != 0 && offset >= 0 && size >= 0 && !data.is_null() {
+            let store = if target == gl::ARRAY_BUFFER { &mut self.state.array_buffer_data } else { &mut self.state.element_array_buffer_data };
+            let bytes = store.entry(binding).or_default();
+            let end = offset as usize + size as usize;
+            if end > bytes.len() { bytes.resize(end, 0); }
+            std::ptr::copy_nonoverlapping(data.cast::<u8>(), bytes.as_mut_ptr().add(offset as usize), size as usize);
+        }
+        gl::BufferSubData(target, offset, size, data);
+    }
     unsafe fn BindTexture(&mut self, target: GLenum, texture: GLuint) { gl::BindTexture(target, texture); }
     unsafe fn GenTextures(&mut self, n: GLsizei, textures: *mut GLuint) { gl::GenTextures(n, textures); }
     unsafe fn DeleteTextures(&mut self, n: GLsizei, textures: *const GLuint) { gl::DeleteTextures(n, textures); }
@@ -453,13 +647,31 @@ impl GLES for GLES1OnGLES2<'_> {
     unsafe fn TexParameterxv(&mut self, target: GLenum, pname: GLenum, params: *const GLfixed) { let v = fixed_to_float(*params); gl::TexParameterf(target, pname, v); }
     unsafe fn TexImage2D(&mut self, target: GLenum, level: GLint, internalformat: GLint, width: GLsizei, height: GLsizei, border: GLint, format: GLenum, type_: GLenum, pixels: *const GLvoid) { gl::TexImage2D(target, level, internalformat, width, height, border, format, type_, pixels); }
     unsafe fn TexSubImage2D(&mut self, target: GLenum, level: GLint, x: GLint, y: GLint, width: GLsizei, height: GLsizei, format: GLenum, type_: GLenum, pixels: *const GLvoid) { gl::TexSubImage2D(target, level, x, y, width, height, format, type_, pixels); }
-    unsafe fn CompressedTexImage2D(&mut self, target: GLenum, level: GLint, internalformat: GLenum, width: GLsizei, height: GLsizei, border: GLint, image_size: GLsizei, data: *const GLvoid) { gl::CompressedTexImage2D(target, level, internalformat, width, height, border, image_size, data); }
-    unsafe fn TexEnvi(&mut self, _target: GLenum, pname: GLenum, param: GLint) { if pname == es1::TEXTURE_ENV_MODE { self.state.texture_env_mode[self.state.active_texture] = param; } }
+    unsafe fn CompressedTexImage2D(&mut self, target: GLenum, level: GLint, internalformat: GLenum, width: GLsizei, height: GLsizei, border: GLint, image_size: GLsizei, data: *const GLvoid) {
+        if !data.is_null() && image_size > 0 && try_decode_pvrtc(self, target, level, internalformat, width, height, border, std::slice::from_raw_parts(data.cast::<u8>(), image_size as usize)) {
+            return;
+        }
+        gl::CompressedTexImage2D(target, level, internalformat, width, height, border, image_size, data);
+    }
+    unsafe fn TexEnvi(&mut self, _target: GLenum, pname: GLenum, param: GLint) {
+        let unit = self.state.active_texture;
+        match pname {
+            es1::TEXTURE_ENV_MODE => self.state.texture_env_mode[unit] = param,
+            es1::TEXTURE_ENV_COLOR => self.state.texture_env_color[unit] = [param as GLfloat; 4],
+            _ => {}
+        }
+    }
     unsafe fn TexEnvf(&mut self, target: GLenum, pname: GLenum, param: GLfloat) { self.TexEnvi(target, pname, param as GLint); }
     unsafe fn TexEnvx(&mut self, target: GLenum, pname: GLenum, param: GLfixed) { self.TexEnvi(target, pname, param); }
-    unsafe fn TexEnviv(&mut self, target: GLenum, pname: GLenum, params: *const GLint) { self.TexEnvi(target, pname, *params); }
-    unsafe fn TexEnvfv(&mut self, target: GLenum, pname: GLenum, params: *const GLfloat) { self.TexEnvi(target, pname, *params as GLint); }
-    unsafe fn TexEnvxv(&mut self, target: GLenum, pname: GLenum, params: *const GLfixed) { self.TexEnvi(target, pname, *params); }
+    unsafe fn TexEnviv(&mut self, target: GLenum, pname: GLenum, params: *const GLint) {
+        if pname == es1::TEXTURE_ENV_COLOR { self.state.texture_env_color[self.state.active_texture] = std::slice::from_raw_parts(params, 4).iter().map(|v| *v as GLfloat).collect::<Vec<_>>().try_into().unwrap(); } else { self.TexEnvi(target, pname, *params); }
+    }
+    unsafe fn TexEnvfv(&mut self, target: GLenum, pname: GLenum, params: *const GLfloat) {
+        if pname == es1::TEXTURE_ENV_COLOR { self.state.texture_env_color[self.state.active_texture] = std::slice::from_raw_parts(params, 4).try_into().unwrap(); } else { self.TexEnvi(target, pname, *params as GLint); }
+    }
+    unsafe fn TexEnvxv(&mut self, target: GLenum, pname: GLenum, params: *const GLfixed) {
+        if pname == es1::TEXTURE_ENV_COLOR { self.state.texture_env_color[self.state.active_texture] = std::slice::from_raw_parts(params, 4).iter().map(|v| fixed_to_float(*v)).collect::<Vec<_>>().try_into().unwrap(); } else { self.TexEnvi(target, pname, *params); }
+    }
     unsafe fn MatrixMode(&mut self, mode: GLenum) { self.state.matrix_mode = mode; }
     unsafe fn LoadIdentity(&mut self) { self.state.matrix_mut().current = MATRIX_IDENTITY; }
     unsafe fn LoadMatrixf(&mut self, m: *const GLfloat) { self.state.matrix_mut().current.copy_from_slice(std::slice::from_raw_parts(m, 16)); }
@@ -485,6 +697,16 @@ impl GLES for GLES1OnGLES2<'_> {
     unsafe fn ClearColorx(&mut self, r: GLclampx, g: GLclampx, b: GLclampx, a: GLclampx) { self.ClearColor(fixed_to_float(r), fixed_to_float(g), fixed_to_float(b), fixed_to_float(a)); }
     unsafe fn ClearDepthf(&mut self, d: GLclampf) { gl::ClearDepthf(d); }
     unsafe fn ClearStencil(&mut self, s: GLint) { gl::ClearStencil(s); }
+    unsafe fn Fogf(&mut self, pname: GLenum, param: GLfloat) {
+        match pname { es1::FOG_MODE => self.state.fog_mode = param as GLenum, es1::FOG_DENSITY => self.state.fog_density = param, es1::FOG_START => self.state.fog_start = param, es1::FOG_END => self.state.fog_end = param, _ => {} }
+    }
+    unsafe fn Fogx(&mut self, pname: GLenum, param: GLfixed) { self.Fogf(pname, fixed_to_float(param)); }
+    unsafe fn Fogfv(&mut self, pname: GLenum, params: *const GLfloat) {
+        if pname == es1::FOG_COLOR { self.state.fog_color = std::slice::from_raw_parts(params, 4).try_into().unwrap(); } else { self.Fogf(pname, *params); }
+    }
+    unsafe fn Fogxv(&mut self, pname: GLenum, params: *const GLfixed) {
+        if pname == es1::FOG_COLOR { self.state.fog_color = std::slice::from_raw_parts(params, 4).iter().map(|v| fixed_to_float(*v)).collect::<Vec<_>>().try_into().unwrap(); } else { self.Fogx(pname, *params); }
+    }
     unsafe fn GetIntegerv(&mut self, pname: GLenum, params: *mut GLint) { gl::GetIntegerv(pname, params); }
     unsafe fn DepthFunc(&mut self, f: GLenum) { gl::DepthFunc(f); }
     unsafe fn DepthMask(&mut self, f: GLboolean) { gl::DepthMask(f); }
@@ -545,15 +767,39 @@ impl GLES for GLES1OnGLES2<'_> {
         let mvp = unsafe { self.state.mvp() };
         let mvp_loc = gl::GetUniformLocation(program, b"u_mvp\0".as_ptr() as *const _);
         gl::UniformMatrix4fv(mvp_loc, 1, gl::FALSE, mvp.as_ptr());
+        let modelview_loc = gl::GetUniformLocation(program, b"u_modelview\0".as_ptr() as *const _);
+        gl::UniformMatrix4fv(modelview_loc, 1, gl::FALSE, self.state.modelview.current.as_ptr());
+        let texture_matrix_loc = gl::GetUniformLocation(program, b"u_texture_matrix0\0".as_ptr() as *const _);
+        gl::UniformMatrix4fv(texture_matrix_loc, 1, gl::FALSE, self.state.texture[0].current.as_ptr());
         let color_loc = gl::GetUniformLocation(program, b"u_color\0".as_ptr() as *const _);
         gl::Uniform4fv(color_loc, 1, self.state.color.as_ptr());
+        let alpha_test_loc = gl::GetUniformLocation(program, b"u_alpha_test_enabled\0".as_ptr() as *const _);
+        gl::Uniform1i(alpha_test_loc, if self.state.alpha_test_enabled { 1 } else { 0 });
+        let alpha_func_loc = gl::GetUniformLocation(program, b"u_alpha_func\0".as_ptr() as *const _);
+        gl::Uniform1i(alpha_func_loc, self.state.alpha_func as GLint);
+        let alpha_ref_loc = gl::GetUniformLocation(program, b"u_alpha_ref\0".as_ptr() as *const _);
+        gl::Uniform1f(alpha_ref_loc, self.state.alpha_ref);
+        let fog_enabled_loc = gl::GetUniformLocation(program, b"u_fog_enabled\0".as_ptr() as *const _);
+        gl::Uniform1i(fog_enabled_loc, if self.state.fog_enabled { 1 } else { 0 });
+        let fog_color_loc = gl::GetUniformLocation(program, b"u_fog_color\0".as_ptr() as *const _);
+        gl::Uniform4fv(fog_color_loc, 1, self.state.fog_color.as_ptr());
+        let fog_density_loc = gl::GetUniformLocation(program, b"u_fog_density\0".as_ptr() as *const _);
+        gl::Uniform1f(fog_density_loc, self.state.fog_density);
+        let fog_start_loc = gl::GetUniformLocation(program, b"u_fog_start\0".as_ptr() as *const _);
+        gl::Uniform1f(fog_start_loc, self.state.fog_start);
+        let fog_end_loc = gl::GetUniformLocation(program, b"u_fog_end\0".as_ptr() as *const _);
+        gl::Uniform1f(fog_end_loc, self.state.fog_end);
+        let fog_mode_loc = gl::GetUniformLocation(program, b"u_fog_mode\0".as_ptr() as *const _);
+        gl::Uniform1i(fog_mode_loc, self.state.fog_mode as GLint);
         let point_size_loc = gl::GetUniformLocation(program, b"u_point_size\0".as_ptr() as *const _);
         gl::Uniform1f(point_size_loc, self.state.point_size);
         let tex_enabled = self.state.texture_enabled[0];
         let enabled_loc = gl::GetUniformLocation(program, b"u_tex_enabled0\0".as_ptr() as *const _);
         gl::Uniform1i(enabled_loc, if tex_enabled { 1 } else { 0 });
         let mode_loc = gl::GetUniformLocation(program, b"u_tex_mode0\0".as_ptr() as *const _);
-        gl::Uniform1i(mode_loc, match self.state.texture_env_mode[0] as GLenum { es1::REPLACE => 1, es1::ADD => 3, es1::DECAL => 1, _ => 2 });
+        gl::Uniform1i(mode_loc, match self.state.texture_env_mode[0] as GLenum { es1::REPLACE => 1, es1::ADD => 3, es1::DECAL => 4, _ => 2 });
+        let env_color_loc = gl::GetUniformLocation(program, b"u_env_color0\0".as_ptr() as *const _);
+        gl::Uniform4fv(env_color_loc, 1, self.state.texture_env_color[0].as_ptr());
         gl::Uniform1i(gl::GetUniformLocation(program, b"u_tex0\0".as_ptr() as *const _), 0);
         let position = self.state.arrays[0];
         let color = self.state.arrays[1];
@@ -581,6 +827,10 @@ impl GLES for GLES1OnGLES2<'_> {
         let mvp = self.state.mvp();
         let mvp_loc = gl::GetUniformLocation(program, b"u_mvp\0".as_ptr() as *const _);
         gl::UniformMatrix4fv(mvp_loc, 1, gl::FALSE, mvp.as_ptr());
+        let modelview_loc = gl::GetUniformLocation(program, b"u_modelview\0".as_ptr() as *const _);
+        gl::UniformMatrix4fv(modelview_loc, 1, gl::FALSE, self.state.modelview.current.as_ptr());
+        let texture_matrix_loc = gl::GetUniformLocation(program, b"u_texture_matrix0\0".as_ptr() as *const _);
+        gl::UniformMatrix4fv(texture_matrix_loc, 1, gl::FALSE, self.state.texture[0].current.as_ptr());
         let color_loc = gl::GetUniformLocation(program, b"u_color\0".as_ptr() as *const _);
         gl::Uniform4fv(color_loc, 1, self.state.color.as_ptr());
         let point_size_loc = gl::GetUniformLocation(program, b"u_point_size\0".as_ptr() as *const _);
@@ -605,13 +855,13 @@ impl GLES for GLES1OnGLES2<'_> {
 
 impl GLES1OnGLES2<'_> {
     unsafe fn bind_array(&mut self, index: GLuint, array: &ArrayState) {
-        if array.enabled {
-            gl::EnableVertexAttribArray(index);
-            gl::VertexAttribPointer(index, array.size, array.type_, gl::FALSE, array.stride, array.pointer);
-        } else {
+        if !array.enabled {
             gl::DisableVertexAttribArray(index);
             let value = if index == ATTR_COLOR { self.state.color } else if index == ATTR_TEX0 { self.state.texcoords[0] } else if index == ATTR_NORMAL { [self.state.normal[0], self.state.normal[1], self.state.normal[2], 1.0] } else { [0.0, 0.0, 0.0, 1.0] };
             gl::VertexAttrib4fv(index, value.as_ptr());
+            return;
         }
+        gl::EnableVertexAttribArray(index);
+        gl::VertexAttribPointer(index, array.size, array.type_, if array.normalized { gl::TRUE } else { gl::FALSE }, array.stride, array.pointer);
     }
 }
