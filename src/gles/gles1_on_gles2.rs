@@ -349,6 +349,8 @@ impl GLES for GLES1OnGLES2<'_> {
 
     unsafe fn GetError(&mut self) -> GLenum { gl::GetError() }
     unsafe fn GetString(&mut self, name: GLenum) -> *const GLubyte { gl::GetString(name) }
+    unsafe fn GetBooleanv(&mut self, pname: GLenum, params: *mut GLboolean) { gl::GetBooleanv(pname, params); }
+    unsafe fn GetFloatv(&mut self, pname: GLenum, params: *mut GLfloat) { gl::GetFloatv(pname, params); }
     unsafe fn Enable(&mut self, cap: GLenum) {
         if cap == es1::TEXTURE_2D {
             self.state.texture_enabled[self.state.active_texture] = true;
