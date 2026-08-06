@@ -14,7 +14,7 @@ use super::gles2_raw as gl;
 use super::gles2_raw::types::*;
 use super::gles11_raw as es1;
 use super::gles_generic::{GLchar, GLES};
-use super::util::fixed_to_float;
+use super::util::{fixed_to_float, float_to_fixed};
 use super::GLESContext;
 use crate::window::{GLContext, GLVersion, Window};
 use std::ffi::{CStr, CString};
@@ -351,6 +351,38 @@ impl GLES for GLES1OnGLES2<'_> {
     unsafe fn GetString(&mut self, name: GLenum) -> *const GLubyte { gl::GetString(name) }
     unsafe fn GetBooleanv(&mut self, pname: GLenum, params: *mut GLboolean) { gl::GetBooleanv(pname, params); }
     unsafe fn GetFloatv(&mut self, pname: GLenum, params: *mut GLfloat) { gl::GetFloatv(pname, params); }
+    unsafe fn GetTexEnviv(&mut self, target: GLenum, pname: GLenum, params: *mut GLint) {
+        assert_eq!(target, es1::TEXTURE_ENV);
+        if pname == es1::TEXTURE_ENV_MODE {
+            *params = self.state.texture_env_mode[self.state.active_texture];
+        } else if pname == es1::TEXTURE_ENV_COLOR {
+            for (index, value) in self.state.texture_env_color[self.state.active_texture].iter().enumerate() {
+                *params.add(index) = *value as GLint;
+            }
+        }
+    }
+    unsafe fn GetTexEnvfv(&mut self, target: GLenum, pname: GLenum, params: *mut GLfloat) {
+        assert_eq!(target, es1::TEXTURE_ENV);
+        if pname == es1::TEXTURE_ENV_MODE {
+            *params = self.state.texture_env_mode[self.state.active_texture] as GLfloat;
+        } else if pname == es1::TEXTURE_ENV_COLOR {
+            params.copy_from(self.state.texture_env_color[self.state.active_texture].as_ptr(), 4);
+        }
+    }
+    unsafe fn GetTexEnvxv(&mut self, target: GLenum, pname: GLenum, params: *mut GLfixed) {
+        let mut values = [0.0; 4];
+        self.GetTexEnvfv(target, pname, values.as_mut_ptr());
+        for (index, value) in values.iter().enumerate() {
+            *params.add(index) = float_to_fixed(*value);
+        }
+    }
+    unsafe fn GetTexParameteriv(&mut self, target: GLenum, pname: GLenum, params: *mut GLint) { gl::GetTexParameteriv(target, pname, params); }
+    unsafe fn GetTexParameterfv(&mut self, target: GLenum, pname: GLenum, params: *mut GLfloat) { gl::GetTexParameterfv(target, pname, params); }
+    unsafe fn GetTexParameterxv(&mut self, target: GLenum, pname: GLenum, params: *mut GLfixed) {
+        let mut value = 0.0;
+        gl::GetTexParameterfv(target, pname, &mut value);
+        *params = float_to_fixed(value);
+    }
     unsafe fn Enable(&mut self, cap: GLenum) {
         if cap == es1::TEXTURE_2D {
             self.state.texture_enabled[self.state.active_texture] = true;
