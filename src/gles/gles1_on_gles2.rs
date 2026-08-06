@@ -25,7 +25,11 @@ const ATTR_POSITION: GLuint = 0;
 const ATTR_COLOR: GLuint = 1;
 const ATTR_NORMAL: GLuint = 2;
 const ATTR_TEX0: GLuint = 3;
+const ATTR_MATRIX_INDEX: GLuint = 4;
+const ATTR_WEIGHT: GLuint = 5;
+const ATTR_POINT_SIZE: GLuint = 6;
 const MAX_TEXTURE_UNITS: usize = 4;
+const MAX_PALETTE_MATRICES: usize = 9;
 const MATRIX_IDENTITY: [GLfloat; 16] = [
     1.0, 0.0, 0.0, 0.0,
     0.0, 1.0, 0.0, 0.0,
@@ -86,6 +90,12 @@ struct TranslatorState {
     texcoords: [[GLfloat; 4]; MAX_TEXTURE_UNITS],
     arrays: [ArrayState; 3],
     texcoord_arrays: [ArrayState; MAX_TEXTURE_UNITS],
+    palette_index_array: ArrayState,
+    palette_weight_array: ArrayState,
+    point_size_array: ArrayState,
+    palette_matrices: [MatrixState; MAX_PALETTE_MATRICES],
+    current_palette_matrix: usize,
+    matrix_palette_enabled: bool,
     texture_enabled: [bool; MAX_TEXTURE_UNITS],
     texture_env_mode: [GLint; MAX_TEXTURE_UNITS],
     texture_env_color: [[GLfloat; 4]; MAX_TEXTURE_UNITS],
@@ -148,6 +158,12 @@ impl TranslatorState {
             texcoords: [[0.0, 0.0, 0.0, 1.0]; MAX_TEXTURE_UNITS],
             arrays: [ArrayState::default(); 3],
             texcoord_arrays: [ArrayState::default(); MAX_TEXTURE_UNITS],
+            palette_index_array: ArrayState::default(),
+            palette_weight_array: ArrayState::default(),
+            point_size_array: ArrayState::default(),
+            palette_matrices: std::array::from_fn(|_| MatrixState::new()),
+            current_palette_matrix: 0,
+            matrix_palette_enabled: false,
             texture_enabled: [false; MAX_TEXTURE_UNITS],
             texture_env_mode: [es1::MODULATE as GLint; MAX_TEXTURE_UNITS],
             texture_env_color: [[0.0, 0.0, 0.0, 0.0]; MAX_TEXTURE_UNITS],
@@ -201,6 +217,7 @@ impl TranslatorState {
         match self.matrix_mode {
             es1::PROJECTION => &mut self.projection,
             es1::TEXTURE => &mut self.texture[self.active_texture],
+            es1::MATRIX_PALETTE_OES => &mut self.palette_matrices[self.current_palette_matrix],
             _ => &mut self.modelview,
         }
     }
@@ -360,11 +377,17 @@ attribute vec4 a_position;
 attribute vec4 a_color;
 attribute vec3 a_normal;
 attribute vec4 a_tex0;
+attribute vec4 a_matrix_index;
+attribute vec4 a_weight;
+attribute float a_point_size;
 uniform mat4 u_mvp;
 uniform mat4 u_modelview;
 uniform mat4 u_texture_matrix0;
 uniform vec4 u_color;
 uniform float u_point_size;
+uniform int u_point_size_array_enabled;
+uniform mat4 u_palette_matrices[9];
+uniform int u_matrix_palette_enabled;
 uniform int u_lighting_enabled;
 uniform int u_light0_enabled;
 uniform int u_color_material_enabled;
@@ -391,11 +414,21 @@ varying float v_fog_coord;
 varying vec4 v_clip_distances0;
 varying vec2 v_clip_distances1;
 void main() {
-    vec4 eye_position = u_modelview * a_position;
-    gl_Position = u_mvp * a_position;
+    vec4 transformed_position = a_position;
+    if (u_matrix_palette_enabled != 0) {
+        transformed_position = vec4(0.0);
+        for (int i = 0; i < 4; i++) {
+            int matrix_index = int(a_matrix_index[i]);
+            matrix_index = matrix_index < 0 ? 0 : matrix_index;
+            matrix_index = matrix_index > 8 ? 8 : matrix_index;
+            transformed_position += a_weight[i] * (u_palette_matrices[matrix_index] * a_position);
+        }
+    }
+    vec4 eye_position = u_modelview * transformed_position;
+    gl_Position = u_mvp * transformed_position;
     float point_distance = length(eye_position.xyz);
     float point_attenuation = sqrt(max(u_point_distance_attenuation.x + u_point_distance_attenuation.y * point_distance + u_point_distance_attenuation.z * point_distance * point_distance, 0.0001));
-    gl_PointSize = u_point_size / point_attenuation;
+    gl_PointSize = (u_point_size_array_enabled != 0 ? a_point_size : u_point_size) / point_attenuation;
     vec3 transformed_normal = (u_modelview * vec4(a_normal, 0.0)).xyz;
     if (u_normalize_enabled != 0) transformed_normal = normalize(transformed_normal);
     vec4 base_color = a_color * u_color;
@@ -498,6 +531,9 @@ void main() {
         gl::BindAttribLocation(program, ATTR_COLOR, b"a_color\0".as_ptr() as *const GLchar);
         gl::BindAttribLocation(program, ATTR_NORMAL, b"a_normal\0".as_ptr() as *const GLchar);
         gl::BindAttribLocation(program, ATTR_TEX0, b"a_tex0\0".as_ptr() as *const GLchar);
+        gl::BindAttribLocation(program, ATTR_MATRIX_INDEX, b"a_matrix_index\0".as_ptr() as *const GLchar);
+        gl::BindAttribLocation(program, ATTR_WEIGHT, b"a_weight\0".as_ptr() as *const GLchar);
+        gl::BindAttribLocation(program, ATTR_POINT_SIZE, b"a_point_size\0".as_ptr() as *const GLchar);
         gl::LinkProgram(program);
         let mut ok = 0;
         gl::GetProgramiv(program, gl::LINK_STATUS, &mut ok);
@@ -657,6 +693,8 @@ impl GLES for GLES1OnGLES2<'_> {
             self.state.color_material_enabled = true;
         } else if cap == es1::NORMALIZE {
             self.state.normalize_enabled = true;
+        } else if cap == es1::MATRIX_PALETTE_OES {
+            self.state.matrix_palette_enabled = true;
         } else if (es1::CLIP_PLANE0..=es1::CLIP_PLANE5).contains(&cap) {
             self.state.clip_plane_enabled[(cap - es1::CLIP_PLANE0) as usize] = true;
         } else {
@@ -680,6 +718,8 @@ impl GLES for GLES1OnGLES2<'_> {
             self.state.color_material_enabled = false;
         } else if cap == es1::NORMALIZE {
             self.state.normalize_enabled = false;
+        } else if cap == es1::MATRIX_PALETTE_OES {
+            self.state.matrix_palette_enabled = false;
         } else if (es1::CLIP_PLANE0..=es1::CLIP_PLANE5).contains(&cap) {
             self.state.clip_plane_enabled[(cap - es1::CLIP_PLANE0) as usize] = false;
         } else {
@@ -711,6 +751,9 @@ impl GLES for GLES1OnGLES2<'_> {
         if cap == es1::NORMALIZE {
             return if self.state.normalize_enabled { gl::TRUE } else { gl::FALSE };
         }
+        if cap == es1::MATRIX_PALETTE_OES {
+            return if self.state.matrix_palette_enabled { gl::TRUE } else { gl::FALSE };
+        }
         if (es1::CLIP_PLANE0..=es1::CLIP_PLANE5).contains(&cap) {
             return if self.state.clip_plane_enabled[(cap - es1::CLIP_PLANE0) as usize] { gl::TRUE } else { gl::FALSE };
         }
@@ -729,6 +772,9 @@ impl GLES for GLES1OnGLES2<'_> {
             es1::COLOR_ARRAY => self.state.arrays[1].enabled = true,
             es1::NORMAL_ARRAY => self.state.arrays[2].enabled = true,
             es1::TEXTURE_COORD_ARRAY => self.state.texcoord_arrays[self.state.client_active_texture].enabled = true,
+            es1::MATRIX_INDEX_ARRAY_OES => self.state.palette_index_array.enabled = true,
+            es1::WEIGHT_ARRAY_OES => self.state.palette_weight_array.enabled = true,
+            es1::POINT_SIZE_ARRAY_OES => self.state.point_size_array.enabled = true,
             _ => {}
         }
     }
@@ -738,6 +784,9 @@ impl GLES for GLES1OnGLES2<'_> {
             es1::COLOR_ARRAY => self.state.arrays[1].enabled = false,
             es1::NORMAL_ARRAY => self.state.arrays[2].enabled = false,
             es1::TEXTURE_COORD_ARRAY => self.state.texcoord_arrays[self.state.client_active_texture].enabled = false,
+            es1::MATRIX_INDEX_ARRAY_OES => self.state.palette_index_array.enabled = false,
+            es1::WEIGHT_ARRAY_OES => self.state.palette_weight_array.enabled = false,
+            es1::POINT_SIZE_ARRAY_OES => self.state.point_size_array.enabled = false,
             _ => {}
         }
     }
@@ -755,6 +804,9 @@ impl GLES for GLES1OnGLES2<'_> {
             es1::COLOR_ARRAY_POINTER => self.state.arrays[1].pointer,
             es1::NORMAL_ARRAY_POINTER => self.state.arrays[2].pointer,
             es1::TEXTURE_COORD_ARRAY_POINTER => self.state.texcoord_arrays[self.state.client_active_texture].pointer,
+            es1::POINT_SIZE_ARRAY_POINTER_OES => self.state.point_size_array.pointer,
+            es1::MATRIX_INDEX_ARRAY_POINTER_OES => self.state.palette_index_array.pointer,
+            es1::WEIGHT_ARRAY_POINTER_OES => self.state.palette_weight_array.pointer,
             _ => std::ptr::null(),
         };
     }
@@ -1111,7 +1163,8 @@ impl GLES for GLES1OnGLES2<'_> {
             es1::MATRIX_MODE => *params = self.state.matrix_mode as GLint,
             es1::ARRAY_BUFFER_BINDING => *params = self.state.array_buffer_binding as GLint,
             es1::ELEMENT_ARRAY_BUFFER_BINDING => *params = self.state.element_array_buffer_binding as GLint,
-            es1::POINT_SIZE_ARRAY_OES => *params = gl::FALSE as GLint,
+            es1::POINT_SIZE_ARRAY_OES => *params = if self.state.point_size_array.enabled { gl::TRUE as GLint } else { gl::FALSE as GLint },
+            es1::MAX_PALETTE_MATRICES_OES => *params = MAX_PALETTE_MATRICES as GLint,
             _ => gl::GetIntegerv(pname, params),
         }
     }
@@ -1173,6 +1226,36 @@ impl GLES for GLES1OnGLES2<'_> {
     }
     unsafe fn PointSizex(&mut self, size: GLfixed) {
         self.state.point_size = fixed_to_float(size);
+    }
+    unsafe fn PointSizePointerOES(&mut self, type_: GLenum, stride: GLsizei, pointer: *const GLvoid) {
+        self.state.point_size_array.size = 1;
+        self.state.point_size_array.type_ = type_;
+        self.state.point_size_array.stride = stride;
+        self.state.point_size_array.pointer = pointer;
+        self.state.point_size_array.buffer_binding = self.state.array_buffer_binding;
+        self.state.point_size_array.fixed = type_ == es1::FIXED;
+    }
+    unsafe fn CurrentPaletteMatrixOES(&mut self, matrixpaletteindex: GLuint) {
+        self.state.current_palette_matrix = (matrixpaletteindex as usize).min(MAX_PALETTE_MATRICES - 1);
+    }
+    unsafe fn LoadPaletteFromModelViewMatrixOES(&mut self) {
+        let index = self.state.current_palette_matrix;
+        self.state.palette_matrices[index].current = self.state.modelview.current;
+    }
+    unsafe fn MatrixIndexPointerOES(&mut self, size: GLint, type_: GLenum, stride: GLsizei, pointer: *const GLvoid) {
+        self.state.palette_index_array.size = size;
+        self.state.palette_index_array.type_ = type_;
+        self.state.palette_index_array.stride = stride;
+        self.state.palette_index_array.pointer = pointer;
+        self.state.palette_index_array.buffer_binding = self.state.array_buffer_binding;
+    }
+    unsafe fn WeightPointerOES(&mut self, size: GLint, type_: GLenum, stride: GLsizei, pointer: *const GLvoid) {
+        self.state.palette_weight_array.size = size;
+        self.state.palette_weight_array.type_ = type_;
+        self.state.palette_weight_array.stride = stride;
+        self.state.palette_weight_array.pointer = pointer;
+        self.state.palette_weight_array.buffer_binding = self.state.array_buffer_binding;
+        self.state.palette_weight_array.fixed = type_ == es1::FIXED;
     }
     unsafe fn DrawArrays(&mut self, mode: GLenum, first: GLint, count: GLsizei) {
         let program = match self.state.program {
@@ -1236,6 +1319,12 @@ impl GLES for GLES1OnGLES2<'_> {
         gl::Uniform1i(fog_mode_loc, self.state.fog_mode as GLint);
         let point_size_loc = gl::GetUniformLocation(program, b"u_point_size\0".as_ptr() as *const _);
         gl::Uniform1f(point_size_loc, self.state.point_size);
+        gl::Uniform1i(gl::GetUniformLocation(program, b"u_point_size_array_enabled\0".as_ptr() as *const _), if self.state.point_size_array.enabled { 1 } else { 0 });
+        gl::Uniform1i(gl::GetUniformLocation(program, b"u_matrix_palette_enabled\0".as_ptr() as *const _), if self.state.matrix_palette_enabled { 1 } else { 0 });
+        for (i, matrix) in self.state.palette_matrices.iter().enumerate() {
+            let name = format!("u_palette_matrices[{}]\\0", i);
+            gl::UniformMatrix4fv(gl::GetUniformLocation(program, name.as_ptr() as *const _), 1, gl::FALSE, matrix.current.as_ptr());
+        }
         let tex_enabled = self.state.texture_enabled[0];
         let enabled_loc = gl::GetUniformLocation(program, b"u_tex_enabled0\0".as_ptr() as *const _);
         gl::Uniform1i(enabled_loc, if tex_enabled { 1 } else { 0 });
@@ -1254,6 +1343,12 @@ impl GLES for GLES1OnGLES2<'_> {
         self.bind_array(ATTR_COLOR, &color);
         self.bind_array(ATTR_NORMAL, &normal);
         self.bind_array(ATTR_TEX0, &tex0);
+        let palette_index = self.state.palette_index_array;
+        let palette_weight = self.state.palette_weight_array;
+        let point_size_array = self.state.point_size_array;
+        self.bind_array(ATTR_MATRIX_INDEX, &palette_index);
+        self.bind_array(ATTR_WEIGHT, &palette_weight);
+        self.bind_array(ATTR_POINT_SIZE, &point_size_array);
         gl::DrawArrays(mode, first, count);
     }
     unsafe fn DrawElements(&mut self, mode: GLenum, count: GLsizei, type_: GLenum, indices: *const GLvoid) {
@@ -1314,6 +1409,12 @@ impl GLES for GLES1OnGLES2<'_> {
         self.bind_array(ATTR_COLOR, &color);
         self.bind_array(ATTR_NORMAL, &normal);
         self.bind_array(ATTR_TEX0, &tex0);
+        let palette_index = self.state.palette_index_array;
+        let palette_weight = self.state.palette_weight_array;
+        let point_size_array = self.state.point_size_array;
+        self.bind_array(ATTR_MATRIX_INDEX, &palette_index);
+        self.bind_array(ATTR_WEIGHT, &palette_weight);
+        self.bind_array(ATTR_POINT_SIZE, &point_size_array);
         gl::DrawElements(mode, count, type_, indices);
     }
 }
