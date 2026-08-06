@@ -810,6 +810,15 @@ impl GLES for GLES1OnGLES2<'_> {
             _ => std::ptr::null(),
         };
     }
+    unsafe fn GetVertexAttribiv(&mut self, index: GLuint, pname: GLenum, params: *mut GLint) {
+        gl::GetVertexAttribiv(index, pname, params);
+    }
+    unsafe fn GetVertexAttribfv(&mut self, index: GLuint, pname: GLenum, params: *mut GLfloat) {
+        gl::GetVertexAttribfv(index, pname, params);
+    }
+    unsafe fn GetVertexAttribPointerv(&mut self, index: GLuint, pname: GLenum, pointer: *mut *mut GLvoid) {
+        gl::GetVertexAttribPointerv(index, pname, pointer);
+    }
     unsafe fn Hint(&mut self, _target: GLenum, _mode: GLenum) {}
     unsafe fn ClipPlanef(&mut self, plane: GLenum, equation: *const GLfloat) {
         if equation.is_null() || !(es1::CLIP_PLANE0..=es1::CLIP_PLANE5).contains(&plane) { return; }
