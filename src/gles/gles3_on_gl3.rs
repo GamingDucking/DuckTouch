@@ -352,6 +352,7 @@ impl GLES for GLES3OnGL3<'_> {
     unsafe fn Fogx(&mut self, _pname: GLenum, _param: GLfixed) {}
     unsafe fn Fogfv(&mut self, _pname: GLenum, _params: *const GLfloat) {}
     unsafe fn Fogxv(&mut self, _pname: GLenum, _params: *const GLfixed) {}
+    unsafe fn Lightx(&mut self, _light: GLenum, _pname: GLenum, _param: GLfixed) {}
 
     // Other state manipulation
     unsafe fn BlendFunc(&mut self, sfactor: GLenum, dfactor: GLenum) {
