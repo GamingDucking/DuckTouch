@@ -804,7 +804,10 @@ unsafe fn present_renderbuffer_readback(env: &mut Environment, drawable: id) {
         return;
     };
     present_pixels(env, drawable, pixels, width, height);
+    let force_composition = env.options.force_composition;
+    env.options.force_composition = true;
     crate::frameworks::core_animation::recomposite_if_necessary(env, true);
+    env.options.force_composition = force_composition;
 }
 
 /// Implement framerate limiting.
