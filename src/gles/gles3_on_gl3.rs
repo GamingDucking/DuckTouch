@@ -348,6 +348,10 @@ impl GLES for GLES3OnGL3<'_> {
     unsafe fn GetString(&mut self, name: GLenum) -> *const GLubyte {
         gl33::GetString(name)
     }
+    unsafe fn Fogf(&mut self, _pname: GLenum, _param: GLfloat) {}
+    unsafe fn Fogx(&mut self, _pname: GLenum, _param: GLfixed) {}
+    unsafe fn Fogfv(&mut self, _pname: GLenum, _params: *const GLfloat) {}
+    unsafe fn Fogxv(&mut self, _pname: GLenum, _params: *const GLfixed) {}
 
     // Other state manipulation
     unsafe fn BlendFunc(&mut self, sfactor: GLenum, dfactor: GLenum) {
