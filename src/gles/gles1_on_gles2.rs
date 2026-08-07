@@ -1414,6 +1414,7 @@ impl GLES for GLES1OnGLES2<'_> {
     }
     unsafe fn BindTexture(&mut self, target: GLenum, texture: GLuint) {
         self.state.bound_textures[self.state.active_texture] = texture;
+        gl::ActiveTexture(gl::TEXTURE0 + self.state.active_texture as GLenum);
         gl::BindTexture(target, texture);
     }
     unsafe fn GenTextures(&mut self, n: GLsizei, textures: *mut GLuint) { gl::GenTextures(n, textures); }
@@ -1727,7 +1728,8 @@ impl GLES for GLES1OnGLES2<'_> {
             gl::UniformMatrix4fv(gl::GetUniformLocation(program, name.as_ptr() as *const _), 1, gl::FALSE, self.state.texture[unit].current.as_ptr());
         }
         let color_loc = gl::GetUniformLocation(program, b"u_color\0".as_ptr() as *const _);
-        gl::Uniform4fv(color_loc, 1, self.state.color.as_ptr());
+        let color_uniform = if self.state.arrays[1].enabled { [1.0; 4] } else { self.state.color };
+        gl::Uniform4fv(color_loc, 1, color_uniform.as_ptr());
         gl::Uniform1i(gl::GetUniformLocation(program, b"u_lighting_enabled\0".as_ptr() as *const _), self.state.lighting_enabled as GLint);
                 let mut light_enabled = [0; 8];
         let mut light_ambient = [[0.0; 4]; 8];
@@ -1831,6 +1833,7 @@ impl GLES for GLES1OnGLES2<'_> {
             gl::Uniform4fv(gl::GetUniformLocation(program, env_name.as_ptr() as *const _), 1, self.state.texture_env_color[unit].as_ptr());
             gl::Uniform1i(gl::GetUniformLocation(program, sampler_name.as_ptr() as *const _), unit as GLint);
         }
+        gl::ActiveTexture(gl::TEXTURE0 + self.state.active_texture as GLenum);
         gl::Uniform1i(gl::GetUniformLocation(program, b"u_logic_op_enabled\0".as_ptr() as *const _), self.state.logic_op_enabled as GLint);
         gl::Uniform1i(gl::GetUniformLocation(program, b"u_logic_op\0".as_ptr() as *const _), self.state.logic_op as GLint);
         let position = self.state.arrays[0];
@@ -1876,7 +1879,8 @@ impl GLES for GLES1OnGLES2<'_> {
             gl::UniformMatrix4fv(gl::GetUniformLocation(program, name.as_ptr() as *const _), 1, gl::FALSE, self.state.texture[unit].current.as_ptr());
         }
         let color_loc = gl::GetUniformLocation(program, b"u_color\0".as_ptr() as *const _);
-        gl::Uniform4fv(color_loc, 1, self.state.color.as_ptr());
+        let color_uniform = if self.state.arrays[1].enabled { [1.0; 4] } else { self.state.color };
+        gl::Uniform4fv(color_loc, 1, color_uniform.as_ptr());
         gl::Uniform1i(gl::GetUniformLocation(program, b"u_lighting_enabled\0".as_ptr() as *const _), self.state.lighting_enabled as GLint);
                 let mut light_enabled = [0; 8];
         let mut light_ambient = [[0.0; 4]; 8];
@@ -1956,6 +1960,7 @@ impl GLES for GLES1OnGLES2<'_> {
             gl::Uniform4fv(gl::GetUniformLocation(program, env_name.as_ptr() as *const _), 1, self.state.texture_env_color[unit].as_ptr());
             gl::Uniform1i(gl::GetUniformLocation(program, sampler_name.as_ptr() as *const _), unit as GLint);
         }
+        gl::ActiveTexture(gl::TEXTURE0 + self.state.active_texture as GLenum);
         let array_range = self.indexed_vertex_range(type_, indices, count).unwrap_or((0, count));
         let position = self.state.arrays[0];
         let color = self.state.arrays[1];
@@ -2104,8 +2109,50 @@ impl GLES1OnGLES2<'_> {
         }
         if array.buffer_binding != 0 {
             gl::BindBuffer(gl::ARRAY_BUFFER, array.buffer_binding);
+            if array.type_ != gl::FIXED {
+                gl::EnableVertexAttribArray(index);
+                gl::VertexAttribPointer(index, array.size, array.type_, if array.normalized { gl::TRUE } else { gl::FALSE }, array.stride, array.pointer);
+                return;
+            }
+            let bytes = match self.state.array_buffer_data.get(&array.buffer_binding) {
+                Some(bytes) => bytes.clone(),
+                None => {
+                    gl::DisableVertexAttribArray(index);
+                    return;
+                }
+            };
+            let components = array.size as usize;
+            let stride = if array.stride > 0 { array.stride as usize } else { components * 4 };
+            let first = first.max(0) as usize;
+            let count = count as usize;
+            let upload_count = first.saturating_add(count);
+            let offset = array.pointer as usize;
+            let byte_count = upload_count.saturating_sub(1).saturating_mul(stride).saturating_add(components * 4);
+            let end = match offset.checked_add(byte_count) {
+                Some(end) if end <= bytes.len() => end,
+                _ => {
+                    gl::DisableVertexAttribArray(index);
+                    return;
+                }
+            };
+            let mut converted = Vec::with_capacity(byte_count / 4 * std::mem::size_of::<GLfloat>());
+            for vertex in 0..upload_count {
+                let source = bytes.as_ptr().add(offset + vertex.saturating_mul(stride));
+                for component in 0..components {
+                    let value = source.add(component * 4).cast::<GLfixed>().read_unaligned();
+                    converted.extend_from_slice(&fixed_to_float(value).to_ne_bytes());
+                }
+            }
+            let _ = end;
+            let vbo_slot = (index as usize).min(self.state.client_array_vbos.len() - 1);
+            if self.state.client_array_vbos[vbo_slot] == 0 {
+                gl::GenBuffers(1, &mut self.state.client_array_vbos[vbo_slot]);
+            }
+            let vbo = self.state.client_array_vbos[vbo_slot];
+            gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
+            gl::BufferData(gl::ARRAY_BUFFER, converted.len() as GLsizeiptr, converted.as_ptr().cast(), gl::STREAM_DRAW);
             gl::EnableVertexAttribArray(index);
-            gl::VertexAttribPointer(index, array.size, array.type_, if array.normalized { gl::TRUE } else { gl::FALSE }, array.stride, array.pointer);
+            gl::VertexAttribPointer(index, array.size, gl::FLOAT, if array.normalized { gl::TRUE } else { gl::FALSE }, (components * 4) as GLsizei, std::ptr::null());
             return;
         }
         if array.pointer.is_null() || count <= 0 || array.size <= 0 {
