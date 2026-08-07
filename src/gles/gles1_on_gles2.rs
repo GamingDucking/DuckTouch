@@ -741,6 +741,7 @@ impl GLES for GLES1OnGLES2<'_> {
     unsafe fn GetTexParameteriv(&mut self, target: GLenum, pname: GLenum, params: *mut GLint) { gl::GetTexParameteriv(target, pname, params); }
     unsafe fn GetTexParameterfv(&mut self, target: GLenum, pname: GLenum, params: *mut GLfloat) { gl::GetTexParameterfv(target, pname, params); }
     unsafe fn GetTexParameterxv(&mut self, target: GLenum, pname: GLenum, params: *mut GLfixed) {
+        if params.is_null() { return; }
         let mut value = 0.0;
         gl::GetTexParameterfv(target, pname, &mut value);
         *params = float_to_fixed(value);
@@ -829,11 +830,11 @@ impl GLES for GLES1OnGLES2<'_> {
         gl::IsEnabled(cap)
     }
     unsafe fn ClientActiveTexture(&mut self, texture: GLenum) {
-        self.state.client_active_texture = (texture - es1::TEXTURE0).min((MAX_TEXTURE_UNITS - 1) as GLenum) as usize;
+        self.state.client_active_texture = texture.saturating_sub(es1::TEXTURE0).min((MAX_TEXTURE_UNITS - 1) as GLenum) as usize;
     }
     unsafe fn ActiveTexture(&mut self, texture: GLenum) {
         self.state.active_texture = texture.saturating_sub(es1::TEXTURE0).min((MAX_TEXTURE_UNITS - 1) as GLenum) as usize;
-        gl::ActiveTexture(es1::TEXTURE0 + self.state.active_texture as GLenum);
+        gl::ActiveTexture(gl::TEXTURE0 + self.state.active_texture as GLenum);
     }
     unsafe fn EnableClientState(&mut self, array: GLenum) {
         match array {
@@ -1019,7 +1020,7 @@ impl GLES for GLES1OnGLES2<'_> {
     unsafe fn Color4ub(&mut self, r: GLubyte, g: GLubyte, b: GLubyte, a: GLubyte) { self.state.color = [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a as f32 / 255.0]; }
     unsafe fn Normal3f(&mut self, x: GLfloat, y: GLfloat, z: GLfloat) { self.state.normal = [x, y, z]; }
     unsafe fn Normal3x(&mut self, x: GLfixed, y: GLfixed, z: GLfixed) { self.Normal3f(fixed_to_float(x), fixed_to_float(y), fixed_to_float(z)); }
-    unsafe fn MultiTexCoord4f(&mut self, texture: GLenum, s: GLfloat, t: GLfloat, r: GLfloat, q: GLfloat) { let i = (texture - es1::TEXTURE0).min((MAX_TEXTURE_UNITS - 1) as GLenum) as usize; self.state.texcoords[i] = [s, t, r, q]; }
+    unsafe fn MultiTexCoord4f(&mut self, texture: GLenum, s: GLfloat, t: GLfloat, r: GLfloat, q: GLfloat) { let i = texture.saturating_sub(es1::TEXTURE0).min((MAX_TEXTURE_UNITS - 1) as GLenum) as usize; self.state.texcoords[i] = [s, t, r, q]; }
     unsafe fn MultiTexCoord4x(&mut self, texture: GLenum, s: GLfixed, t: GLfixed, r: GLfixed, q: GLfixed) { self.MultiTexCoord4f(texture, fixed_to_float(s), fixed_to_float(t), fixed_to_float(r), fixed_to_float(q)); }
     unsafe fn TexCoordPointer(&mut self, size: GLint, type_: GLenum, stride: GLsizei, pointer: *const GLvoid) {
         let enabled = self.state.texcoord_arrays[self.state.client_active_texture].enabled;
@@ -1105,7 +1106,8 @@ impl GLES for GLES1OnGLES2<'_> {
         gl::TexParameterfv(target, pname, params);
     }
     unsafe fn TexParameterxv(&mut self, target: GLenum, pname: GLenum, params: *const GLfixed) {
-        if pname == es1::TEXTURE_CROP_RECT_OES && !params.is_null() { self.state.texture_crop_rect = std::slice::from_raw_parts(params, 4).try_into().unwrap(); return; }
+        if params.is_null() { return; }
+        if pname == es1::TEXTURE_CROP_RECT_OES { self.state.texture_crop_rect = std::slice::from_raw_parts(params, 4).iter().map(|v| fixed_to_float(*v) as GLint).collect::<Vec<_>>().try_into().unwrap(); return; }
         let v = fixed_to_float(*params); gl::TexParameterf(target, pname, v);
     }
     unsafe fn DrawTexsOES(&mut self, x: i16, y: i16, z: i16, width: i16, height: i16) { self.DrawTexfOES(x as GLfloat, y as GLfloat, z as GLfloat, width as GLfloat, height as GLfloat); }
