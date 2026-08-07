@@ -1055,6 +1055,22 @@ unsafe fn present_renderbuffer_es2(
         (w, h)
     };
 
+    let mut pixels = vec![0u8; (width.max(0) as usize).saturating_mul(height.max(0) as usize).saturating_mul(4)];
+    if width > 0 && height > 0 && !pixels.is_empty() {
+        gles.Finish();
+        gles.ReadPixels(
+            0,
+            0,
+            width,
+            height,
+            gles2::RGBA,
+            gles2::UNSIGNED_BYTE,
+            pixels.as_mut_ptr().cast(),
+        );
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| log!("GLES2 presenter: using RGBA CPU readback before texture presentation"));
+    }
+
     let present_objects = ensure_present_objects(gles);
     gles.BindFramebuffer(gles2::FRAMEBUFFER, present_objects.framebuffer);
     gles.FramebufferRenderbuffer(
@@ -1066,6 +1082,19 @@ unsafe fn present_renderbuffer_es2(
 
     gles.ActiveTexture(gles2::TEXTURE0);
     gles.BindTexture(gles2::TEXTURE_2D, present_objects.texture);
+    if !pixels.is_empty() {
+        gles.TexImage2D(
+            gles2::TEXTURE_2D,
+            0,
+            gles2::RGBA as GLint,
+            width,
+            height,
+            0,
+            gles2::RGBA,
+            gles2::UNSIGNED_BYTE,
+            pixels.as_ptr().cast(),
+        );
+    }
     gles.BindBuffer(gles2::ARRAY_BUFFER, present_objects.quad_vbo);
     #[rustfmt::skip]
     let verts: [f32; 24] = [
@@ -1083,9 +1112,6 @@ unsafe fn present_renderbuffer_es2(
         verts.as_ptr().cast(),
         gles2::STREAM_DRAW,
     );
-    gles.Finish();
-    gles.CopyTexImage2D(gles2::TEXTURE_2D, 0, gles2::RGB, 0, 0, width, height, 0);
-
     gles.BindFramebuffer(gles2::FRAMEBUFFER, 0);
 
     // Configure the destination viewport (the window) and clear.
