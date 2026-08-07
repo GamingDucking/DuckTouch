@@ -134,6 +134,14 @@ struct TranslatorState {
     texture_enabled: [bool; MAX_TEXTURE_UNITS],
     texture_env_mode: [GLint; MAX_TEXTURE_UNITS],
     texture_env_color: [[GLfloat; 4]; MAX_TEXTURE_UNITS],
+    texture_combine_rgb: [GLenum; MAX_TEXTURE_UNITS],
+    texture_combine_alpha: [GLenum; MAX_TEXTURE_UNITS],
+    texture_src_rgb: [[GLenum; 3]; MAX_TEXTURE_UNITS],
+    texture_src_alpha: [[GLenum; 3]; MAX_TEXTURE_UNITS],
+    texture_operand_rgb: [[GLenum; 3]; MAX_TEXTURE_UNITS],
+    texture_operand_alpha: [[GLenum; 3]; MAX_TEXTURE_UNITS],
+    texture_rgb_scale: [GLfloat; MAX_TEXTURE_UNITS],
+    texture_alpha_scale: [GLfloat; MAX_TEXTURE_UNITS],
     fixed_buffers: [Vec<GLfloat>; 3],
     client_array_vbos: [GLuint; 7],
     client_element_vbo: GLuint,
@@ -200,6 +208,14 @@ impl TranslatorState {
             texture_enabled: [false; MAX_TEXTURE_UNITS],
             texture_env_mode: [es1::MODULATE as GLint; MAX_TEXTURE_UNITS],
             texture_env_color: [[0.0, 0.0, 0.0, 0.0]; MAX_TEXTURE_UNITS],
+            texture_combine_rgb: [es1::MODULATE; MAX_TEXTURE_UNITS],
+            texture_combine_alpha: [es1::MODULATE; MAX_TEXTURE_UNITS],
+            texture_src_rgb: [[es1::TEXTURE, es1::PREVIOUS, es1::CONSTANT]; MAX_TEXTURE_UNITS],
+            texture_src_alpha: [[es1::TEXTURE, es1::PREVIOUS, es1::CONSTANT]; MAX_TEXTURE_UNITS],
+            texture_operand_rgb: [[es1::SRC_COLOR, es1::SRC_COLOR, es1::SRC_COLOR]; MAX_TEXTURE_UNITS],
+            texture_operand_alpha: [[es1::SRC_ALPHA, es1::SRC_ALPHA, es1::SRC_ALPHA]; MAX_TEXTURE_UNITS],
+            texture_rgb_scale: [1.0; MAX_TEXTURE_UNITS],
+            texture_alpha_scale: [1.0; MAX_TEXTURE_UNITS],
             fixed_buffers: std::array::from_fn(|_| Vec::new()),
             client_array_vbos: [0; 7],
             client_element_vbo: 0,
@@ -543,6 +559,38 @@ uniform int u_tex_mode0;
 uniform int u_tex_mode1;
 uniform int u_tex_mode2;
 uniform int u_tex_mode3;
+uniform int u_combine_rgb0;
+uniform int u_combine_rgb1;
+uniform int u_combine_rgb2;
+uniform int u_combine_rgb3;
+uniform int u_combine_alpha0;
+uniform int u_combine_alpha1;
+uniform int u_combine_alpha2;
+uniform int u_combine_alpha3;
+uniform int u_src_rgb0[3];
+uniform int u_src_rgb1[3];
+uniform int u_src_rgb2[3];
+uniform int u_src_rgb3[3];
+uniform int u_src_alpha0[3];
+uniform int u_src_alpha1[3];
+uniform int u_src_alpha2[3];
+uniform int u_src_alpha3[3];
+uniform int u_operand_rgb0[3];
+uniform int u_operand_rgb1[3];
+uniform int u_operand_rgb2[3];
+uniform int u_operand_rgb3[3];
+uniform int u_operand_alpha0[3];
+uniform int u_operand_alpha1[3];
+uniform int u_operand_alpha2[3];
+uniform int u_operand_alpha3[3];
+uniform float u_rgb_scale0;
+uniform float u_rgb_scale1;
+uniform float u_rgb_scale2;
+uniform float u_rgb_scale3;
+uniform float u_alpha_scale0;
+uniform float u_alpha_scale1;
+uniform float u_alpha_scale2;
+uniform float u_alpha_scale3;
 uniform int u_alpha_test_enabled;
 uniform int u_alpha_func;
 uniform float u_alpha_ref;
@@ -582,6 +630,15 @@ void main() {
         else if (u_tex_mode0 == 3) color = vec4(color.rgb + texel.rgb, color.a * texel.a);
         else if (u_tex_mode0 == 4) color = vec4(mix(color.rgb, texel.rgb, texel.a), color.a);
         else if (u_tex_mode0 == 5) color = vec4(mix(color.rgb, u_env_color0.rgb, texel.rgb), color.a * texel.a);
+        else if (u_combine_rgb0 == 0) color = color * texel;
+        else if (u_combine_rgb0 == 1) color = texel;
+        else if (u_combine_rgb0 == 0x0104) color = color + texel;
+        else if (u_combine_rgb0 == 0x8574) color = color + texel - 0.5;
+        else if (u_combine_rgb0 == 0x84E7) color = color - texel;
+        else if (u_combine_rgb0 == 0x8575) color = mix(color, texel, texel.a);
+        else if (u_combine_rgb0 == 0x86AE) color = vec4(vec3(dot(color.rgb * 2.0 - 1.0, texel.rgb * 2.0 - 1.0)), color.a);
+        color.rgb *= u_rgb_scale0;
+        color.a *= u_alpha_scale0;
     }
     if (u_tex_enabled1 != 0) {
         vec4 texel = texture2D(u_tex1, v_tex1);
@@ -590,6 +647,15 @@ void main() {
         else if (u_tex_mode1 == 3) color = vec4(color.rgb + texel.rgb, color.a * texel.a);
         else if (u_tex_mode1 == 4) color = vec4(mix(color.rgb, texel.rgb, texel.a), color.a);
         else if (u_tex_mode1 == 5) color = vec4(mix(color.rgb, u_env_color1.rgb, texel.rgb), color.a * texel.a);
+        else if (u_combine_rgb1 == 0) color = color * texel;
+        else if (u_combine_rgb1 == 1) color = texel;
+        else if (u_combine_rgb1 == 0x0104) color = color + texel;
+        else if (u_combine_rgb1 == 0x8574) color = color + texel - 0.5;
+        else if (u_combine_rgb1 == 0x84E7) color = color - texel;
+        else if (u_combine_rgb1 == 0x8575) color = mix(color, texel, texel.a);
+        else if (u_combine_rgb1 == 0x86AE) color = vec4(vec3(dot(color.rgb * 2.0 - 1.0, texel.rgb * 2.0 - 1.0)), color.a);
+        color.rgb *= u_rgb_scale1;
+        color.a *= u_alpha_scale1;
     }
     if (u_tex_enabled2 != 0) {
         vec4 texel = texture2D(u_tex2, v_tex2);
@@ -598,6 +664,15 @@ void main() {
         else if (u_tex_mode2 == 3) color = vec4(color.rgb + texel.rgb, color.a * texel.a);
         else if (u_tex_mode2 == 4) color = vec4(mix(color.rgb, texel.rgb, texel.a), color.a);
         else if (u_tex_mode2 == 5) color = vec4(mix(color.rgb, u_env_color2.rgb, texel.rgb), color.a * texel.a);
+        else if (u_combine_rgb2 == 0) color = color * texel;
+        else if (u_combine_rgb2 == 1) color = texel;
+        else if (u_combine_rgb2 == 0x0104) color = color + texel;
+        else if (u_combine_rgb2 == 0x8574) color = color + texel - 0.5;
+        else if (u_combine_rgb2 == 0x84E7) color = color - texel;
+        else if (u_combine_rgb2 == 0x8575) color = mix(color, texel, texel.a);
+        else if (u_combine_rgb2 == 0x86AE) color = vec4(vec3(dot(color.rgb * 2.0 - 1.0, texel.rgb * 2.0 - 1.0)), color.a);
+        color.rgb *= u_rgb_scale2;
+        color.a *= u_alpha_scale2;
     }
     if (u_tex_enabled3 != 0) {
         vec4 texel = texture2D(u_tex3, v_tex3);
@@ -606,6 +681,15 @@ void main() {
         else if (u_tex_mode3 == 3) color = vec4(color.rgb + texel.rgb, color.a * texel.a);
         else if (u_tex_mode3 == 4) color = vec4(mix(color.rgb, texel.rgb, texel.a), color.a);
         else if (u_tex_mode3 == 5) color = vec4(mix(color.rgb, u_env_color3.rgb, texel.rgb), color.a * texel.a);
+        else if (u_combine_rgb3 == 0) color = color * texel;
+        else if (u_combine_rgb3 == 1) color = texel;
+        else if (u_combine_rgb3 == 0x0104) color = color + texel;
+        else if (u_combine_rgb3 == 0x8574) color = color + texel - 0.5;
+        else if (u_combine_rgb3 == 0x84E7) color = color - texel;
+        else if (u_combine_rgb3 == 0x8575) color = mix(color, texel, texel.a);
+        else if (u_combine_rgb3 == 0x86AE) color = vec4(vec3(dot(color.rgb * 2.0 - 1.0, texel.rgb * 2.0 - 1.0)), color.a);
+        color.rgb *= u_rgb_scale3;
+        color.a *= u_alpha_scale3;
     }
     if (u_alpha_test_enabled != 0 && !alpha_pass(color.a)) discard;
     if (u_clip_enabled[0] != 0 && v_clip_distances0.x < 0.0) discard;
@@ -1331,25 +1415,36 @@ impl GLES for GLES1OnGLES2<'_> {
     unsafe fn TexEnvi(&mut self, target: GLenum, pname: GLenum, param: GLint) {
         if target != es1::TEXTURE_ENV { return; }
         let unit = self.state.active_texture;
+        let value = param as GLenum;
         match pname {
             es1::TEXTURE_ENV_MODE => self.state.texture_env_mode[unit] = param,
             es1::TEXTURE_ENV_COLOR => self.state.texture_env_color[unit] = [param as GLfloat; 4],
+            es1::COMBINE_RGB => self.state.texture_combine_rgb[unit] = value,
+            es1::COMBINE_ALPHA => self.state.texture_combine_alpha[unit] = value,
+            es1::SRC0_RGB..=es1::SRC2_RGB => self.state.texture_src_rgb[unit][(pname - es1::SRC0_RGB) as usize] = value,
+            es1::SRC0_ALPHA..=es1::SRC2_ALPHA => self.state.texture_src_alpha[unit][(pname - es1::SRC0_ALPHA) as usize] = value,
+            es1::OPERAND0_RGB..=es1::OPERAND2_RGB => self.state.texture_operand_rgb[unit][(pname - es1::OPERAND0_RGB) as usize] = value,
+            es1::OPERAND0_ALPHA..=es1::OPERAND2_ALPHA => self.state.texture_operand_alpha[unit][(pname - es1::OPERAND0_ALPHA) as usize] = value,
+            es1::RGB_SCALE => self.state.texture_rgb_scale[unit] = param as GLfloat,
+            es1::ALPHA_SCALE => self.state.texture_alpha_scale[unit] = param as GLfloat,
             _ => {}
         }
     }
-    unsafe fn TexEnvf(&mut self, target: GLenum, pname: GLenum, param: GLfloat) { self.TexEnvi(target, pname, param as GLint); }
-    unsafe fn TexEnvx(&mut self, target: GLenum, pname: GLenum, param: GLfixed) { self.TexEnvi(target, pname, param); }
+    unsafe fn TexEnvf(&mut self, target: GLenum, pname: GLenum, param: GLfloat) {
+        if pname == es1::TEXTURE_ENV_COLOR { self.state.texture_env_color[self.state.active_texture] = [param; 4]; } else { self.TexEnvi(target, pname, param as GLint); }
+    }
+    unsafe fn TexEnvx(&mut self, target: GLenum, pname: GLenum, param: GLfixed) { self.TexEnvf(target, pname, fixed_to_float(param)); }
     unsafe fn TexEnviv(&mut self, target: GLenum, pname: GLenum, params: *const GLint) {
         if params.is_null() { return; }
         if pname == es1::TEXTURE_ENV_COLOR { self.state.texture_env_color[self.state.active_texture] = std::slice::from_raw_parts(params, 4).iter().map(|v| *v as GLfloat).collect::<Vec<_>>().try_into().unwrap(); } else { self.TexEnvi(target, pname, *params); }
     }
     unsafe fn TexEnvfv(&mut self, target: GLenum, pname: GLenum, params: *const GLfloat) {
         if params.is_null() { return; }
-        if pname == es1::TEXTURE_ENV_COLOR { self.state.texture_env_color[self.state.active_texture] = std::slice::from_raw_parts(params, 4).try_into().unwrap(); } else { self.TexEnvi(target, pname, *params as GLint); }
+        if pname == es1::TEXTURE_ENV_COLOR { self.state.texture_env_color[self.state.active_texture] = std::slice::from_raw_parts(params, 4).try_into().unwrap(); } else { self.TexEnvf(target, pname, *params); }
     }
     unsafe fn TexEnvxv(&mut self, target: GLenum, pname: GLenum, params: *const GLfixed) {
         if params.is_null() { return; }
-        if pname == es1::TEXTURE_ENV_COLOR { self.state.texture_env_color[self.state.active_texture] = std::slice::from_raw_parts(params, 4).iter().map(|v| fixed_to_float(*v)).collect::<Vec<_>>().try_into().unwrap(); } else { self.TexEnvi(target, pname, *params); }
+        if pname == es1::TEXTURE_ENV_COLOR { self.state.texture_env_color[self.state.active_texture] = std::slice::from_raw_parts(params, 4).iter().map(|v| fixed_to_float(*v)).collect::<Vec<_>>().try_into().unwrap(); } else { self.TexEnvx(target, pname, *params); }
     }
     unsafe fn MatrixMode(&mut self, mode: GLenum) { self.state.matrix_mode = mode; }
     unsafe fn LoadIdentity(&mut self) { self.state.matrix_mut().current = MATRIX_IDENTITY; }
@@ -1607,6 +1702,22 @@ impl GLES for GLES1OnGLES2<'_> {
             let env_name = format!("u_env_color{}\0", unit);
             let sampler_name = format!("u_tex{}\0", unit);
             let mode = match self.state.texture_env_mode[unit] as GLenum { es1::REPLACE => 1, es1::ADD => 3, es1::DECAL => 4, es1::BLEND => 5, _ => 2 };
+            let combine_name = format!("u_combine_rgb{}\0", unit);
+            let combine_alpha_name = format!("u_combine_alpha{}\0", unit);
+            let src_rgb_name = format!("u_src_rgb{}\0", unit);
+            let src_alpha_name = format!("u_src_alpha{}\0", unit);
+            let operand_rgb_name = format!("u_operand_rgb{}\0", unit);
+            let operand_alpha_name = format!("u_operand_alpha{}\0", unit);
+            let rgb_scale_name = format!("u_rgb_scale{}\0", unit);
+            let alpha_scale_name = format!("u_alpha_scale{}\0", unit);
+            gl::Uniform1i(gl::GetUniformLocation(program, combine_name.as_ptr() as *const _), self.state.texture_combine_rgb[unit] as GLint);
+            gl::Uniform1i(gl::GetUniformLocation(program, combine_alpha_name.as_ptr() as *const _), self.state.texture_combine_alpha[unit] as GLint);
+            gl::Uniform1iv(gl::GetUniformLocation(program, src_rgb_name.as_ptr() as *const _), 3, self.state.texture_src_rgb[unit].as_ptr().cast());
+            gl::Uniform1iv(gl::GetUniformLocation(program, src_alpha_name.as_ptr() as *const _), 3, self.state.texture_src_alpha[unit].as_ptr().cast());
+            gl::Uniform1iv(gl::GetUniformLocation(program, operand_rgb_name.as_ptr() as *const _), 3, self.state.texture_operand_rgb[unit].as_ptr().cast());
+            gl::Uniform1iv(gl::GetUniformLocation(program, operand_alpha_name.as_ptr() as *const _), 3, self.state.texture_operand_alpha[unit].as_ptr().cast());
+            gl::Uniform1f(gl::GetUniformLocation(program, rgb_scale_name.as_ptr() as *const _), self.state.texture_rgb_scale[unit]);
+            gl::Uniform1f(gl::GetUniformLocation(program, alpha_scale_name.as_ptr() as *const _), self.state.texture_alpha_scale[unit]);
             gl::Uniform1i(gl::GetUniformLocation(program, enabled_name.as_ptr() as *const _), self.state.texture_enabled[unit] as GLint);
             gl::Uniform1i(gl::GetUniformLocation(program, mode_name.as_ptr() as *const _), mode);
             gl::Uniform4fv(gl::GetUniformLocation(program, env_name.as_ptr() as *const _), 1, self.state.texture_env_color[unit].as_ptr());
@@ -1722,6 +1833,22 @@ impl GLES for GLES1OnGLES2<'_> {
             let env_name = format!("u_env_color{}\0", unit);
             let sampler_name = format!("u_tex{}\0", unit);
             let mode = match self.state.texture_env_mode[unit] as GLenum { es1::REPLACE => 1, es1::ADD => 3, es1::DECAL => 4, es1::BLEND => 5, _ => 2 };
+            let combine_name = format!("u_combine_rgb{}\0", unit);
+            let combine_alpha_name = format!("u_combine_alpha{}\0", unit);
+            let src_rgb_name = format!("u_src_rgb{}\0", unit);
+            let src_alpha_name = format!("u_src_alpha{}\0", unit);
+            let operand_rgb_name = format!("u_operand_rgb{}\0", unit);
+            let operand_alpha_name = format!("u_operand_alpha{}\0", unit);
+            let rgb_scale_name = format!("u_rgb_scale{}\0", unit);
+            let alpha_scale_name = format!("u_alpha_scale{}\0", unit);
+            gl::Uniform1i(gl::GetUniformLocation(program, combine_name.as_ptr() as *const _), self.state.texture_combine_rgb[unit] as GLint);
+            gl::Uniform1i(gl::GetUniformLocation(program, combine_alpha_name.as_ptr() as *const _), self.state.texture_combine_alpha[unit] as GLint);
+            gl::Uniform1iv(gl::GetUniformLocation(program, src_rgb_name.as_ptr() as *const _), 3, self.state.texture_src_rgb[unit].as_ptr().cast());
+            gl::Uniform1iv(gl::GetUniformLocation(program, src_alpha_name.as_ptr() as *const _), 3, self.state.texture_src_alpha[unit].as_ptr().cast());
+            gl::Uniform1iv(gl::GetUniformLocation(program, operand_rgb_name.as_ptr() as *const _), 3, self.state.texture_operand_rgb[unit].as_ptr().cast());
+            gl::Uniform1iv(gl::GetUniformLocation(program, operand_alpha_name.as_ptr() as *const _), 3, self.state.texture_operand_alpha[unit].as_ptr().cast());
+            gl::Uniform1f(gl::GetUniformLocation(program, rgb_scale_name.as_ptr() as *const _), self.state.texture_rgb_scale[unit]);
+            gl::Uniform1f(gl::GetUniformLocation(program, alpha_scale_name.as_ptr() as *const _), self.state.texture_alpha_scale[unit]);
             gl::Uniform1i(gl::GetUniformLocation(program, enabled_name.as_ptr() as *const _), self.state.texture_enabled[unit] as GLint);
             gl::Uniform1i(gl::GetUniformLocation(program, mode_name.as_ptr() as *const _), mode);
             gl::Uniform4fv(gl::GetUniformLocation(program, env_name.as_ptr() as *const _), 1, self.state.texture_env_color[unit].as_ptr());
