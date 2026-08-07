@@ -104,6 +104,7 @@ struct TranslatorState {
     element_array_buffer_binding: GLuint,
     array_buffer_data: HashMap<GLuint, Vec<u8>>,
     element_array_buffer_data: HashMap<GLuint, Vec<u8>>,
+    mapped_buffer: Option<(GLenum, GLuint)>,
     point_size: GLfloat,
     alpha_test_enabled: bool,
     alpha_func: GLenum,
@@ -173,6 +174,7 @@ impl TranslatorState {
             element_array_buffer_binding: 0,
             array_buffer_data: HashMap::new(),
             element_array_buffer_data: HashMap::new(),
+            mapped_buffer: None,
             point_size: 1.0,
             alpha_test_enabled: false,
             alpha_func: es1::ALWAYS,
@@ -1153,8 +1155,34 @@ impl GLES for GLES1OnGLES2<'_> {
     unsafe fn TexSubImage2D(&mut self, target: GLenum, level: GLint, x: GLint, y: GLint, width: GLsizei, height: GLsizei, format: GLenum, type_: GLenum, pixels: *const GLvoid) { gl::TexSubImage2D(target, level, x, y, width, height, format, type_, pixels); }
     unsafe fn CompressedTexSubImage2D(&mut self, target: GLenum, level: GLint, x: GLint, y: GLint, width: GLsizei, height: GLsizei, format: GLenum, image_size: GLsizei, data: *const GLvoid) { gl::CompressedTexSubImage2D(target, level, x, y, width, height, format, image_size, data); }
     unsafe fn GetBufferParameteriv(&mut self, target: GLenum, pname: GLenum, params: *mut GLint) { if !params.is_null() { gl::GetBufferParameteriv(target, pname, params); } }
-    unsafe fn MapBufferOES(&mut self, target: GLenum, access: GLenum) -> *mut GLvoid { if gl::MapBufferOES::is_loaded() { gl::MapBufferOES(target, access) } else { std::ptr::null_mut() } }
-    unsafe fn UnmapBufferOES(&mut self, target: GLenum) -> GLboolean { if gl::UnmapBufferOES::is_loaded() { gl::UnmapBufferOES(target) } else { gl::FALSE } }
+    unsafe fn MapBufferOES(&mut self, target: GLenum, _access: GLenum) -> *mut GLvoid {
+        let binding = match target {
+            gl::ARRAY_BUFFER => self.state.array_buffer_binding,
+            gl::ELEMENT_ARRAY_BUFFER => self.state.element_array_buffer_binding,
+            _ => 0,
+        };
+        if binding == 0 {
+            return std::ptr::null_mut();
+        }
+        let store = if target == gl::ARRAY_BUFFER {
+            &mut self.state.array_buffer_data
+        } else {
+            &mut self.state.element_array_buffer_data
+        };
+        let Some(bytes) = store.get_mut(&binding) else {
+            return std::ptr::null_mut();
+        };
+        self.state.mapped_buffer = Some((target, binding));
+        bytes.as_mut_ptr().cast()
+    }
+    unsafe fn UnmapBufferOES(&mut self, target: GLenum) -> GLboolean {
+        if self.state.mapped_buffer.map(|(mapped_target, _)| mapped_target) == Some(target) {
+            self.state.mapped_buffer = None;
+            gl::TRUE
+        } else {
+            gl::FALSE
+        }
+    }
     unsafe fn CopyTexImage2D(&mut self, target: GLenum, level: GLint, internalformat: GLenum, x: GLint, y: GLint, width: GLsizei, height: GLsizei, border: GLint) { gl::CopyTexImage2D(target, level, internalformat, x, y, width, height, border); }
     unsafe fn CopyTexSubImage2D(&mut self, target: GLenum, level: GLint, xoffset: GLint, yoffset: GLint, x: GLint, y: GLint, width: GLsizei, height: GLsizei) { gl::CopyTexSubImage2D(target, level, xoffset, yoffset, x, y, width, height); }
     unsafe fn CompressedTexImage2D(&mut self, target: GLenum, level: GLint, internalformat: GLenum, width: GLsizei, height: GLsizei, border: GLint, image_size: GLsizei, data: *const GLvoid) {

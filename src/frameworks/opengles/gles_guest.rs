@@ -2756,7 +2756,11 @@ fn glUnmapBufferOES(env: &mut Environment, target: GLenum) -> GLboolean {
         );
     }
     env.mem.free(guest_buffer);
-    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.UnmapBufferOES(target) })
+    let unmapped = with_ctx_and_mem(env, |gles, _mem| unsafe { gles.UnmapBufferOES(target) });
+    if unmapped == gles11::FALSE {
+        log!("Warning: host glUnmapBufferOES returned GL_FALSE for buffer {}", buffer_object_name);
+    }
+    unmapped
 }
 
 // =====================================================================
