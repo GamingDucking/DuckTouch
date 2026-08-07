@@ -1492,20 +1492,21 @@ impl GLES for GLES1OnGLES2<'_> {
         let mode_loc = gl::GetUniformLocation(program, b"u_tex_mode0\0".as_ptr() as *const _);
         gl::Uniform1i(mode_loc, match self.state.texture_env_mode[0] as GLenum { es1::REPLACE => 1, es1::ADD => 3, es1::DECAL => 1, _ => 2 });
         gl::Uniform1i(gl::GetUniformLocation(program, b"u_tex0\0".as_ptr() as *const _), 0);
+        let array_range = self.indexed_vertex_range(type_, indices, count).unwrap_or((0, count));
         let position = self.state.arrays[0];
         let color = self.state.arrays[1];
         let normal = self.state.arrays[2];
         let tex0 = self.state.texcoord_arrays[0];
-        self.bind_array_range(ATTR_POSITION, &position, 0, count);
-        self.bind_array_range(ATTR_COLOR, &color, 0, count);
-        self.bind_array_range(ATTR_NORMAL, &normal, 0, count);
-        self.bind_array_range(ATTR_TEX0, &tex0, 0, count);
+        self.bind_array_range(ATTR_POSITION, &position, array_range.0, array_range.1);
+        self.bind_array_range(ATTR_COLOR, &color, array_range.0, array_range.1);
+        self.bind_array_range(ATTR_NORMAL, &normal, array_range.0, array_range.1);
+        self.bind_array_range(ATTR_TEX0, &tex0, array_range.0, array_range.1);
         let palette_index = self.state.palette_index_array;
         let palette_weight = self.state.palette_weight_array;
         let point_size_array = self.state.point_size_array;
-        self.bind_array_range(ATTR_MATRIX_INDEX, &palette_index, 0, count);
-        self.bind_array_range(ATTR_WEIGHT, &palette_weight, 0, count);
-        self.bind_array_range(ATTR_POINT_SIZE, &point_size_array, 0, count);
+        self.bind_array_range(ATTR_MATRIX_INDEX, &palette_index, array_range.0, array_range.1);
+        self.bind_array_range(ATTR_WEIGHT, &palette_weight, array_range.0, array_range.1);
+        self.bind_array_range(ATTR_POINT_SIZE, &point_size_array, array_range.0, array_range.1);
         let (draw_indices, restore_element_buffer) = self.stage_client_indices(type_, indices, count);
         gl::DrawElements(mode, count, type_, draw_indices);
         if restore_element_buffer {
@@ -1552,6 +1553,42 @@ impl GLES1OnGLES2<'_> {
                 None
             }
         }
+    }
+
+    unsafe fn indexed_vertex_range(&self, type_: GLenum, indices: *const GLvoid, count: GLsizei) -> Option<(GLint, GLsizei)> {
+        if count <= 0 || indices.is_null() {
+            return None;
+        }
+        let index_size = match type_ {
+            gl::UNSIGNED_BYTE => 1usize,
+            gl::UNSIGNED_SHORT => 2usize,
+            gl::UNSIGNED_INT => 4usize,
+            _ => return None,
+        };
+        let bytes = if self.state.element_array_buffer_binding != 0 {
+            self.state.element_array_buffer_data.get(&self.state.element_array_buffer_binding)?
+        } else {
+            return None;
+        };
+        let offset = indices as usize;
+        let byte_count = (count as usize).checked_mul(index_size)?;
+        let end = offset.checked_add(byte_count)?;
+        if end > bytes.len() {
+            return None;
+        }
+        let mut max_index = 0usize;
+        for i in 0..count as usize {
+            let at = offset + i * index_size;
+            let value = match type_ {
+                gl::UNSIGNED_BYTE => bytes[at] as usize,
+                gl::UNSIGNED_SHORT => u16::from_ne_bytes([bytes[at], bytes[at + 1]]) as usize,
+                gl::UNSIGNED_INT => u32::from_ne_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]) as usize,
+                _ => return None,
+            };
+            max_index = max_index.max(value);
+        }
+        let vertex_count = max_index.checked_add(1)?.try_into().ok()?;
+        Some((0, vertex_count))
     }
 
     unsafe fn stage_client_indices(&mut self, type_: GLenum, indices: *const GLvoid, count: GLsizei) -> (*const GLvoid, bool) {
