@@ -742,9 +742,16 @@ impl GLES for GLES1OnGLES2<'_> {
     unsafe fn GetTexParameterfv(&mut self, target: GLenum, pname: GLenum, params: *mut GLfloat) { gl::GetTexParameterfv(target, pname, params); }
     unsafe fn GetTexParameterxv(&mut self, target: GLenum, pname: GLenum, params: *mut GLfixed) {
         if params.is_null() { return; }
-        let mut value = 0.0;
-        gl::GetTexParameterfv(target, pname, &mut value);
-        *params = float_to_fixed(value);
+        let is_enum = pname == es1::TEXTURE_MIN_FILTER || pname == es1::TEXTURE_MAG_FILTER || pname == es1::TEXTURE_WRAP_S || pname == es1::TEXTURE_WRAP_T;
+        if is_enum {
+            let mut value = 0;
+            gl::GetTexParameteriv(target, pname, &mut value);
+            *params = value as GLfixed;
+        } else {
+            let mut value = 0.0;
+            gl::GetTexParameterfv(target, pname, &mut value);
+            *params = float_to_fixed(value);
+        }
     }
     unsafe fn Enable(&mut self, cap: GLenum) {
         if cap == es1::COLOR_LOGIC_OP {
