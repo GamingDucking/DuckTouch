@@ -114,8 +114,6 @@ macro_rules! echo_no_panic {
 /// Put modules to enable [log_dbg] for here, e.g. "touchHLE::mem" to see when
 /// memory is allocated and freed.
 pub const ENABLED_MODULES: &[&str] = &[
-    "touchHLE::window",
-    "touchHLE::frameworks::uikit::ui_touch",
     "touchHLE::frameworks::uikit::ui_view",
     "touchHLE::frameworks::uikit::ui_view_controller",
     "touchHLE::frameworks::foundation::ns_run_loop",
