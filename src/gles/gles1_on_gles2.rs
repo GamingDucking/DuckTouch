@@ -1108,7 +1108,12 @@ impl GLES for GLES1OnGLES2<'_> {
     unsafe fn TexParameterxv(&mut self, target: GLenum, pname: GLenum, params: *const GLfixed) {
         if params.is_null() { return; }
         if pname == es1::TEXTURE_CROP_RECT_OES { self.state.texture_crop_rect = std::slice::from_raw_parts(params, 4).iter().map(|v| fixed_to_float(*v) as GLint).collect::<Vec<_>>().try_into().unwrap(); return; }
-        let v = fixed_to_float(*params); gl::TexParameterf(target, pname, v);
+        let is_enum = pname == es1::TEXTURE_MIN_FILTER || pname == es1::TEXTURE_MAG_FILTER || pname == es1::TEXTURE_WRAP_S || pname == es1::TEXTURE_WRAP_T;
+        if is_enum {
+            gl::TexParameteri(target, pname, *params as GLint);
+        } else {
+            gl::TexParameterf(target, pname, fixed_to_float(*params));
+        }
     }
     unsafe fn DrawTexsOES(&mut self, x: i16, y: i16, z: i16, width: i16, height: i16) { self.DrawTexfOES(x as GLfloat, y as GLfloat, z as GLfloat, width as GLfloat, height as GLfloat); }
     unsafe fn DrawTexiOES(&mut self, x: GLint, y: GLint, z: GLint, width: GLint, height: GLint) { self.DrawTexfOES(x as GLfloat, y as GLfloat, z as GLfloat, width as GLfloat, height as GLfloat); }
