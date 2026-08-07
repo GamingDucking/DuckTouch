@@ -293,22 +293,54 @@ pub trait GLES {
     }
 
     // Lighting and materials
-    unsafe fn Fogf(&mut self, _pname: GLenum, _param: GLfloat) {}
-    unsafe fn Fogx(&mut self, _pname: GLenum, _param: GLfixed) {}
-    unsafe fn Fogfv(&mut self, _pname: GLenum, _params: *const GLfloat) {}
-    unsafe fn Fogxv(&mut self, _pname: GLenum, _params: *const GLfixed) {}
-    unsafe fn Lightf(&mut self, _light: GLenum, _pname: GLenum, _param: GLfloat) {}
-    unsafe fn Lightx(&mut self, _light: GLenum, _pname: GLenum, _param: GLfixed) {}
-    unsafe fn Lightfv(&mut self, _light: GLenum, _pname: GLenum, _params: *const GLfloat) {}
-    unsafe fn Lightxv(&mut self, _light: GLenum, _pname: GLenum, _params: *const GLfixed) {}
-    unsafe fn LightModelf(&mut self, _pname: GLenum, _param: GLfloat) {}
-    unsafe fn LightModelx(&mut self, _pname: GLenum, _param: GLfixed) {}
-    unsafe fn LightModelfv(&mut self, _pname: GLenum, _params: *const GLfloat) {}
-    unsafe fn LightModelxv(&mut self, _pname: GLenum, _params: *const GLfixed) {}
-    unsafe fn Materialf(&mut self, _face: GLenum, _pname: GLenum, _param: GLfloat) {}
-    unsafe fn Materialx(&mut self, _face: GLenum, _pname: GLenum, _param: GLfixed) {}
-    unsafe fn Materialfv(&mut self, _face: GLenum, _pname: GLenum, _params: *const GLfloat) {}
-    unsafe fn Materialxv(&mut self, _face: GLenum, _pname: GLenum, _params: *const GLfixed) {}
+    unsafe fn Fogf(&mut self, _pname: GLenum, _param: GLfloat) {
+        unimplemented!("Fogf not implemented by this backend")
+    }
+    unsafe fn Fogx(&mut self, _pname: GLenum, _param: GLfixed) {
+        unimplemented!("Fogx not implemented by this backend")
+    }
+    unsafe fn Fogfv(&mut self, _pname: GLenum, _params: *const GLfloat) {
+        unimplemented!("Fogfv not implemented by this backend")
+    }
+    unsafe fn Fogxv(&mut self, _pname: GLenum, _params: *const GLfixed) {
+        unimplemented!("Fogxv not implemented by this backend")
+    }
+    unsafe fn Lightf(&mut self, _light: GLenum, _pname: GLenum, _param: GLfloat) {
+        unimplemented!("Lightf not implemented by this backend")
+    }
+    unsafe fn Lightx(&mut self, _light: GLenum, _pname: GLenum, _param: GLfixed) {
+        unimplemented!("Lightx not implemented by this backend")
+    }
+    unsafe fn Lightfv(&mut self, _light: GLenum, _pname: GLenum, _params: *const GLfloat) {
+        unimplemented!("Lightfv not implemented by this backend")
+    }
+    unsafe fn Lightxv(&mut self, _light: GLenum, _pname: GLenum, _params: *const GLfixed) {
+        unimplemented!("Lightxv not implemented by this backend")
+    }
+    unsafe fn LightModelf(&mut self, _pname: GLenum, _param: GLfloat) {
+        unimplemented!("LightModelf not implemented by this backend")
+    }
+    unsafe fn LightModelx(&mut self, _pname: GLenum, _param: GLfixed) {
+        unimplemented!("LightModelx not implemented by this backend")
+    }
+    unsafe fn LightModelfv(&mut self, _pname: GLenum, _params: *const GLfloat) {
+        unimplemented!("LightModelfv not implemented by this backend")
+    }
+    unsafe fn LightModelxv(&mut self, _pname: GLenum, _params: *const GLfixed) {
+        unimplemented!("LightModelxv not implemented by this backend")
+    }
+    unsafe fn Materialf(&mut self, _face: GLenum, _pname: GLenum, _param: GLfloat) {
+        unimplemented!("Materialf not implemented by this backend")
+    }
+    unsafe fn Materialx(&mut self, _face: GLenum, _pname: GLenum, _param: GLfixed) {
+        unimplemented!("Materialx not implemented by this backend")
+    }
+    unsafe fn Materialfv(&mut self, _face: GLenum, _pname: GLenum, _params: *const GLfloat) {
+        unimplemented!("Materialfv not implemented by this backend")
+    }
+    unsafe fn Materialxv(&mut self, _face: GLenum, _pname: GLenum, _params: *const GLfixed) {
+        unimplemented!("Materialxv not implemented by this backend")
+    }
 
     // Buffers
     unsafe fn IsBuffer(&mut self, _buffer: GLuint) -> GLboolean {
