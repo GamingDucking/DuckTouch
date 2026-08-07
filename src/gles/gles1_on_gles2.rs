@@ -1807,6 +1807,8 @@ impl GLES for GLES1OnGLES2<'_> {
             let mode_name = format!("u_tex_mode{}\0", unit);
             let env_name = format!("u_env_color{}\0", unit);
             let sampler_name = format!("u_tex{}\0", unit);
+            gl::ActiveTexture(gl::TEXTURE0 + unit as GLenum);
+            gl::BindTexture(gl::TEXTURE_2D, self.state.bound_textures[unit]);
             let mode = match self.state.texture_env_mode[unit] as GLenum { es1::REPLACE => 1, es1::ADD => 3, es1::DECAL => 4, es1::BLEND => 5, es1::COMBINE => 0, _ => 2 };
             let combine_name = format!("u_combine_rgb{}\0", unit);
             let combine_alpha_name = format!("u_combine_alpha{}\0", unit);
@@ -1930,6 +1932,8 @@ impl GLES for GLES1OnGLES2<'_> {
             let mode_name = format!("u_tex_mode{}\0", unit);
             let env_name = format!("u_env_color{}\0", unit);
             let sampler_name = format!("u_tex{}\0", unit);
+            gl::ActiveTexture(gl::TEXTURE0 + unit as GLenum);
+            gl::BindTexture(gl::TEXTURE_2D, self.state.bound_textures[unit]);
             let mode = match self.state.texture_env_mode[unit] as GLenum { es1::REPLACE => 1, es1::ADD => 3, es1::DECAL => 4, es1::BLEND => 5, es1::COMBINE => 0, _ => 2 };
             let combine_name = format!("u_combine_rgb{}\0", unit);
             let combine_alpha_name = format!("u_combine_alpha{}\0", unit);
