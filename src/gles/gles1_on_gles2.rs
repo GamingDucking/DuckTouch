@@ -442,7 +442,6 @@ uniform int u_point_size_array_enabled;
 uniform mat4 u_palette_matrices[9];
 uniform int u_matrix_palette_enabled;
 uniform int u_lighting_enabled;
-uniform int u_light0_enabled;
 uniform int u_light_enabled[8];
 uniform vec4 u_light_ambient[8];
 uniform vec4 u_light_diffuse[8];
@@ -456,15 +455,6 @@ uniform float u_light_linear_attenuation[8];
 uniform float u_light_quadratic_attenuation[8];
 uniform int u_color_material_enabled;
 uniform int u_normalize_enabled;
-uniform vec4 u_light0_ambient;
-uniform vec4 u_light0_diffuse;
-uniform vec4 u_light0_position;
-uniform vec3 u_light0_spot_direction;
-uniform float u_light0_spot_cutoff;
-uniform float u_light0_spot_exponent;
-uniform float u_light0_constant_attenuation;
-uniform float u_light0_linear_attenuation;
-uniform float u_light0_quadratic_attenuation;
 uniform vec4 u_material_ambient;
 uniform vec4 u_material_diffuse;
 uniform vec4 u_material_specular;
@@ -772,7 +762,7 @@ void main() {
     vec4 color = v_color;
     if (u_tex_enabled0 != 0) {
         vec4 texel = texture2D(u_tex0, v_tex0);
-        if (u_tex_mode0 == 1) color = texel;
+        if (u_tex_mode0 == 1) color = vec4(texel.rgb * v_color.rgb, texel.a * v_color.a);
         else if (u_tex_mode0 == 2) color = color * texel;
         else if (u_tex_mode0 == 3) color = vec4(color.rgb + texel.rgb, color.a * texel.a);
         else if (u_tex_mode0 == 4) color = vec4(mix(color.rgb, texel.rgb, texel.a), color.a);
@@ -781,7 +771,7 @@ void main() {
     }
     if (u_tex_enabled1 != 0) {
         vec4 texel = texture2D(u_tex1, v_tex1);
-        if (u_tex_mode1 == 1) color = texel;
+        if (u_tex_mode1 == 1) color = vec4(texel.rgb * color.rgb, texel.a * color.a);
         else if (u_tex_mode1 == 2) color = color * texel;
         else if (u_tex_mode1 == 3) color = vec4(color.rgb + texel.rgb, color.a * texel.a);
         else if (u_tex_mode1 == 4) color = vec4(mix(color.rgb, texel.rgb, texel.a), color.a);
@@ -790,7 +780,7 @@ void main() {
     }
     if (u_tex_enabled2 != 0) {
         vec4 texel = texture2D(u_tex2, v_tex2);
-        if (u_tex_mode2 == 1) color = texel;
+        if (u_tex_mode2 == 1) color = vec4(texel.rgb * color.rgb, texel.a * color.a);
         else if (u_tex_mode2 == 2) color = color * texel;
         else if (u_tex_mode2 == 3) color = vec4(color.rgb + texel.rgb, color.a * texel.a);
         else if (u_tex_mode2 == 4) color = vec4(mix(color.rgb, texel.rgb, texel.a), color.a);
@@ -799,7 +789,7 @@ void main() {
     }
     if (u_tex_enabled3 != 0) {
         vec4 texel = texture2D(u_tex3, v_tex3);
-        if (u_tex_mode3 == 1) color = texel;
+        if (u_tex_mode3 == 1) color = vec4(texel.rgb * color.rgb, texel.a * color.a);
         else if (u_tex_mode3 == 2) color = color * texel;
         else if (u_tex_mode3 == 3) color = vec4(color.rgb + texel.rgb, color.a * texel.a);
         else if (u_tex_mode3 == 4) color = vec4(mix(color.rgb, texel.rgb, texel.a), color.a);
@@ -1739,8 +1729,7 @@ impl GLES for GLES1OnGLES2<'_> {
         let color_loc = gl::GetUniformLocation(program, b"u_color\0".as_ptr() as *const _);
         gl::Uniform4fv(color_loc, 1, self.state.color.as_ptr());
         gl::Uniform1i(gl::GetUniformLocation(program, b"u_lighting_enabled\0".as_ptr() as *const _), self.state.lighting_enabled as GLint);
-        gl::Uniform1i(gl::GetUniformLocation(program, b"u_light0_enabled\0".as_ptr() as *const _), self.state.light_enabled[0] as GLint);
-        let mut light_enabled = [0; 8];
+                let mut light_enabled = [0; 8];
         let mut light_ambient = [[0.0; 4]; 8];
         let mut light_diffuse = [[0.0; 4]; 8];
         let mut light_specular = [[0.0; 4]; 8];
@@ -1778,15 +1767,6 @@ impl GLES for GLES1OnGLES2<'_> {
         gl::Uniform1fv(gl::GetUniformLocation(program, b"u_light_quadratic_attenuation\0".as_ptr() as *const _), 8, light_quadratic_attenuation.as_ptr());
         gl::Uniform1i(gl::GetUniformLocation(program, b"u_color_material_enabled\0".as_ptr() as *const _), self.state.color_material_enabled as GLint);
         gl::Uniform1i(gl::GetUniformLocation(program, b"u_normalize_enabled\0".as_ptr() as *const _), self.state.normalize_enabled as GLint);
-        gl::Uniform4fv(gl::GetUniformLocation(program, b"u_light0_ambient\0".as_ptr() as *const _), 1, self.state.lights[0].ambient.as_ptr());
-        gl::Uniform4fv(gl::GetUniformLocation(program, b"u_light0_diffuse\0".as_ptr() as *const _), 1, self.state.lights[0].diffuse.as_ptr());
-        gl::Uniform4fv(gl::GetUniformLocation(program, b"u_light0_position\0".as_ptr() as *const _), 1, self.state.lights[0].position.as_ptr());
-        gl::Uniform3fv(gl::GetUniformLocation(program, b"u_light0_spot_direction\0".as_ptr() as *const _), 1, self.state.lights[0].spot_direction.as_ptr());
-        gl::Uniform1f(gl::GetUniformLocation(program, b"u_light0_spot_cutoff\0".as_ptr() as *const _), self.state.lights[0].spot_cutoff);
-        gl::Uniform1f(gl::GetUniformLocation(program, b"u_light0_spot_exponent\0".as_ptr() as *const _), self.state.lights[0].spot_exponent);
-        gl::Uniform1f(gl::GetUniformLocation(program, b"u_light0_constant_attenuation\0".as_ptr() as *const _), self.state.lights[0].constant_attenuation);
-        gl::Uniform1f(gl::GetUniformLocation(program, b"u_light0_linear_attenuation\0".as_ptr() as *const _), self.state.lights[0].linear_attenuation);
-        gl::Uniform1f(gl::GetUniformLocation(program, b"u_light0_quadratic_attenuation\0".as_ptr() as *const _), self.state.lights[0].quadratic_attenuation);
         gl::Uniform4fv(gl::GetUniformLocation(program, b"u_material_ambient\0".as_ptr() as *const _), 1, self.state.material_ambient.as_ptr());
         gl::Uniform4fv(gl::GetUniformLocation(program, b"u_material_diffuse\0".as_ptr() as *const _), 1, self.state.material_diffuse.as_ptr());
         gl::Uniform4fv(gl::GetUniformLocation(program, b"u_material_specular\0".as_ptr() as *const _), 1, self.state.material_specular.as_ptr());
@@ -1896,8 +1876,7 @@ impl GLES for GLES1OnGLES2<'_> {
         let color_loc = gl::GetUniformLocation(program, b"u_color\0".as_ptr() as *const _);
         gl::Uniform4fv(color_loc, 1, self.state.color.as_ptr());
         gl::Uniform1i(gl::GetUniformLocation(program, b"u_lighting_enabled\0".as_ptr() as *const _), self.state.lighting_enabled as GLint);
-        gl::Uniform1i(gl::GetUniformLocation(program, b"u_light0_enabled\0".as_ptr() as *const _), self.state.light_enabled[0] as GLint);
-        let mut light_enabled = [0; 8];
+                let mut light_enabled = [0; 8];
         let mut light_ambient = [[0.0; 4]; 8];
         let mut light_diffuse = [[0.0; 4]; 8];
         let mut light_specular = [[0.0; 4]; 8];
@@ -1935,15 +1914,6 @@ impl GLES for GLES1OnGLES2<'_> {
         gl::Uniform1fv(gl::GetUniformLocation(program, b"u_light_quadratic_attenuation\0".as_ptr() as *const _), 8, light_quadratic_attenuation.as_ptr());
         gl::Uniform1i(gl::GetUniformLocation(program, b"u_color_material_enabled\0".as_ptr() as *const _), self.state.color_material_enabled as GLint);
         gl::Uniform1i(gl::GetUniformLocation(program, b"u_normalize_enabled\0".as_ptr() as *const _), self.state.normalize_enabled as GLint);
-        gl::Uniform4fv(gl::GetUniformLocation(program, b"u_light0_ambient\0".as_ptr() as *const _), 1, self.state.lights[0].ambient.as_ptr());
-        gl::Uniform4fv(gl::GetUniformLocation(program, b"u_light0_diffuse\0".as_ptr() as *const _), 1, self.state.lights[0].diffuse.as_ptr());
-        gl::Uniform4fv(gl::GetUniformLocation(program, b"u_light0_position\0".as_ptr() as *const _), 1, self.state.lights[0].position.as_ptr());
-        gl::Uniform3fv(gl::GetUniformLocation(program, b"u_light0_spot_direction\0".as_ptr() as *const _), 1, self.state.lights[0].spot_direction.as_ptr());
-        gl::Uniform1f(gl::GetUniformLocation(program, b"u_light0_spot_cutoff\0".as_ptr() as *const _), self.state.lights[0].spot_cutoff);
-        gl::Uniform1f(gl::GetUniformLocation(program, b"u_light0_spot_exponent\0".as_ptr() as *const _), self.state.lights[0].spot_exponent);
-        gl::Uniform1f(gl::GetUniformLocation(program, b"u_light0_constant_attenuation\0".as_ptr() as *const _), self.state.lights[0].constant_attenuation);
-        gl::Uniform1f(gl::GetUniformLocation(program, b"u_light0_linear_attenuation\0".as_ptr() as *const _), self.state.lights[0].linear_attenuation);
-        gl::Uniform1f(gl::GetUniformLocation(program, b"u_light0_quadratic_attenuation\0".as_ptr() as *const _), self.state.lights[0].quadratic_attenuation);
         gl::Uniform4fv(gl::GetUniformLocation(program, b"u_material_ambient\0".as_ptr() as *const _), 1, self.state.material_ambient.as_ptr());
         gl::Uniform4fv(gl::GetUniformLocation(program, b"u_material_diffuse\0".as_ptr() as *const _), 1, self.state.material_diffuse.as_ptr());
         gl::Uniform4fv(gl::GetUniformLocation(program, b"u_material_specular\0".as_ptr() as *const _), 1, self.state.material_specular.as_ptr());
