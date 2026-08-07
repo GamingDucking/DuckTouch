@@ -1419,7 +1419,7 @@ impl GLES for GLES1OnGLES2<'_> {
         gl::Uniform1i(gl::GetUniformLocation(program, b"u_point_size_array_enabled\0".as_ptr() as *const _), if self.state.point_size_array.enabled { 1 } else { 0 });
         gl::Uniform1i(gl::GetUniformLocation(program, b"u_matrix_palette_enabled\0".as_ptr() as *const _), if self.state.matrix_palette_enabled { 1 } else { 0 });
         for (i, matrix) in self.state.palette_matrices.iter().enumerate() {
-            let name = format!("u_palette_matrices[{}]\\0", i);
+            let name = format!("u_palette_matrices[{}]\0", i);
             gl::UniformMatrix4fv(gl::GetUniformLocation(program, name.as_ptr() as *const _), 1, gl::FALSE, matrix.current.as_ptr());
         }
         let tex_enabled = self.state.texture_enabled[0];
