@@ -197,6 +197,25 @@ pub fn prepopulate_user_data_dir() {
         return;
     }
 
+    let has_user_wallpaper = WALLPAPER_FILES
+        .iter()
+        .any(|name| base_path.join(name).is_file());
+    if !has_user_wallpaper {
+        match ResourceFile::open(WALLPAPER_FILES[0]) {
+            Ok(mut resource) => {
+                let mut image = Vec::new();
+                match resource.get().read_to_end(&mut image) {
+                    Ok(_) => match std::fs::write(base_path.join(WALLPAPER_FILES[0]), image) {
+                        Ok(()) => log!("Created default wallpaper"),
+                        Err(e) => log!("Warning: Couldn't create default wallpaper: {}", e),
+                    },
+                    Err(e) => log!("Warning: Couldn't read default wallpaper: {}", e),
+                }
+            }
+            Err(e) => log!("Warning: Couldn't open default wallpaper: {}", e),
+        }
+    }
+
     let apps_dir = base_path.join(APPS_DIR);
     if !apps_dir.is_dir() {
         match std::fs::create_dir(&apps_dir) {

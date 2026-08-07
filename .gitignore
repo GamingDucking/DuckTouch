@@ -5,7 +5,6 @@
 /touchHLE_apps/*.ipa
 /touchHLE_apps/*.app
 touchHLE_log.txt
-touchHLE_wallpaper.*
 
 # Xcode (integration testing app)
 
