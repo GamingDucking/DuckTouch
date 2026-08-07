@@ -101,6 +101,7 @@ struct TranslatorState {
     texture_env_color: [[GLfloat; 4]; MAX_TEXTURE_UNITS],
     fixed_buffers: [Vec<GLfloat>; 3],
     client_array_vbos: [GLuint; 7],
+    client_element_vbo: GLuint,
     array_buffer_binding: GLuint,
     element_array_buffer_binding: GLuint,
     array_buffer_data: HashMap<GLuint, Vec<u8>>,
@@ -172,6 +173,7 @@ impl TranslatorState {
             texture_env_color: [[0.0, 0.0, 0.0, 0.0]; MAX_TEXTURE_UNITS],
             fixed_buffers: std::array::from_fn(|_| Vec::new()),
             client_array_vbos: [0; 7],
+            client_element_vbo: 0,
             array_buffer_binding: 0,
             element_array_buffer_binding: 0,
             array_buffer_data: HashMap::new(),
@@ -1504,7 +1506,11 @@ impl GLES for GLES1OnGLES2<'_> {
         self.bind_array_range(ATTR_MATRIX_INDEX, &palette_index, 0, count);
         self.bind_array_range(ATTR_WEIGHT, &palette_weight, 0, count);
         self.bind_array_range(ATTR_POINT_SIZE, &point_size_array, 0, count);
-        gl::DrawElements(mode, count, type_, indices);
+        let (draw_indices, restore_element_buffer) = self.stage_client_indices(type_, indices, count);
+        gl::DrawElements(mode, count, type_, draw_indices);
+        if restore_element_buffer {
+            gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, self.state.element_array_buffer_binding);
+        }
         gl::BindBuffer(gl::ARRAY_BUFFER, self.state.array_buffer_binding);
     }
 }
@@ -1546,6 +1552,28 @@ impl GLES1OnGLES2<'_> {
                 None
             }
         }
+    }
+
+    unsafe fn stage_client_indices(&mut self, type_: GLenum, indices: *const GLvoid, count: GLsizei) -> (*const GLvoid, bool) {
+        if self.state.element_array_buffer_binding != 0 || indices.is_null() || count <= 0 {
+            return (indices, false);
+        }
+        let index_size = match type_ {
+            gl::UNSIGNED_BYTE => 1usize,
+            gl::UNSIGNED_SHORT => 2usize,
+            gl::UNSIGNED_INT => 4usize,
+            _ => return (indices, false),
+        };
+        let byte_count = (count as usize).saturating_mul(index_size);
+        if byte_count == 0 {
+            return (indices, false);
+        }
+        if self.state.client_element_vbo == 0 {
+            gl::GenBuffers(1, &mut self.state.client_element_vbo);
+        }
+        gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, self.state.client_element_vbo);
+        gl::BufferData(gl::ELEMENT_ARRAY_BUFFER, byte_count as GLsizeiptr, indices, gl::STREAM_DRAW);
+        (std::ptr::null(), true)
     }
 
     unsafe fn bind_array(&mut self, index: GLuint, array: &ArrayState) {
