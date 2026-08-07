@@ -20,7 +20,7 @@ use super::gles11_raw as gles11;
 use super::gles11_raw::types::*;
 use super::gles30_raw as gles30;
 use super::gles_generic::{GLchar, GLES};
-use super::util::{try_decode_pvrtc, PalettedTextureFormat};
+use super::util::{fixed_to_float, try_decode_pvrtc, PalettedTextureFormat};
 use super::GLESContext;
 use crate::window::{GLContext, GLVersion, Window};
 use std::ffi::CStr;
@@ -291,6 +291,25 @@ impl GLES for GLES3Native<'_> {
     unsafe fn Fogfv(&mut self, _pname: GLenum, _params: *const GLfloat) {}
     unsafe fn Fogxv(&mut self, _pname: GLenum, _params: *const GLfixed) {}
     unsafe fn Lightx(&mut self, _light: GLenum, _pname: GLenum, _param: GLfixed) {}
+
+    unsafe fn ClearColorx(&mut self, r: GLclampx, g: GLclampx, b: GLclampx, a: GLclampx) {
+        self.ClearColor(fixed_to_float(r), fixed_to_float(g), fixed_to_float(b), fixed_to_float(a));
+    }
+    unsafe fn ClearDepthx(&mut self, depth: GLfixed) {
+        self.ClearDepthf(fixed_to_float(depth));
+    }
+    unsafe fn DepthRangex(&mut self, near: GLclampx, far: GLclampx) {
+        self.DepthRangef(fixed_to_float(near), fixed_to_float(far));
+    }
+    unsafe fn LineWidthx(&mut self, width: GLfixed) {
+        self.LineWidth(fixed_to_float(width));
+    }
+    unsafe fn PolygonOffsetx(&mut self, factor: GLfixed, units: GLfixed) {
+        self.PolygonOffset(fixed_to_float(factor), fixed_to_float(units));
+    }
+    unsafe fn SampleCoveragex(&mut self, value: GLclampx, invert: GLboolean) {
+        self.SampleCoverage(fixed_to_float(value), invert);
+    }
 
     // Other state manipulation
     unsafe fn BlendFunc(&mut self, sfactor: GLenum, dfactor: GLenum) {
