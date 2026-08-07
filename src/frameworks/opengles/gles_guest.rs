@@ -2286,21 +2286,30 @@ fn glTexEnvi(env: &mut Environment, target: GLenum, pname: GLenum, param: GLint)
     })
 }
 fn glTexEnvfv(env: &mut Environment, target: GLenum, pname: GLenum, params: ConstPtr<GLfloat>) {
-    assert!(target == gles11::TEXTURE_ENV || target == gles11::TEXTURE_FILTER_CONTROL_EXT);
+    if target != gles11::TEXTURE_ENV && target != gles11::TEXTURE_FILTER_CONTROL_EXT {
+        return;
+    }
+    if params.is_null() {
+        return;
+    }
     with_ctx_and_mem(env, |gles, mem| {
         let params = mem.ptr_at(params, 4);
         unsafe { gles.TexEnvfv(target, pname, params) }
     })
 }
 fn glTexEnvxv(env: &mut Environment, target: GLenum, pname: GLenum, params: ConstPtr<GLfixed>) {
-    assert!(target == gles11::TEXTURE_ENV);
+    if target != gles11::TEXTURE_ENV || params.is_null() {
+        return;
+    }
     with_ctx_and_mem(env, |gles, mem| {
         let params = mem.ptr_at(params, 4);
         unsafe { gles.TexEnvxv(target, pname, params) }
     })
 }
 fn glTexEnviv(env: &mut Environment, target: GLenum, pname: GLenum, params: ConstPtr<GLint>) {
-    assert!(target == gles11::TEXTURE_ENV);
+    if target != gles11::TEXTURE_ENV || params.is_null() {
+        return;
+    }
     with_ctx_and_mem(env, |gles, mem| {
         let params = mem.ptr_at(params, 4);
         unsafe { gles.TexEnviv(target, pname, params) }
@@ -2661,8 +2670,9 @@ fn glGetBufferParameteriv(
     })
 }
 fn glMapBufferOES(env: &mut Environment, target: GLenum, access: GLenum) -> MutPtr<GLvoid> {
-    assert!(matches!(target, ARRAY_BUFFER | ELEMENT_ARRAY_BUFFER));
-    assert!(access == WRITE_ONLY_OES);
+    if !matches!(target, ARRAY_BUFFER | ELEMENT_ARRAY_BUFFER) || access != WRITE_ONLY_OES {
+        return nil.cast();
+    }
     let buffer_object_name = _get_currently_bound_buffer_object_name(env, target);
     let host_buffer = with_ctx_and_mem_no_skip(env, |gles, _mem| unsafe {
         gles.MapBufferOES(target, access)
