@@ -2146,8 +2146,12 @@ fn glCompressedTexImage2D(
             }
         }
 
+        let image_size_usize = match usize::try_from(image_size) {
+            Ok(size) => size,
+            Err(_) => return,
+        };
         let data: *const GLvoid = mem
-            .ptr_at(data.cast::<u8>(), image_size.try_into().unwrap())
+            .ptr_at(data.cast::<u8>(), image_size_usize as GuestUSize)
             .cast();
         let is_pvrtc = matches!(
             internalformat,
@@ -2157,7 +2161,7 @@ fn glCompressedTexImage2D(
                 | gles11::COMPRESSED_RGB_PVRTC_4BPPV1_IMG
         );
         if is_pvrtc && !data.is_null() && image_size > 0 {
-            let payload = std::slice::from_raw_parts(data.cast::<u8>(), image_size as usize);
+            let payload = std::slice::from_raw_parts(data.cast::<u8>(), image_size_usize);
             if crate::gles::try_decode_pvrtc(
                 gles,
                 target,
@@ -3882,10 +3886,14 @@ fn glMapBufferRange(
     if host_ptr.is_null() || length == 0 {
         return Ptr::null();
     }
-    let guest_buf: MutPtr<GLvoid> = env.mem.alloc(length as GuestUSize).cast();
+    let length_usize = match usize::try_from(length) {
+        Ok(size) => size,
+        Err(_) => return Ptr::null(),
+    };
+    let guest_buf: MutPtr<GLvoid> = env.mem.alloc(length_usize as GuestUSize).cast();
     unsafe {
-        let host_slice = from_raw_parts(host_ptr as *const u8, length as usize);
-        let guest_slice = env.mem.bytes_at_mut(guest_buf.cast(), length as GuestUSize);
+        let host_slice = from_raw_parts(host_ptr as *const u8, length_usize);
+        let guest_slice = env.mem.bytes_at_mut(guest_buf.cast(), length_usize as GuestUSize);
         guest_slice.copy_from_slice(host_slice);
     }
     let current_ctx: Option<crate::objc::id> = *env
@@ -3921,15 +3929,25 @@ fn glFlushMappedBufferRange(
             .get(&target)
             .copied();
         if let Some((guest_buf, host_ptr)) = mapping {
-            let guest_slice = env
-                .mem
-                .bytes_at(guest_buf.cast(), (offset + length) as GuestUSize);
+            let offset_usize = match usize::try_from(offset) {
+                Ok(value) => value,
+                Err(_) => return,
+            };
+            let length_usize = match usize::try_from(length) {
+                Ok(value) => value,
+                Err(_) => return,
+            };
+            let end = match offset_usize.checked_add(length_usize) {
+                Some(value) => value,
+                None => return,
+            };
+            let guest_slice = env.mem.bytes_at(guest_buf.cast(), end as GuestUSize);
             unsafe {
                 let host_slice = std::slice::from_raw_parts_mut(
-                    (host_ptr as *mut u8).add(offset as usize),
-                    length as usize,
+                    (host_ptr as *mut u8).add(offset_usize),
+                    length_usize,
                 );
-                host_slice.copy_from_slice(&guest_slice[offset as usize..]);
+                host_slice.copy_from_slice(&guest_slice[offset_usize..end]);
             }
         }
     }
