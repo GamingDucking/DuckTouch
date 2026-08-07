@@ -431,6 +431,7 @@ attribute vec4 a_weight;
 attribute float a_point_size;
 uniform mat4 u_mvp;
 uniform mat4 u_modelview;
+uniform mat4 u_projection;
 uniform mat4 u_texture_matrix0;
 uniform mat4 u_texture_matrix1;
 uniform mat4 u_texture_matrix2;
@@ -492,8 +493,14 @@ void main() {
             transformed_position += a_weight[i] * (u_palette_matrices[matrix_index] * a_position);
         }
     }
-    vec4 eye_position = u_modelview * transformed_position;
-    gl_Position = u_mvp * transformed_position;
+    vec4 eye_position;
+    if (u_matrix_palette_enabled != 0) {
+        eye_position = transformed_position;
+        gl_Position = u_projection * transformed_position;
+    } else {
+        eye_position = u_modelview * transformed_position;
+        gl_Position = u_mvp * transformed_position;
+    }
     float point_distance = length(eye_position.xyz);
     float point_attenuation = sqrt(max(u_point_distance_attenuation.x + u_point_distance_attenuation.y * point_distance + u_point_distance_attenuation.z * point_distance * point_distance, 0.0001));
     gl_PointSize = (u_point_size_array_enabled != 0 ? a_point_size : u_point_size) / point_attenuation;
@@ -603,6 +610,146 @@ uniform int u_fog_mode;
 uniform int u_clip_enabled[6];
 uniform int u_logic_op_enabled;
 uniform int u_logic_op;
+vec4 combine_source(int source, vec4 previous, vec4 texel, vec4 primary, vec4 constant_value) {
+    if (source == 0x8576) return constant_value;
+    if (source == 0x8577) return primary;
+    if (source == 0x8578) return previous;
+    return texel;
+}
+vec3 combine_rgb_operand(vec4 value, int operand) {
+    if (operand == 0x0301) return vec3(1.0) - value.rgb;
+    if (operand == 0x0302) return value.aaa;
+    if (operand == 0x0303) return vec3(1.0) - value.aaa;
+    return value.rgb;
+}
+float combine_alpha_operand(vec4 value, int operand) {
+    if (operand == 0x0303) return 1.0 - value.a;
+    return value.a;
+}
+vec4 combine_stage0(vec4 previous, vec4 texel, vec4 primary) {
+    vec4 constant_value = u_env_color0;
+    vec4 rgb0 = combine_source(u_src_rgb0[0], previous, texel, primary, constant_value);
+    vec4 rgb1 = combine_source(u_src_rgb0[1], previous, texel, primary, constant_value);
+    vec4 rgb2 = combine_source(u_src_rgb0[2], previous, texel, primary, constant_value);
+    vec3 a = combine_rgb_operand(rgb0, u_operand_rgb0[0]);
+    vec3 b = combine_rgb_operand(rgb1, u_operand_rgb0[1]);
+    vec3 c = combine_rgb_operand(rgb2, u_operand_rgb0[2]);
+    vec3 rgb;
+    if (u_combine_rgb0 == 0x1E01) rgb = a;
+    else if (u_combine_rgb0 == 0x0104) rgb = a + b;
+    else if (u_combine_rgb0 == 0x8574) rgb = a + b - 0.5;
+    else if (u_combine_rgb0 == 0x84E7) rgb = a - b;
+    else if (u_combine_rgb0 == 0x8575) rgb = a * c + b * (vec3(1.0) - c);
+    else if (u_combine_rgb0 == 0x86AE) rgb = vec3(4.0 * dot(a * 2.0 - 1.0, b * 2.0 - 1.0));
+    else rgb = a * b;
+    vec4 alpha0 = combine_source(u_src_alpha0[0], previous, texel, primary, constant_value);
+    vec4 alpha1 = combine_source(u_src_alpha0[1], previous, texel, primary, constant_value);
+    vec4 alpha2 = combine_source(u_src_alpha0[2], previous, texel, primary, constant_value);
+    float aa = combine_alpha_operand(alpha0, u_operand_alpha0[0]);
+    float ab = combine_alpha_operand(alpha1, u_operand_alpha0[1]);
+    float ac = combine_alpha_operand(alpha2, u_operand_alpha0[2]);
+    float alpha;
+    if (u_combine_alpha0 == 0x1E01) alpha = aa;
+    else if (u_combine_alpha0 == 0x0104) alpha = aa + ab;
+    else if (u_combine_alpha0 == 0x8574) alpha = aa + ab - 0.5;
+    else if (u_combine_alpha0 == 0x84E7) alpha = aa - ab;
+    else if (u_combine_alpha0 == 0x8575) alpha = aa * ac + ab * (1.0 - ac);
+    else alpha = aa * ab;
+    return vec4(clamp(rgb * u_rgb_scale0, 0.0, 1.0), clamp(alpha * u_alpha_scale0, 0.0, 1.0));
+}
+vec4 combine_stage1(vec4 previous, vec4 texel, vec4 primary) {
+    vec4 constant_value = u_env_color1;
+    vec4 rgb0 = combine_source(u_src_rgb1[0], previous, texel, primary, constant_value);
+    vec4 rgb1 = combine_source(u_src_rgb1[1], previous, texel, primary, constant_value);
+    vec4 rgb2 = combine_source(u_src_rgb1[2], previous, texel, primary, constant_value);
+    vec3 a = combine_rgb_operand(rgb0, u_operand_rgb1[0]);
+    vec3 b = combine_rgb_operand(rgb1, u_operand_rgb1[1]);
+    vec3 c = combine_rgb_operand(rgb2, u_operand_rgb1[2]);
+    vec3 rgb;
+    if (u_combine_rgb1 == 0x1E01) rgb = a;
+    else if (u_combine_rgb1 == 0x0104) rgb = a + b;
+    else if (u_combine_rgb1 == 0x8574) rgb = a + b - 0.5;
+    else if (u_combine_rgb1 == 0x84E7) rgb = a - b;
+    else if (u_combine_rgb1 == 0x8575) rgb = a * c + b * (vec3(1.0) - c);
+    else if (u_combine_rgb1 == 0x86AE) rgb = vec3(4.0 * dot(a * 2.0 - 1.0, b * 2.0 - 1.0));
+    else rgb = a * b;
+    vec4 alpha0 = combine_source(u_src_alpha1[0], previous, texel, primary, constant_value);
+    vec4 alpha1 = combine_source(u_src_alpha1[1], previous, texel, primary, constant_value);
+    vec4 alpha2 = combine_source(u_src_alpha1[2], previous, texel, primary, constant_value);
+    float aa = combine_alpha_operand(alpha0, u_operand_alpha1[0]);
+    float ab = combine_alpha_operand(alpha1, u_operand_alpha1[1]);
+    float ac = combine_alpha_operand(alpha2, u_operand_alpha1[2]);
+    float alpha;
+    if (u_combine_alpha1 == 0x1E01) alpha = aa;
+    else if (u_combine_alpha1 == 0x0104) alpha = aa + ab;
+    else if (u_combine_alpha1 == 0x8574) alpha = aa + ab - 0.5;
+    else if (u_combine_alpha1 == 0x84E7) alpha = aa - ab;
+    else if (u_combine_alpha1 == 0x8575) alpha = aa * ac + ab * (1.0 - ac);
+    else alpha = aa * ab;
+    return vec4(clamp(rgb * u_rgb_scale1, 0.0, 1.0), clamp(alpha * u_alpha_scale1, 0.0, 1.0));
+}
+vec4 combine_stage2(vec4 previous, vec4 texel, vec4 primary) {
+    vec4 constant_value = u_env_color2;
+    vec4 rgb0 = combine_source(u_src_rgb2[0], previous, texel, primary, constant_value);
+    vec4 rgb1 = combine_source(u_src_rgb2[1], previous, texel, primary, constant_value);
+    vec4 rgb2 = combine_source(u_src_rgb2[2], previous, texel, primary, constant_value);
+    vec3 a = combine_rgb_operand(rgb0, u_operand_rgb2[0]);
+    vec3 b = combine_rgb_operand(rgb1, u_operand_rgb2[1]);
+    vec3 c = combine_rgb_operand(rgb2, u_operand_rgb2[2]);
+    vec3 rgb;
+    if (u_combine_rgb2 == 0x1E01) rgb = a;
+    else if (u_combine_rgb2 == 0x0104) rgb = a + b;
+    else if (u_combine_rgb2 == 0x8574) rgb = a + b - 0.5;
+    else if (u_combine_rgb2 == 0x84E7) rgb = a - b;
+    else if (u_combine_rgb2 == 0x8575) rgb = a * c + b * (vec3(1.0) - c);
+    else if (u_combine_rgb2 == 0x86AE) rgb = vec3(4.0 * dot(a * 2.0 - 1.0, b * 2.0 - 1.0));
+    else rgb = a * b;
+    vec4 alpha0 = combine_source(u_src_alpha2[0], previous, texel, primary, constant_value);
+    vec4 alpha1 = combine_source(u_src_alpha2[1], previous, texel, primary, constant_value);
+    vec4 alpha2 = combine_source(u_src_alpha2[2], previous, texel, primary, constant_value);
+    float aa = combine_alpha_operand(alpha0, u_operand_alpha2[0]);
+    float ab = combine_alpha_operand(alpha1, u_operand_alpha2[1]);
+    float ac = combine_alpha_operand(alpha2, u_operand_alpha2[2]);
+    float alpha;
+    if (u_combine_alpha2 == 0x1E01) alpha = aa;
+    else if (u_combine_alpha2 == 0x0104) alpha = aa + ab;
+    else if (u_combine_alpha2 == 0x8574) alpha = aa + ab - 0.5;
+    else if (u_combine_alpha2 == 0x84E7) alpha = aa - ab;
+    else if (u_combine_alpha2 == 0x8575) alpha = aa * ac + ab * (1.0 - ac);
+    else alpha = aa * ab;
+    return vec4(clamp(rgb * u_rgb_scale2, 0.0, 1.0), clamp(alpha * u_alpha_scale2, 0.0, 1.0));
+}
+vec4 combine_stage3(vec4 previous, vec4 texel, vec4 primary) {
+    vec4 constant_value = u_env_color3;
+    vec4 rgb0 = combine_source(u_src_rgb3[0], previous, texel, primary, constant_value);
+    vec4 rgb1 = combine_source(u_src_rgb3[1], previous, texel, primary, constant_value);
+    vec4 rgb2 = combine_source(u_src_rgb3[2], previous, texel, primary, constant_value);
+    vec3 a = combine_rgb_operand(rgb0, u_operand_rgb3[0]);
+    vec3 b = combine_rgb_operand(rgb1, u_operand_rgb3[1]);
+    vec3 c = combine_rgb_operand(rgb2, u_operand_rgb3[2]);
+    vec3 rgb;
+    if (u_combine_rgb3 == 0x1E01) rgb = a;
+    else if (u_combine_rgb3 == 0x0104) rgb = a + b;
+    else if (u_combine_rgb3 == 0x8574) rgb = a + b - 0.5;
+    else if (u_combine_rgb3 == 0x84E7) rgb = a - b;
+    else if (u_combine_rgb3 == 0x8575) rgb = a * c + b * (vec3(1.0) - c);
+    else if (u_combine_rgb3 == 0x86AE) rgb = vec3(4.0 * dot(a * 2.0 - 1.0, b * 2.0 - 1.0));
+    else rgb = a * b;
+    vec4 alpha0 = combine_source(u_src_alpha3[0], previous, texel, primary, constant_value);
+    vec4 alpha1 = combine_source(u_src_alpha3[1], previous, texel, primary, constant_value);
+    vec4 alpha2 = combine_source(u_src_alpha3[2], previous, texel, primary, constant_value);
+    float aa = combine_alpha_operand(alpha0, u_operand_alpha3[0]);
+    float ab = combine_alpha_operand(alpha1, u_operand_alpha3[1]);
+    float ac = combine_alpha_operand(alpha2, u_operand_alpha3[2]);
+    float alpha;
+    if (u_combine_alpha3 == 0x1E01) alpha = aa;
+    else if (u_combine_alpha3 == 0x0104) alpha = aa + ab;
+    else if (u_combine_alpha3 == 0x8574) alpha = aa + ab - 0.5;
+    else if (u_combine_alpha3 == 0x84E7) alpha = aa - ab;
+    else if (u_combine_alpha3 == 0x8575) alpha = aa * ac + ab * (1.0 - ac);
+    else alpha = aa * ab;
+    return vec4(clamp(rgb * u_rgb_scale3, 0.0, 1.0), clamp(alpha * u_alpha_scale3, 0.0, 1.0));
+}
 float fog_factor() {
     if (u_fog_mode == 2048) return exp(-u_fog_density * v_fog_coord);
     if (u_fog_mode == 2049) {
@@ -630,15 +777,7 @@ void main() {
         else if (u_tex_mode0 == 3) color = vec4(color.rgb + texel.rgb, color.a * texel.a);
         else if (u_tex_mode0 == 4) color = vec4(mix(color.rgb, texel.rgb, texel.a), color.a);
         else if (u_tex_mode0 == 5) color = vec4(mix(color.rgb, u_env_color0.rgb, texel.rgb), color.a * texel.a);
-        else if (u_combine_rgb0 == 0) color = color * texel;
-        else if (u_combine_rgb0 == 1) color = texel;
-        else if (u_combine_rgb0 == 0x0104) color = color + texel;
-        else if (u_combine_rgb0 == 0x8574) color = color + texel - 0.5;
-        else if (u_combine_rgb0 == 0x84E7) color = color - texel;
-        else if (u_combine_rgb0 == 0x8575) color = mix(color, texel, texel.a);
-        else if (u_combine_rgb0 == 0x86AE) color = vec4(vec3(dot(color.rgb * 2.0 - 1.0, texel.rgb * 2.0 - 1.0)), color.a);
-        color.rgb *= u_rgb_scale0;
-        color.a *= u_alpha_scale0;
+        else if (u_tex_mode0 == 0) color = combine_stage0(color, texel, v_color);
     }
     if (u_tex_enabled1 != 0) {
         vec4 texel = texture2D(u_tex1, v_tex1);
@@ -647,15 +786,7 @@ void main() {
         else if (u_tex_mode1 == 3) color = vec4(color.rgb + texel.rgb, color.a * texel.a);
         else if (u_tex_mode1 == 4) color = vec4(mix(color.rgb, texel.rgb, texel.a), color.a);
         else if (u_tex_mode1 == 5) color = vec4(mix(color.rgb, u_env_color1.rgb, texel.rgb), color.a * texel.a);
-        else if (u_combine_rgb1 == 0) color = color * texel;
-        else if (u_combine_rgb1 == 1) color = texel;
-        else if (u_combine_rgb1 == 0x0104) color = color + texel;
-        else if (u_combine_rgb1 == 0x8574) color = color + texel - 0.5;
-        else if (u_combine_rgb1 == 0x84E7) color = color - texel;
-        else if (u_combine_rgb1 == 0x8575) color = mix(color, texel, texel.a);
-        else if (u_combine_rgb1 == 0x86AE) color = vec4(vec3(dot(color.rgb * 2.0 - 1.0, texel.rgb * 2.0 - 1.0)), color.a);
-        color.rgb *= u_rgb_scale1;
-        color.a *= u_alpha_scale1;
+        else if (u_tex_mode1 == 0) color = combine_stage1(color, texel, v_color);
     }
     if (u_tex_enabled2 != 0) {
         vec4 texel = texture2D(u_tex2, v_tex2);
@@ -664,15 +795,7 @@ void main() {
         else if (u_tex_mode2 == 3) color = vec4(color.rgb + texel.rgb, color.a * texel.a);
         else if (u_tex_mode2 == 4) color = vec4(mix(color.rgb, texel.rgb, texel.a), color.a);
         else if (u_tex_mode2 == 5) color = vec4(mix(color.rgb, u_env_color2.rgb, texel.rgb), color.a * texel.a);
-        else if (u_combine_rgb2 == 0) color = color * texel;
-        else if (u_combine_rgb2 == 1) color = texel;
-        else if (u_combine_rgb2 == 0x0104) color = color + texel;
-        else if (u_combine_rgb2 == 0x8574) color = color + texel - 0.5;
-        else if (u_combine_rgb2 == 0x84E7) color = color - texel;
-        else if (u_combine_rgb2 == 0x8575) color = mix(color, texel, texel.a);
-        else if (u_combine_rgb2 == 0x86AE) color = vec4(vec3(dot(color.rgb * 2.0 - 1.0, texel.rgb * 2.0 - 1.0)), color.a);
-        color.rgb *= u_rgb_scale2;
-        color.a *= u_alpha_scale2;
+        else if (u_tex_mode2 == 0) color = combine_stage2(color, texel, v_color);
     }
     if (u_tex_enabled3 != 0) {
         vec4 texel = texture2D(u_tex3, v_tex3);
@@ -681,15 +804,7 @@ void main() {
         else if (u_tex_mode3 == 3) color = vec4(color.rgb + texel.rgb, color.a * texel.a);
         else if (u_tex_mode3 == 4) color = vec4(mix(color.rgb, texel.rgb, texel.a), color.a);
         else if (u_tex_mode3 == 5) color = vec4(mix(color.rgb, u_env_color3.rgb, texel.rgb), color.a * texel.a);
-        else if (u_combine_rgb3 == 0) color = color * texel;
-        else if (u_combine_rgb3 == 1) color = texel;
-        else if (u_combine_rgb3 == 0x0104) color = color + texel;
-        else if (u_combine_rgb3 == 0x8574) color = color + texel - 0.5;
-        else if (u_combine_rgb3 == 0x84E7) color = color - texel;
-        else if (u_combine_rgb3 == 0x8575) color = mix(color, texel, texel.a);
-        else if (u_combine_rgb3 == 0x86AE) color = vec4(vec3(dot(color.rgb * 2.0 - 1.0, texel.rgb * 2.0 - 1.0)), color.a);
-        color.rgb *= u_rgb_scale3;
-        color.a *= u_alpha_scale3;
+        else if (u_tex_mode3 == 0) color = combine_stage3(color, texel, v_color);
     }
     if (u_alpha_test_enabled != 0 && !alpha_pass(color.a)) discard;
     if (u_clip_enabled[0] != 0 && v_clip_distances0.x < 0.0) discard;
@@ -1168,13 +1283,22 @@ impl GLES for GLES1OnGLES2<'_> {
     unsafe fn Lightfv(&mut self, light: GLenum, pname: GLenum, params: *const GLfloat) {
         let Some(index) = Self::light_index(light) else { return; };
         if params.is_null() { return; }
+        let modelview = self.state.modelview.current;
         let light = &mut self.state.lights[index];
         match pname {
             es1::AMBIENT => light.ambient = std::slice::from_raw_parts(params, 4).try_into().unwrap(),
             es1::DIFFUSE => light.diffuse = std::slice::from_raw_parts(params, 4).try_into().unwrap(),
             es1::SPECULAR => light.specular = std::slice::from_raw_parts(params, 4).try_into().unwrap(),
-            es1::POSITION => light.position = std::slice::from_raw_parts(params, 4).try_into().unwrap(),
-            es1::SPOT_DIRECTION => light.spot_direction = std::slice::from_raw_parts(params, 3).try_into().unwrap(),
+            es1::POSITION => {
+                let value: [GLfloat; 4] = std::slice::from_raw_parts(params, 4).try_into().unwrap();
+                light.position = Self::transform_vec4(&modelview, value);
+            }
+            es1::SPOT_DIRECTION => {
+                let value: [GLfloat; 3] = std::slice::from_raw_parts(params, 3).try_into().unwrap();
+                let transformed = Self::transform_vec4(&modelview, [value[0], value[1], value[2], 0.0]);
+                let length = (transformed[0] * transformed[0] + transformed[1] * transformed[1] + transformed[2] * transformed[2]).sqrt().max(0.000001);
+                light.spot_direction = [transformed[0] / length, transformed[1] / length, transformed[2] / length];
+            }
             _ => {}
         }
     }
@@ -1604,6 +1728,8 @@ impl GLES for GLES1OnGLES2<'_> {
         gl::UniformMatrix4fv(mvp_loc, 1, gl::FALSE, mvp.as_ptr());
         let modelview_loc = gl::GetUniformLocation(program, b"u_modelview\0".as_ptr() as *const _);
         gl::UniformMatrix4fv(modelview_loc, 1, gl::FALSE, self.state.modelview.current.as_ptr());
+        let projection_loc = gl::GetUniformLocation(program, b"u_projection\0".as_ptr() as *const _);
+        gl::UniformMatrix4fv(projection_loc, 1, gl::FALSE, self.state.projection.current.as_ptr());
         let texture_matrix_loc = gl::GetUniformLocation(program, b"u_texture_matrix0\0".as_ptr() as *const _);
         gl::UniformMatrix4fv(texture_matrix_loc, 1, gl::FALSE, self.state.texture[0].current.as_ptr());
         for unit in 1..MAX_TEXTURE_UNITS {
@@ -1701,7 +1827,7 @@ impl GLES for GLES1OnGLES2<'_> {
             let mode_name = format!("u_tex_mode{}\0", unit);
             let env_name = format!("u_env_color{}\0", unit);
             let sampler_name = format!("u_tex{}\0", unit);
-            let mode = match self.state.texture_env_mode[unit] as GLenum { es1::REPLACE => 1, es1::ADD => 3, es1::DECAL => 4, es1::BLEND => 5, _ => 2 };
+            let mode = match self.state.texture_env_mode[unit] as GLenum { es1::REPLACE => 1, es1::ADD => 3, es1::DECAL => 4, es1::BLEND => 5, es1::COMBINE => 0, _ => 2 };
             let combine_name = format!("u_combine_rgb{}\0", unit);
             let combine_alpha_name = format!("u_combine_alpha{}\0", unit);
             let src_rgb_name = format!("u_src_rgb{}\0", unit);
@@ -1759,6 +1885,8 @@ impl GLES for GLES1OnGLES2<'_> {
         gl::UniformMatrix4fv(mvp_loc, 1, gl::FALSE, mvp.as_ptr());
         let modelview_loc = gl::GetUniformLocation(program, b"u_modelview\0".as_ptr() as *const _);
         gl::UniformMatrix4fv(modelview_loc, 1, gl::FALSE, self.state.modelview.current.as_ptr());
+        let projection_loc = gl::GetUniformLocation(program, b"u_projection\0".as_ptr() as *const _);
+        gl::UniformMatrix4fv(projection_loc, 1, gl::FALSE, self.state.projection.current.as_ptr());
         let texture_matrix_loc = gl::GetUniformLocation(program, b"u_texture_matrix0\0".as_ptr() as *const _);
         gl::UniformMatrix4fv(texture_matrix_loc, 1, gl::FALSE, self.state.texture[0].current.as_ptr());
         for unit in 1..MAX_TEXTURE_UNITS {
@@ -1832,7 +1960,7 @@ impl GLES for GLES1OnGLES2<'_> {
             let mode_name = format!("u_tex_mode{}\0", unit);
             let env_name = format!("u_env_color{}\0", unit);
             let sampler_name = format!("u_tex{}\0", unit);
-            let mode = match self.state.texture_env_mode[unit] as GLenum { es1::REPLACE => 1, es1::ADD => 3, es1::DECAL => 4, es1::BLEND => 5, _ => 2 };
+            let mode = match self.state.texture_env_mode[unit] as GLenum { es1::REPLACE => 1, es1::ADD => 3, es1::DECAL => 4, es1::BLEND => 5, es1::COMBINE => 0, _ => 2 };
             let combine_name = format!("u_combine_rgb{}\0", unit);
             let combine_alpha_name = format!("u_combine_alpha{}\0", unit);
             let src_rgb_name = format!("u_src_rgb{}\0", unit);
@@ -1885,6 +2013,15 @@ impl GLES for GLES1OnGLES2<'_> {
 }
 
 impl GLES1OnGLES2<'_> {
+    fn transform_vec4(matrix: &[GLfloat; 16], value: [GLfloat; 4]) -> [GLfloat; 4] {
+        [
+            matrix[0] * value[0] + matrix[4] * value[1] + matrix[8] * value[2] + matrix[12] * value[3],
+            matrix[1] * value[0] + matrix[5] * value[1] + matrix[9] * value[2] + matrix[13] * value[3],
+            matrix[2] * value[0] + matrix[6] * value[1] + matrix[10] * value[2] + matrix[14] * value[3],
+            matrix[3] * value[0] + matrix[7] * value[1] + matrix[11] * value[2] + matrix[15] * value[3],
+        ]
+    }
+
     fn light_index(light: GLenum) -> Option<usize> {
         (es1::LIGHT0..=es1::LIGHT7).contains(&light).then_some((light - es1::LIGHT0) as usize)
     }
@@ -1928,39 +2065,34 @@ impl GLES1OnGLES2<'_> {
     }
 
     unsafe fn indexed_vertex_range(&self, type_: GLenum, indices: *const GLvoid, count: GLsizei) -> Option<(GLint, GLsizei)> {
-        if count <= 0 || indices.is_null() {
-            return None;
-        }
-        let index_size = match type_ {
-            gl::UNSIGNED_BYTE => 1usize,
-            gl::UNSIGNED_SHORT => 2usize,
-            gl::UNSIGNED_INT => 4usize,
-            _ => return None,
-        };
-        let bytes = if self.state.element_array_buffer_binding != 0 {
-            self.state.element_array_buffer_data.get(&self.state.element_array_buffer_binding)?
+        if count <= 0 || indices.is_null() { return None; }
+        let max_index = if self.state.element_array_buffer_binding != 0 {
+            let index_size = match type_ { gl::UNSIGNED_BYTE => 1usize, gl::UNSIGNED_SHORT => 2, gl::UNSIGNED_INT => 4, _ => return None };
+            let bytes = self.state.element_array_buffer_data.get(&self.state.element_array_buffer_binding)?;
+            let offset = indices as usize;
+            let byte_count = (count as usize).checked_mul(index_size)?;
+            let end = offset.checked_add(byte_count)?;
+            if end > bytes.len() { return None; }
+            (0..count as usize).map(|i| {
+                let at = offset + i * index_size;
+                match type_ {
+                    gl::UNSIGNED_BYTE => Some(bytes[at] as usize),
+                    gl::UNSIGNED_SHORT => Some(u16::from_ne_bytes([bytes[at], bytes[at + 1]]) as usize),
+                    gl::UNSIGNED_INT => Some(u32::from_ne_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]) as usize),
+                    _ => None,
+                }
+            }).collect::<Option<Vec<_>>>()?.into_iter().max()?
         } else {
-            return None;
+            (0..count as usize).map(|i| {
+                match type_ {
+                    gl::UNSIGNED_BYTE => Some((indices.cast::<u8>().add(i)).read_unaligned() as usize),
+                    gl::UNSIGNED_SHORT => Some((indices.cast::<u16>().add(i)).read_unaligned() as usize),
+                    gl::UNSIGNED_INT => Some((indices.cast::<u32>().add(i)).read_unaligned() as usize),
+                    _ => None,
+                }
+            }).collect::<Option<Vec<_>>>()?.into_iter().max()?
         };
-        let offset = indices as usize;
-        let byte_count = (count as usize).checked_mul(index_size)?;
-        let end = offset.checked_add(byte_count)?;
-        if end > bytes.len() {
-            return None;
-        }
-        let mut max_index = 0usize;
-        for i in 0..count as usize {
-            let at = offset + i * index_size;
-            let value = match type_ {
-                gl::UNSIGNED_BYTE => bytes[at] as usize,
-                gl::UNSIGNED_SHORT => u16::from_ne_bytes([bytes[at], bytes[at + 1]]) as usize,
-                gl::UNSIGNED_INT => u32::from_ne_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]) as usize,
-                _ => return None,
-            };
-            max_index = max_index.max(value);
-        }
-        let vertex_count = max_index.checked_add(1)?.try_into().ok()?;
-        Some((0, vertex_count))
+        Some((0, max_index.checked_add(1)?.try_into().ok()?))
     }
 
     unsafe fn stage_client_indices(&mut self, type_: GLenum, indices: *const GLvoid, count: GLsizei) -> (*const GLvoid, bool) {
