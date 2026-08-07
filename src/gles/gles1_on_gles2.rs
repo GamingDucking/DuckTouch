@@ -1139,10 +1139,10 @@ impl GLES for GLES1OnGLES2<'_> {
         if width <= 0.0 || height <= 0.0 || viewport[2] <= 0 || viewport[3] <= 0 { return; }
         let sx = 2.0 / viewport[2] as GLfloat;
         let sy = 2.0 / viewport[3] as GLfloat;
-        let x0 = x * sx - 1.0;
-        let y0 = y * sy - 1.0;
-        let x1 = (x + width) * sx - 1.0;
-        let y1 = (y + height) * sy - 1.0;
+        let x0 = (x - viewport[0] as GLfloat) * sx - 1.0;
+        let y0 = (y - viewport[1] as GLfloat) * sy - 1.0;
+        let x1 = (x + width - viewport[0] as GLfloat) * sx - 1.0;
+        let y1 = (y + height - viewport[1] as GLfloat) * sy - 1.0;
         let vertices = [x0, y0, z, 1.0, x1, y0, z, 1.0, x0, y1, z, 1.0, x1, y1, z, 1.0];
         let tex_w = crop[2].max(1) as GLfloat;
         let tex_h = crop[3].max(1) as GLfloat;
