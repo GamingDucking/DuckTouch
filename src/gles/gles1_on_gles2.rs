@@ -676,7 +676,7 @@ impl GLES for GLES1OnGLES2<'_> {
         }
     }
     unsafe fn GetTexEnviv(&mut self, target: GLenum, pname: GLenum, params: *mut GLint) {
-        assert_eq!(target, es1::TEXTURE_ENV);
+        if target != es1::TEXTURE_ENV || params.is_null() { return; }
         if pname == es1::TEXTURE_ENV_MODE {
             *params = self.state.texture_env_mode[self.state.active_texture];
         } else if pname == es1::TEXTURE_ENV_COLOR {
@@ -686,7 +686,7 @@ impl GLES for GLES1OnGLES2<'_> {
         }
     }
     unsafe fn GetTexEnvfv(&mut self, target: GLenum, pname: GLenum, params: *mut GLfloat) {
-        assert_eq!(target, es1::TEXTURE_ENV);
+        if target != es1::TEXTURE_ENV || params.is_null() { return; }
         if pname == es1::TEXTURE_ENV_MODE {
             *params = self.state.texture_env_mode[self.state.active_texture] as GLfloat;
         } else if pname == es1::TEXTURE_ENV_COLOR {
@@ -694,6 +694,7 @@ impl GLES for GLES1OnGLES2<'_> {
         }
     }
     unsafe fn GetTexEnvxv(&mut self, target: GLenum, pname: GLenum, params: *mut GLfixed) {
+        if params.is_null() { return; }
         let mut values = [0.0; 4];
         self.GetTexEnvfv(target, pname, values.as_mut_ptr());
         for (index, value) in values.iter().enumerate() {
@@ -717,6 +718,7 @@ impl GLES for GLES1OnGLES2<'_> {
         }
     }
     unsafe fn GetLightxv(&mut self, light: GLenum, pname: GLenum, params: *mut GLfixed) {
+        if params.is_null() { return; }
         let count = if pname == es1::SPOT_DIRECTION { 3 } else if matches!(pname, es1::AMBIENT | es1::DIFFUSE | es1::SPECULAR | es1::POSITION) { 4 } else { 1 };
         let mut values = [0.0; 4];
         self.GetLightfv(light, pname, values.as_mut_ptr());
@@ -733,6 +735,7 @@ impl GLES for GLES1OnGLES2<'_> {
         }
     }
     unsafe fn GetMaterialxv(&mut self, face: GLenum, pname: GLenum, params: *mut GLfixed) {
+        if params.is_null() { return; }
         let mut values = [0.0; 4];
         self.GetMaterialfv(face, pname, values.as_mut_ptr());
         let count = if pname == es1::SHININESS { 1 } else { 4 };
@@ -1209,7 +1212,8 @@ impl GLES for GLES1OnGLES2<'_> {
         }
         gl::CompressedTexImage2D(target, level, internalformat, width, height, border, image_size, data);
     }
-    unsafe fn TexEnvi(&mut self, _target: GLenum, pname: GLenum, param: GLint) {
+    unsafe fn TexEnvi(&mut self, target: GLenum, pname: GLenum, param: GLint) {
+        if target != es1::TEXTURE_ENV { return; }
         let unit = self.state.active_texture;
         match pname {
             es1::TEXTURE_ENV_MODE => self.state.texture_env_mode[unit] = param,
@@ -1220,12 +1224,15 @@ impl GLES for GLES1OnGLES2<'_> {
     unsafe fn TexEnvf(&mut self, target: GLenum, pname: GLenum, param: GLfloat) { self.TexEnvi(target, pname, param as GLint); }
     unsafe fn TexEnvx(&mut self, target: GLenum, pname: GLenum, param: GLfixed) { self.TexEnvi(target, pname, param); }
     unsafe fn TexEnviv(&mut self, target: GLenum, pname: GLenum, params: *const GLint) {
+        if params.is_null() { return; }
         if pname == es1::TEXTURE_ENV_COLOR { self.state.texture_env_color[self.state.active_texture] = std::slice::from_raw_parts(params, 4).iter().map(|v| *v as GLfloat).collect::<Vec<_>>().try_into().unwrap(); } else { self.TexEnvi(target, pname, *params); }
     }
     unsafe fn TexEnvfv(&mut self, target: GLenum, pname: GLenum, params: *const GLfloat) {
+        if params.is_null() { return; }
         if pname == es1::TEXTURE_ENV_COLOR { self.state.texture_env_color[self.state.active_texture] = std::slice::from_raw_parts(params, 4).try_into().unwrap(); } else { self.TexEnvi(target, pname, *params as GLint); }
     }
     unsafe fn TexEnvxv(&mut self, target: GLenum, pname: GLenum, params: *const GLfixed) {
+        if params.is_null() { return; }
         if pname == es1::TEXTURE_ENV_COLOR { self.state.texture_env_color[self.state.active_texture] = std::slice::from_raw_parts(params, 4).iter().map(|v| fixed_to_float(*v)).collect::<Vec<_>>().try_into().unwrap(); } else { self.TexEnvi(target, pname, *params); }
     }
     unsafe fn MatrixMode(&mut self, mode: GLenum) { self.state.matrix_mode = mode; }
