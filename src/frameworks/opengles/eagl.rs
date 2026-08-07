@@ -1083,6 +1083,7 @@ unsafe fn present_renderbuffer_es2(
         verts.as_ptr().cast(),
         gles2::STREAM_DRAW,
     );
+    gles.Finish();
     gles.CopyTexImage2D(gles2::TEXTURE_2D, 0, gles2::RGB, 0, 0, width, height, 0);
 
     gles.BindFramebuffer(gles2::FRAMEBUFFER, 0);

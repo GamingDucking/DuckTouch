@@ -100,6 +100,7 @@ struct TranslatorState {
     texture_env_mode: [GLint; MAX_TEXTURE_UNITS],
     texture_env_color: [[GLfloat; 4]; MAX_TEXTURE_UNITS],
     fixed_buffers: [Vec<GLfloat>; 3],
+    client_array_vbos: [GLuint; 7],
     array_buffer_binding: GLuint,
     element_array_buffer_binding: GLuint,
     array_buffer_data: HashMap<GLuint, Vec<u8>>,
@@ -170,6 +171,7 @@ impl TranslatorState {
             texture_env_mode: [es1::MODULATE as GLint; MAX_TEXTURE_UNITS],
             texture_env_color: [[0.0, 0.0, 0.0, 0.0]; MAX_TEXTURE_UNITS],
             fixed_buffers: std::array::from_fn(|_| Vec::new()),
+            client_array_vbos: [0; 7],
             array_buffer_binding: 0,
             element_array_buffer_binding: 0,
             array_buffer_data: HashMap::new(),
@@ -1432,17 +1434,18 @@ impl GLES for GLES1OnGLES2<'_> {
         let color = self.state.arrays[1];
         let normal = self.state.arrays[2];
         let tex0 = self.state.texcoord_arrays[0];
-        self.bind_array(ATTR_POSITION, &position);
-        self.bind_array(ATTR_COLOR, &color);
-        self.bind_array(ATTR_NORMAL, &normal);
-        self.bind_array(ATTR_TEX0, &tex0);
+        self.bind_array_range(ATTR_POSITION, &position, first, count);
+        self.bind_array_range(ATTR_COLOR, &color, first, count);
+        self.bind_array_range(ATTR_NORMAL, &normal, first, count);
+        self.bind_array_range(ATTR_TEX0, &tex0, first, count);
         let palette_index = self.state.palette_index_array;
         let palette_weight = self.state.palette_weight_array;
         let point_size_array = self.state.point_size_array;
-        self.bind_array(ATTR_MATRIX_INDEX, &palette_index);
-        self.bind_array(ATTR_WEIGHT, &palette_weight);
-        self.bind_array(ATTR_POINT_SIZE, &point_size_array);
+        self.bind_array_range(ATTR_MATRIX_INDEX, &palette_index, first, count);
+        self.bind_array_range(ATTR_WEIGHT, &palette_weight, first, count);
+        self.bind_array_range(ATTR_POINT_SIZE, &point_size_array, first, count);
         gl::DrawArrays(mode, first, count);
+        gl::BindBuffer(gl::ARRAY_BUFFER, self.state.array_buffer_binding);
     }
     unsafe fn DrawElements(&mut self, mode: GLenum, count: GLsizei, type_: GLenum, indices: *const GLvoid) {
         let program = match self.ensure_program() {
@@ -1491,17 +1494,18 @@ impl GLES for GLES1OnGLES2<'_> {
         let color = self.state.arrays[1];
         let normal = self.state.arrays[2];
         let tex0 = self.state.texcoord_arrays[0];
-        self.bind_array(ATTR_POSITION, &position);
-        self.bind_array(ATTR_COLOR, &color);
-        self.bind_array(ATTR_NORMAL, &normal);
-        self.bind_array(ATTR_TEX0, &tex0);
+        self.bind_array_range(ATTR_POSITION, &position, 0, count);
+        self.bind_array_range(ATTR_COLOR, &color, 0, count);
+        self.bind_array_range(ATTR_NORMAL, &normal, 0, count);
+        self.bind_array_range(ATTR_TEX0, &tex0, 0, count);
         let palette_index = self.state.palette_index_array;
         let palette_weight = self.state.palette_weight_array;
         let point_size_array = self.state.point_size_array;
-        self.bind_array(ATTR_MATRIX_INDEX, &palette_index);
-        self.bind_array(ATTR_WEIGHT, &palette_weight);
-        self.bind_array(ATTR_POINT_SIZE, &point_size_array);
+        self.bind_array_range(ATTR_MATRIX_INDEX, &palette_index, 0, count);
+        self.bind_array_range(ATTR_WEIGHT, &palette_weight, 0, count);
+        self.bind_array_range(ATTR_POINT_SIZE, &point_size_array, 0, count);
         gl::DrawElements(mode, count, type_, indices);
+        gl::BindBuffer(gl::ARRAY_BUFFER, self.state.array_buffer_binding);
     }
 }
 
@@ -1545,13 +1549,67 @@ impl GLES1OnGLES2<'_> {
     }
 
     unsafe fn bind_array(&mut self, index: GLuint, array: &ArrayState) {
+        self.bind_array_range(index, array, 0, 0);
+    }
+
+    unsafe fn bind_array_range(&mut self, index: GLuint, array: &ArrayState, first: GLint, count: GLsizei) {
         if !array.enabled {
             gl::DisableVertexAttribArray(index);
             let value = if index == ATTR_COLOR { [1.0, 1.0, 1.0, 1.0] } else if index == ATTR_TEX0 { self.state.texcoords[0] } else if index == ATTR_NORMAL { [self.state.normal[0], self.state.normal[1], self.state.normal[2], 1.0] } else { [0.0, 0.0, 0.0, 1.0] };
             gl::VertexAttrib4fv(index, value.as_ptr());
             return;
         }
-        gl::EnableVertexAttribArray(index);
-        gl::VertexAttribPointer(index, array.size, array.type_, if array.normalized { gl::TRUE } else { gl::FALSE }, array.stride, array.pointer);
+        if array.buffer_binding != 0 {
+            gl::BindBuffer(gl::ARRAY_BUFFER, array.buffer_binding);
+            gl::EnableVertexAttribArray(index);
+            gl::VertexAttribPointer(index, array.size, array.type_, if array.normalized { gl::TRUE } else { gl::FALSE }, array.stride, array.pointer);
+            return;
+        }
+        if array.pointer.is_null() || count <= 0 || array.size <= 0 {
+            gl::DisableVertexAttribArray(index);
+            return;
+        }
+        let component_size = match array.type_ {
+            gl::BYTE | gl::UNSIGNED_BYTE => 1usize,
+            gl::SHORT | gl::UNSIGNED_SHORT => 2usize,
+            gl::FIXED | gl::FLOAT => 4usize,
+            _ => {
+                gl::DisableVertexAttribArray(index);
+                return;
+            }
+        };
+        let components = array.size as usize;
+        let stride = if array.stride > 0 { array.stride as usize } else { components * component_size };
+        let first = first.max(0) as usize;
+        let count = count as usize;
+        let upload_count = first.saturating_add(count);
+        let byte_count = upload_count.saturating_sub(1).saturating_mul(stride).saturating_add(components * component_size);
+        let vbo_slot = (index as usize).min(self.state.client_array_vbos.len() - 1);
+        if self.state.client_array_vbos[vbo_slot] == 0 {
+            gl::GenBuffers(1, &mut self.state.client_array_vbos[vbo_slot]);
+        }
+        let vbo = self.state.client_array_vbos[vbo_slot];
+        gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
+        if array.type_ == gl::FIXED {
+            let mut converted = Vec::with_capacity(upload_count * components * std::mem::size_of::<GLfloat>());
+            for vertex in 0..upload_count {
+                let source = (array.pointer as *const u8).add(vertex.saturating_mul(stride));
+                for component in 0..components {
+                    let value = (source.add(component * 4) as *const GLfixed).read_unaligned();
+                    converted.extend_from_slice(&fixed_to_float(value).to_ne_bytes());
+                }
+            }
+            gl::BufferData(gl::ARRAY_BUFFER, converted.len() as GLsizeiptr, converted.as_ptr().cast(), gl::STREAM_DRAW);
+            gl::EnableVertexAttribArray(index);
+            gl::VertexAttribPointer(index, array.size, gl::FLOAT, if array.normalized { gl::TRUE } else { gl::FALSE }, (components * std::mem::size_of::<GLfloat>()) as GLsizei, std::ptr::null());
+        } else {
+            let source = array.pointer as *const u8;
+            gl::BufferData(gl::ARRAY_BUFFER, byte_count as GLsizeiptr, source.cast(), gl::STREAM_DRAW);
+            gl::EnableVertexAttribArray(index);
+            gl::VertexAttribPointer(index, array.size, array.type_, if array.normalized { gl::TRUE } else { gl::FALSE }, array.stride, std::ptr::null());
+        }
+        if index == ATTR_POSITION {
+            log_once!("GLES1-on-GLES2: uploaded client-side vertex arrays to a host VBO for GLES2 compatibility");
+        }
     }
 }
