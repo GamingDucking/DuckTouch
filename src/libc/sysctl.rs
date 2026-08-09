@@ -14,7 +14,7 @@ use crate::libc::sysctl::SysInfoType::String;
 use crate::mem::{guest_size_of, ConstPtr, GuestUSize, MutPtr, MutVoidPtr, PAGE_SIZE};
 use crate::Environment;
 
-static SYSCTL_VALUES: [((i32, i32), &str, SysInfoType); 29] = [
+static SYSCTL_VALUES: [((i32, i32), &str, SysInfoType); 30] = [
     // Generic CPU, I/O
     ((6,1), "hw.machine" , String(b"iPhone2,1")), // overridden dynamically below
     ((6,2), "hw.model" , String(b"N88AP")),
@@ -44,7 +44,8 @@ static SYSCTL_VALUES: [((i32, i32), &str, SysInfoType); 29] = [
     ((1, 14), "kern.osversion", String(b"10B141")),
     ((6,5), "hw.physmem" , SysInfoType::Int32(536870912)),
     ((6,6), "hw.usermem" , SysInfoType::Int32(402653184)),
-    ((6,24), "hw.memsize" , SysInfoType::Int32(536870912)),
+    ((6,24), "hw.memsize" , SysInfoType::Int64(536870912)),
+    ((7,1), "machdep.cpu.vendor", String(b"Apple")),
     ((6,7), "hw.pagesize" , SysInfoType::Int32(PAGE_SIZE as i32)),
     // High kernel limits
     ((1,1), "kern.ostype" , String(b"Darwin")),
@@ -216,6 +217,9 @@ fn sysctlbyname(
             if name_str == "hw.machine" {
                 let machine: &'static str = env.window().device_family().machine_name();
                 return Some(("hw.machine", String(machine.as_bytes())));
+            }
+            if name_str == "machdep.cpu.vendor" {
+                return Some(("machdep.cpu.vendor", String(b"Apple")));
             }
             // hw.physmem / hw.memsize / hw.usermem must reflect the emulated
             // device's real RAM (see the numeric sysctl() path above for why).
