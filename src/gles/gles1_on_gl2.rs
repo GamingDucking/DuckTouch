@@ -900,10 +900,14 @@ impl GLES1OnGL2<'_> {
             return None;
         }
 
+        let mut previous_array_buffer_binding: GLint = 0;
+        gl21::GetIntegerv(gl21::ARRAY_BUFFER_BINDING, &mut previous_array_buffer_binding);
+
         // Resolve all three source arrays to host pointers.
         let (vertex_base, vertex_mapped) =
             Self::resolve_array_base(vertex_pointer.cast_const(), vertex_buffer_binding as GLuint);
         if vertex_base.is_null() {
+            gl21::BindBuffer(gl21::ARRAY_BUFFER, previous_array_buffer_binding as GLuint);
             return None;
         }
         let (weight_base, weight_mapped) =
@@ -911,11 +915,19 @@ impl GLES1OnGL2<'_> {
         let (index_base, index_mapped) =
             Self::resolve_array_base(index.pointer, index.buffer_binding);
         if weight_base.is_null() || index_base.is_null() {
+            if index_mapped {
+                gl21::BindBuffer(gl21::ARRAY_BUFFER, index.buffer_binding);
+                gl21::UnmapBuffer(gl21::ARRAY_BUFFER);
+            }
+            if weight_mapped {
+                gl21::BindBuffer(gl21::ARRAY_BUFFER, weight.buffer_binding);
+                gl21::UnmapBuffer(gl21::ARRAY_BUFFER);
+            }
             if vertex_mapped {
                 gl21::BindBuffer(gl21::ARRAY_BUFFER, vertex_buffer_binding as GLuint);
                 gl21::UnmapBuffer(gl21::ARRAY_BUFFER);
-                gl21::BindBuffer(gl21::ARRAY_BUFFER, 0);
             }
+            gl21::BindBuffer(gl21::ARRAY_BUFFER, previous_array_buffer_binding as GLuint);
             return None;
         }
 
@@ -994,6 +1006,7 @@ impl GLES1OnGL2<'_> {
             gl21::BindBuffer(gl21::ARRAY_BUFFER, 0);
         }
 
+        gl21::BindBuffer(gl21::ARRAY_BUFFER, previous_array_buffer_binding as GLuint);
         Some(out)
     }
 
