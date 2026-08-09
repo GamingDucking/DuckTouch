@@ -512,10 +512,15 @@ impl GLES for GLES3Native<'_> {
         type_: GLenum,
         pixels: *const GLvoid,
     ) {
+        let host_internalformat = if format == gles11::BGRA_EXT {
+            gles11::BGRA_EXT as GLint
+        } else {
+            internalformat
+        };
         gles30::TexImage2D(
             target,
             level,
-            internalformat,
+            host_internalformat,
             width,
             height,
             border,
@@ -563,7 +568,7 @@ impl GLES for GLES3Native<'_> {
         // GL_INVALID_ENUM and leaves the texture in its default (black)
         // state. Mirror the behaviour of the ES 1.1 backends here and
         // software-decode PVRTC to plain RGBA when the host can't do it.
-        if !self.pvrtc_native && !data.is_null() && image_size > 0 {
+        if !self.pvrtc_native && !data.is_null() && image_size > 0 && width > 0 && height > 0 {
             let payload = std::slice::from_raw_parts(data.cast::<u8>(), image_size as usize);
             if try_decode_pvrtc(
                 self,

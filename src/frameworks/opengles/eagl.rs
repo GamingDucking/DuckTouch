@@ -1023,8 +1023,12 @@ unsafe fn present_renderbuffer_es2(
     gles.GetIntegerv(gles2::ELEMENT_ARRAY_BUFFER_BINDING, &mut old_elem_buffer);
     let mut old_active_texture: GLint = 0;
     gles.GetIntegerv(gles2::ACTIVE_TEXTURE, &mut old_active_texture);
-    let mut old_texture: GLint = 0;
-    gles.GetIntegerv(gles2::TEXTURE_BINDING_2D, &mut old_texture);
+    let mut old_active_texture_binding: GLint = 0;
+    gles.GetIntegerv(gles2::TEXTURE_BINDING_2D, &mut old_active_texture_binding);
+    gles.ActiveTexture(gles2::TEXTURE0);
+    let mut old_texture0_binding: GLint = 0;
+    gles.GetIntegerv(gles2::TEXTURE_BINDING_2D, &mut old_texture0_binding);
+    gles.ActiveTexture(old_active_texture as GLenum);
     let mut old_framebuffer: GLint = 0;
     gles.GetIntegerv(gles2::FRAMEBUFFER_BINDING, &mut old_framebuffer);
     let mut old_viewport = [0i32; 4];
@@ -1153,8 +1157,13 @@ unsafe fn present_renderbuffer_es2(
         gles.BindBuffer(gles2::ARRAY_BUFFER, old_array_buffer as GLuint);
         gles.BindBuffer(gles2::ELEMENT_ARRAY_BUFFER, old_elem_buffer as GLuint);
         gles.BindFramebuffer(gles2::FRAMEBUFFER, old_framebuffer as GLuint);
-        gles.BindTexture(gles2::TEXTURE_2D, old_texture as GLuint);
+        gles.ActiveTexture(gles2::TEXTURE0);
+        gles.BindTexture(gles2::TEXTURE_2D, old_texture0_binding as GLuint);
         gles.ActiveTexture(old_active_texture as GLenum);
+        gles.BindTexture(
+            gles2::TEXTURE_2D,
+            old_active_texture_binding as GLuint,
+        );
         gles.Viewport(
             old_viewport[0],
             old_viewport[1],
@@ -1257,8 +1266,13 @@ unsafe fn present_renderbuffer_es2(
     gles.BindBuffer(gles2::ARRAY_BUFFER, old_array_buffer as GLuint);
     gles.BindBuffer(gles2::ELEMENT_ARRAY_BUFFER, old_elem_buffer as GLuint);
     gles.BindFramebuffer(gles2::FRAMEBUFFER, old_framebuffer as GLuint);
-    gles.BindTexture(gles2::TEXTURE_2D, old_texture as GLuint);
+    gles.ActiveTexture(gles2::TEXTURE0);
+    gles.BindTexture(gles2::TEXTURE_2D, old_texture0_binding as GLuint);
     gles.ActiveTexture(old_active_texture as GLenum);
+    gles.BindTexture(
+        gles2::TEXTURE_2D,
+        old_active_texture_binding as GLuint,
+    );
     gles.Viewport(
         old_viewport[0],
         old_viewport[1],
