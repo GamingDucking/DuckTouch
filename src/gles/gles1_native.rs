@@ -12,8 +12,16 @@ use super::gles_generic::GLES;
 use super::util::{try_decode_pvrtc, PalettedTextureFormat};
 use super::GLESContext;
 use crate::window::{GLContext, GLVersion, Window};
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
+use std::sync::OnceLock;
+
+fn c_string_from_gl(pointer: *const GLubyte) -> String {
+    if pointer.is_null() {
+        return String::new();
+    }
+    unsafe { CStr::from_ptr(pointer as *const _).to_string_lossy().into_owned() }
+}
 
 pub struct GLES1NativeContext {
     gl_ctx: GLContext,
@@ -164,15 +172,10 @@ impl GLES for GLES1Native<'_> {
         true
     }
     unsafe fn driver_description(&self) -> String {
-        let version = CStr::from_ptr(gles11::GetString(gles11::VERSION) as *const _);
-        let vendor = CStr::from_ptr(gles11::GetString(gles11::VENDOR) as *const _);
-        let renderer = CStr::from_ptr(gles11::GetString(gles11::RENDERER) as *const _);
-        format!(
-            "{} / {} / {}",
-            version.to_string_lossy(),
-            vendor.to_string_lossy(),
-            renderer.to_string_lossy()
-        )
+        let version = c_string_from_gl(gles11::GetString(gles11::VERSION));
+        let vendor = c_string_from_gl(gles11::GetString(gles11::VENDOR));
+        let renderer = c_string_from_gl(gles11::GetString(gles11::RENDERER));
+        format!("{version} / {vendor} / {renderer}")
     }
 
     // Generic state manipulation
@@ -265,26 +268,27 @@ impl GLES for GLES1Native<'_> {
         gles11::Flush()
     }
 
-    // MALI HACK: Прячем сломанные расширения
     unsafe fn GetString(&mut self, name: GLenum) -> *const GLubyte {
-        if name == gles11::EXTENSIONS {
-            static mut FILTERED_EXTS: *mut std::os::raw::c_char = std::ptr::null_mut();
-            if FILTERED_EXTS.is_null() {
-                let orig_ptr = gles11::GetString(name);
-                if !orig_ptr.is_null() {
-                    let orig_str = std::ffi::CStr::from_ptr(orig_ptr as *const _).to_string_lossy();
-                    // Вырезаем OES_matrix_palette чтобы заставить AC2
-                    // использовать CPU анимацию
-                    let filtered = orig_str.replace("GL_OES_matrix_palette", "");
-                    let c_str = std::ffi::CString::new(filtered).unwrap();
-                    FILTERED_EXTS = c_str.into_raw();
-                } else {
-                    return std::ptr::null();
-                }
-            }
-            return FILTERED_EXTS as *const GLubyte;
+        if name != gles11::EXTENSIONS {
+            return gles11::GetString(name);
         }
-        gles11::GetString(name)
+
+        static FILTERED_EXTS: OnceLock<Option<CString>> = OnceLock::new();
+        FILTERED_EXTS
+            .get_or_init(|| {
+                let original = c_string_from_gl(gles11::GetString(name));
+                if original.is_empty() {
+                    return None;
+                }
+                let filtered = original
+                    .split_whitespace()
+                    .filter(|extension| *extension != "GL_OES_matrix_palette")
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                CString::new(filtered).ok()
+            })
+            .as_ref()
+            .map_or(std::ptr::null(), |extensions| extensions.as_ptr() as *const GLubyte)
     }
 
     // Other state manipulation
@@ -840,7 +844,14 @@ impl GLES for GLES1Native<'_> {
                 let palette_entry_count: usize = if index_is_nibble { 16 } else { 256 };
                 let palette_size = palette_entry_size * palette_entry_count;
 
-                let index_count = width as usize * height as usize;
+                let Some(index_count) = (usize::try_from(width).ok())
+                    .and_then(|width| usize::try_from(height).ok().and_then(|height| width.checked_mul(height)))
+                else {
+                    log!(
+                        "Warning: GLES1Native::CompressedTexImage2D: invalid paletted texture dimensions {width}x{height}; skipping upload."
+                    );
+                    return;
+                };
                 let (index_word_size, index_word_count) = if index_is_nibble {
                     (1, index_count.div_ceil(2))
                 } else {
@@ -990,17 +1001,14 @@ impl GLES for GLES1Native<'_> {
     }
 
     unsafe fn TexEnvfv(&mut self, target: GLenum, pname: GLenum, params: *const GLfloat) {
-        if target == gles11::TEXTURE_FILTER_CONTROL_EXT {
-            assert!(pname == gles11::TEXTURE_LOD_BIAS_EXT);
-            unsafe {
-                if !CStr::from_ptr(gles11::GetString(gles11::EXTENSIONS) as _)
-                    .to_str()
-                    .unwrap()
-                    .contains("EXT_texture_lod_bias")
-                {
-                    return;
-                }
-            };
+        if target == gles11::TEXTURE_FILTER_CONTROL_EXT && pname == gles11::TEXTURE_LOD_BIAS_EXT {
+            let extensions = c_string_from_gl(gles11::GetString(gles11::EXTENSIONS));
+            if !extensions
+                .split_whitespace()
+                .any(|extension| extension == "GL_EXT_texture_lod_bias")
+            {
+                return;
+            }
         }
         gles11::TexEnvfv(target, pname, params)
     }
