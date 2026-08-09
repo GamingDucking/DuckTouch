@@ -1385,6 +1385,15 @@ impl GLES for GLES1OnGLES2<'_> {
                 let buffer = buffers.add(i).read();
                 self.state.array_buffer_data.remove(&buffer);
                 self.state.element_array_buffer_data.remove(&buffer);
+                if self.state.array_buffer_binding == buffer {
+                    self.state.array_buffer_binding = 0;
+                }
+                if self.state.element_array_buffer_binding == buffer {
+                    self.state.element_array_buffer_binding = 0;
+                }
+                if self.state.mapped_buffer.map(|(_, mapped)| mapped) == Some(buffer) {
+                    self.state.mapped_buffer = None;
+                }
             }
         }
         gl::DeleteBuffers(n, buffers);
@@ -1396,11 +1405,16 @@ impl GLES for GLES1OnGLES2<'_> {
             _ => 0,
         };
         if binding != 0 && size >= 0 {
+            let size = size as usize;
             let store = if target == gl::ARRAY_BUFFER { &mut self.state.array_buffer_data } else { &mut self.state.element_array_buffer_data };
             let bytes = store.entry(binding).or_default();
-            bytes.resize(size as usize, 0);
-            if !data.is_null() { std::ptr::copy_nonoverlapping(data.cast::<u8>(), bytes.as_mut_ptr(), size as usize); }
+            bytes.clear();
+            bytes.resize(size, 0);
+            if !data.is_null() && size != 0 {
+                std::ptr::copy_nonoverlapping(data.cast::<u8>(), bytes.as_mut_ptr(), size);
+            }
         }
+        self.state.mapped_buffer = None;
         gl::BufferData(target, size, data, usage);
     }
     unsafe fn BufferSubData(&mut self, target: GLenum, offset: GLintptr, size: GLsizeiptr, data: *const GLvoid) {
@@ -1410,11 +1424,15 @@ impl GLES for GLES1OnGLES2<'_> {
             _ => 0,
         };
         if binding != 0 && offset >= 0 && size >= 0 && !data.is_null() {
+            let offset = offset as usize;
+            let size = size as usize;
             let store = if target == gl::ARRAY_BUFFER { &mut self.state.array_buffer_data } else { &mut self.state.element_array_buffer_data };
             let bytes = store.entry(binding).or_default();
-            let end = offset as usize + size as usize;
-            if end > bytes.len() { bytes.resize(end, 0); }
-            std::ptr::copy_nonoverlapping(data.cast::<u8>(), bytes.as_mut_ptr().add(offset as usize), size as usize);
+            if let Some(end) = offset.checked_add(size) {
+                if end <= bytes.len() {
+                    std::ptr::copy_nonoverlapping(data.cast::<u8>(), bytes.as_mut_ptr().add(offset), size);
+                }
+            }
         }
         gl::BufferSubData(target, offset, size, data);
     }
@@ -1424,7 +1442,19 @@ impl GLES for GLES1OnGLES2<'_> {
         gl::BindTexture(target, texture);
     }
     unsafe fn GenTextures(&mut self, n: GLsizei, textures: *mut GLuint) { gl::GenTextures(n, textures); }
-    unsafe fn DeleteTextures(&mut self, n: GLsizei, textures: *const GLuint) { gl::DeleteTextures(n, textures); }
+    unsafe fn DeleteTextures(&mut self, n: GLsizei, textures: *const GLuint) {
+        if !textures.is_null() {
+            for i in 0..n.max(0) as usize {
+                let texture = textures.add(i).read();
+                for bound in &mut self.state.bound_textures {
+                    if *bound == texture {
+                        *bound = 0;
+                    }
+                }
+            }
+        }
+        gl::DeleteTextures(n, textures);
+    }
     unsafe fn TexParameteri(&mut self, target: GLenum, pname: GLenum, param: GLint) { gl::TexParameteri(target, pname, param); }
     unsafe fn TexParameterf(&mut self, target: GLenum, pname: GLenum, param: GLfloat) { gl::TexParameterf(target, pname, param); }
     unsafe fn TexParameterx(&mut self, target: GLenum, pname: GLenum, param: GLfixed) { gl::TexParameterf(target, pname, fixed_to_float(param)); }
