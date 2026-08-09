@@ -21,7 +21,7 @@ use crate::mem::MutVoidPtr;
 use crate::Environment;
 use std::collections::HashMap;
 
-const CACHE_SIZE: usize = 10;
+const CACHE_SIZE: usize = 60;
 
 #[derive(Default)]
 pub struct State {

@@ -16,7 +16,7 @@ pub mod ui_switch;
 pub mod ui_text_field;
 
 use crate::frameworks::core_graphics::CGPoint;
-use crate::frameworks::foundation::NSUInteger;
+use crate::frameworks::foundation::{NSInteger, NSUInteger};
 use crate::objc::{
     id, impl_HostObject_with_superclass, msg, msg_send, msg_super, nil, objc_classes, release,
     retain, ClassExports, NSZonePtr, SEL,
@@ -34,11 +34,15 @@ pub const UIControlEventTouchUpInside: UIControlEvents = 1 << 6;
 const UIControlEventTouchUpOutside: UIControlEvents = 1 << 7;
 pub const UIControlEventValueChanged: UIControlEvents = 1 << 12;
 
+pub type UIControlContentVerticalAlignment = NSInteger;
+const UIControlContentVerticalAlignmentCenter: UIControlContentVerticalAlignment = 0;
+
 pub struct UIControlHostObject {
     superclass: super::UIViewHostObject,
     enabled: bool,
     selected: bool,
     highlighted: bool,
+    content_vertical_alignment: UIControlContentVerticalAlignment,
     /// `UITouch*` of the touch currently being tracked, [nil] if none
     tracked_touch: id,
     tracking: bool,
@@ -54,6 +58,7 @@ impl Default for UIControlHostObject {
             enabled: true,
             selected: false,
             highlighted: false,
+            content_vertical_alignment: UIControlContentVerticalAlignmentCenter,
             tracked_touch: nil,
             tracking: false,
             action_targets: Vec::new(),
@@ -111,6 +116,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         enabled: _,
         selected: _,
         highlighted: _,
+        content_vertical_alignment: _,
         tracking: _,
         action_targets: _, // targets are weak references, nothing to do
         tracked_touch,
@@ -161,6 +167,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (())setHighlighted:(bool)highlighted {
     env.objc.borrow_mut::<UIControlHostObject>(this).highlighted = highlighted;
+}
+
+- (NSInteger)contentVerticalAlignment {
+    env.objc.borrow::<UIControlHostObject>(this).content_vertical_alignment
+}
+
+- (())setContentVerticalAlignment:(UIControlContentVerticalAlignment)alignment {
+    env.objc.borrow_mut::<UIControlHostObject>(this).content_vertical_alignment = alignment;
 }
 
 - (bool)tracking {
