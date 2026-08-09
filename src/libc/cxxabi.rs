@@ -197,7 +197,9 @@ fn __cxa_free_exception(_env: &mut Environment, _thrown: MutVoidPtr) {
 
 fn __cxa_decrement_exception_refcount(_env: &mut Environment, _exception: MutVoidPtr) {}
 
-fn __cxa_increment_exception_refcount(_env: &mut Environment, _exception: MutVoid) {}
+fn __cxa_increment_exception_refcount(_env: &mut Environment, _exception: MutVoidPtr) {
+    // The exception object is intentionally retained by the emulator.
+}
 
 fn __cxa_throw(env: &mut Environment, _exc: MutVoidPtr, tinfo: ConstVoidPtr, _dtor: GuestFunction) {
     // Itanium type_info layout (32-bit):
