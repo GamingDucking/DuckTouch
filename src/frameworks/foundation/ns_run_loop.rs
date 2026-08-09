@@ -283,10 +283,13 @@ pub fn remove_audio_unit(env: &mut Environment, run_loop: id, unit: AudioUnit) -
 /// mechanism?
 /// TODO: Handle run loop modes. Currently assumes the common modes.
 pub fn add_audio_queue(env: &mut Environment, run_loop: id, queue: AudioQueueRef) {
-    env.objc
+    let queues = &mut env
+        .objc
         .borrow_mut::<NSRunLoopHostObject>(run_loop)
-        .audio_queues
-        .push(queue);
+        .audio_queues;
+    if !queues.contains(&queue) {
+        queues.push(queue);
+    }
 }
 
 /// For use by Audio Toolbox.
@@ -295,8 +298,9 @@ pub fn remove_audio_queue(env: &mut Environment, run_loop: id, queue: AudioQueue
         .objc
         .borrow_mut::<NSRunLoopHostObject>(run_loop)
         .audio_queues;
-    let queue_idx = queues.iter().position(|&item| item == queue).unwrap();
-    queues.remove(queue_idx);
+    if let Some(queue_idx) = queues.iter().position(|&item| item == queue) {
+        queues.remove(queue_idx);
+    }
 }
 
 /// For use by NSTimer so it can remove itself once it's invalidated.

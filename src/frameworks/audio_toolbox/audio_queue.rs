@@ -1818,9 +1818,15 @@ pub fn AudioQueueNewInput(
     in_flags: u32,
     out_aq: MutPtr<AudioQueueRef>,
 ) -> OSStatus {
-    log!("TODO: AudioQueueNewInput(...) stubbed");
-
-    assert!(in_flags == 0);
+    if in_flags != 0 {
+        log!(
+            "Warning: AudioQueueNewInput: ignoring unexpected non-zero flags {:#x}",
+            in_flags
+        );
+    }
+    if in_format.is_null() || out_aq.is_null() {
+        return crate::frameworks::carbon_core::paramErr;
+    }
 
     let in_callback_run_loop = if in_callback_run_loop.is_null() {
         CFRunLoopGetMain(env)
@@ -1845,7 +1851,7 @@ pub fn AudioQueueNewInput(
         aq_is_running_proc: None,
         aq_is_running_user_data: None,
         is_running_handler: false,
-        is_input: false,
+        is_input: true,
         input_delay: 0,
         hardware_codec_policy: codec_policy::DEFAULT,
         offline_render_format: None,
@@ -1856,9 +1862,7 @@ pub fn AudioQueueNewInput(
         .audio_queues
         .insert(aq_ref, host_object);
 
-    if !out_aq.is_null() {
-        env.mem.write(out_aq, aq_ref);
-    }
+    env.mem.write(out_aq, aq_ref);
 
     ns_run_loop::add_audio_queue(env, in_callback_run_loop, aq_ref);
 
