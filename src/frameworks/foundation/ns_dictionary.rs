@@ -1120,7 +1120,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())setDictionary:(id)dict {
-    todo_objc_setter!(this, dict);
+    if dict == this {
+        return;
+    }
+    () = msg![env; this removeAllObjects];
+    () = msg![env; this addEntriesFromDictionary:dict];
 }
 
 - (id)initWithObjectsAndKeys:(id)first_object, ...dots {
