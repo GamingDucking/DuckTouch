@@ -99,7 +99,7 @@ pub(super) struct EAGLContextHostObject {
     renderbuffer_drawable_bindings: Rc<RefCell<HashMap<GLuint, id>>>,
     fps_counter: Option<FpsCounter>,
     next_frame_due: Option<Instant>,
-    pub mapped_buffers: HashMap<GLuint, (MutPtr<GLvoid>, *mut GLvoid)>,
+    pub mapped_buffers: HashMap<(GLenum, GLuint), (MutPtr<GLvoid>, *mut GLvoid, usize)>,
 }
 impl HostObject for EAGLContextHostObject {}
 
@@ -239,7 +239,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())dealloc {
     let host_obj = env.objc.borrow_mut::<EAGLContextHostObject>(this);
-    for &(guest_buf, _host_buf) in host_obj.mapped_buffers.values() {
+    for &(guest_buf, _host_buf, _size) in host_obj.mapped_buffers.values() {
         env.mem.free(guest_buf);
     }
     if Rc::strong_count(&host_obj.renderbuffer_drawable_bindings) == 1 {
@@ -678,8 +678,8 @@ pub const CLASSES: ClassExports = objc_classes! {
             maybe_gles.is_some_and(|gles| gles.is_native_es1())
         };
         if native_es1 {
-            log!(
-                "Layer {:?} uses native ES1; presenting renderbuffer {:?} through resolved RAM readback to avoid empty tile-buffer copies.",
+            log_dbg!(
+                "Native ES1 presentation for layer {:?}, renderbuffer {:?}: using resolved RAM readback for tile-buffer compatibility.",
                 drawable,
                 renderbuffer,
             );
@@ -804,7 +804,10 @@ unsafe fn present_renderbuffer_readback(env: &mut Environment, drawable: id) {
         return;
     };
     present_pixels(env, drawable, pixels, width, height);
+    let force_composition = env.options.force_composition;
+    env.options.force_composition = true;
     crate::frameworks::core_animation::recomposite_if_necessary(env, true);
+    env.options.force_composition = force_composition;
 }
 
 /// Implement framerate limiting.
@@ -1020,8 +1023,12 @@ unsafe fn present_renderbuffer_es2(
     gles.GetIntegerv(gles2::ELEMENT_ARRAY_BUFFER_BINDING, &mut old_elem_buffer);
     let mut old_active_texture: GLint = 0;
     gles.GetIntegerv(gles2::ACTIVE_TEXTURE, &mut old_active_texture);
-    let mut old_texture: GLint = 0;
-    gles.GetIntegerv(gles2::TEXTURE_BINDING_2D, &mut old_texture);
+    let mut old_active_texture_binding: GLint = 0;
+    gles.GetIntegerv(gles2::TEXTURE_BINDING_2D, &mut old_active_texture_binding);
+    gles.ActiveTexture(gles2::TEXTURE0);
+    let mut old_texture0_binding: GLint = 0;
+    gles.GetIntegerv(gles2::TEXTURE_BINDING_2D, &mut old_texture0_binding);
+    gles.ActiveTexture(old_active_texture as GLenum);
     let mut old_framebuffer: GLint = 0;
     gles.GetIntegerv(gles2::FRAMEBUFFER_BINDING, &mut old_framebuffer);
     let mut old_viewport = [0i32; 4];
@@ -1150,8 +1157,13 @@ unsafe fn present_renderbuffer_es2(
         gles.BindBuffer(gles2::ARRAY_BUFFER, old_array_buffer as GLuint);
         gles.BindBuffer(gles2::ELEMENT_ARRAY_BUFFER, old_elem_buffer as GLuint);
         gles.BindFramebuffer(gles2::FRAMEBUFFER, old_framebuffer as GLuint);
-        gles.BindTexture(gles2::TEXTURE_2D, old_texture as GLuint);
+        gles.ActiveTexture(gles2::TEXTURE0);
+        gles.BindTexture(gles2::TEXTURE_2D, old_texture0_binding as GLuint);
         gles.ActiveTexture(old_active_texture as GLenum);
+        gles.BindTexture(
+            gles2::TEXTURE_2D,
+            old_active_texture_binding as GLuint,
+        );
         gles.Viewport(
             old_viewport[0],
             old_viewport[1],
@@ -1254,8 +1266,13 @@ unsafe fn present_renderbuffer_es2(
     gles.BindBuffer(gles2::ARRAY_BUFFER, old_array_buffer as GLuint);
     gles.BindBuffer(gles2::ELEMENT_ARRAY_BUFFER, old_elem_buffer as GLuint);
     gles.BindFramebuffer(gles2::FRAMEBUFFER, old_framebuffer as GLuint);
-    gles.BindTexture(gles2::TEXTURE_2D, old_texture as GLuint);
+    gles.ActiveTexture(gles2::TEXTURE0);
+    gles.BindTexture(gles2::TEXTURE_2D, old_texture0_binding as GLuint);
     gles.ActiveTexture(old_active_texture as GLenum);
+    gles.BindTexture(
+        gles2::TEXTURE_2D,
+        old_active_texture_binding as GLuint,
+    );
     gles.Viewport(
         old_viewport[0],
         old_viewport[1],

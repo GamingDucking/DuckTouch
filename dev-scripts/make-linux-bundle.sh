@@ -15,6 +15,7 @@ if [ "$#" -eq 1 ]; then
     cp -r ../touchHLE_dylibs touchHLE_linux_bundle/
     cp -r ../touchHLE_fonts touchHLE_linux_bundle/
     cp -r ../touchHLE_default_options.txt touchHLE_linux_bundle/
+    cp ../touchHLE_wallpaper.png touchHLE_linux_bundle/
 else
     echo "Incorrect usage."
     exit 1

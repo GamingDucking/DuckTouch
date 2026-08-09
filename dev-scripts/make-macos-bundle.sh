@@ -32,6 +32,7 @@ if [[ $# == 3 ]]; then
     cp -r ../touchHLE_dylibs "$APP_NAME.app"/Contents/Resources/
     cp -r ../touchHLE_fonts "$APP_NAME.app"/Contents/Resources/
     cp -r ../touchHLE_default_options.txt "$APP_NAME.app"/Contents/Resources/
+    cp ../touchHLE_wallpaper.png "$APP_NAME.app"/Contents/Resources/
     cp "$ICON_NAME.icns" "$APP_NAME.app"/Contents/Resources/
 
     plutil -create xml1 "$APP_NAME.app"/Contents/Info.plist
