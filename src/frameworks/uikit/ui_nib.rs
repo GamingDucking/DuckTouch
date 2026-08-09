@@ -251,12 +251,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         release(env, this);
         msg![env; dummy init]
     } else if id == "IBFirstResponder" {
-        log!("touchHLE: Bypassing IBFirstResponder replacement with dummy NSObject");
-        let proxy_class = env.objc.get_known_class("NSObject", &mut env.mem);
-        let dummy: id = msg![env; proxy_class alloc];
-        let dummy_init: id = msg![env; dummy init];
         release(env, this);
-        dummy_init
+        nil
     } else {
         log!("TODO: UIProxyObject replacement for {}, instance {:?} left unreplaced", id, this);
         this
@@ -374,7 +370,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let &UIRuntimeConnectionHostObject { destination, label, source } = env.objc.borrow(this);
     let &UIRuntimeEventConnectionHostObject { superclass: _, event_mask } = env.objc.borrow(this);
 
-    if source != nil && destination != nil && label != nil {
+    if source != nil && label != nil {
         let selector = to_rust_string(env, label).into_owned();
         // `lookup_selector` only finds selectors that the binary or some
         // already-loaded host class has registered. Storyboard-only

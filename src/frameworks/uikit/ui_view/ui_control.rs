@@ -17,8 +17,10 @@ pub mod ui_text_field;
 
 use crate::frameworks::core_graphics::CGPoint;
 use crate::frameworks::foundation::{NSInteger, NSUInteger};
+use crate::frameworks::uikit::ui_application;
 use crate::objc::{
-    id, impl_HostObject_with_superclass, msg, msg_send, msg_super, nil, objc_classes, release,
+    id, impl_HostObject_with_superclass, msg, msg_class, msg_send, msg_super, nil,
+    objc_classes, release,
     retain, ClassExports, NSZonePtr, SEL,
 };
 use crate::Environment;
@@ -91,10 +93,9 @@ fn send_actions(env: &mut Environment, this: id, event: id, control_event: UICon
         );
     }
 
+    let application: id = msg_class![env; UIApplication sharedApplication];
     for (target, action) in action_targets {
-        assert!(target != nil); // TODO
-
-        () = msg![env; this sendAction:action to:target forEvent:event];
+        () = msg![env; application sendAction:action to:target from:this forEvent:event];
     }
 }
 
@@ -286,17 +287,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())addTarget:(id)target
          action:(SEL)action
 forControlEvents:(UIControlEvents)events {
-    if target == nil {
-        // TODO: when the target is nil, the responder chain is searched for
-        // a suitable target
-        log!(
-            "TODO: [{:?} addTarget:nil action:{:?} forControlEvents:{:?}] (ignored)",
-            target,
-            action,
-            events,
-        );
-        return;
-    }
+    // A nil target is intentional: UIApplication resolves the action through
+    // the sender's responder chain when the control event is delivered.
     // The target is a *weak* reference!
 
     // The selector must be for a method with zero to two arguments
@@ -310,8 +302,6 @@ forControlEvents:(UIControlEvents)events {
 - (())sendAction:(SEL)action
               to:(id)target
         forEvent:(id)event { // UIEvent*
-    assert!(target != nil); // TODO
-
     let sel_str = action.as_str(&env.mem);
     let colon_count = sel_str.bytes().filter(|&b| b == b':').count();
     match colon_count {
