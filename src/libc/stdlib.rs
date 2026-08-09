@@ -876,6 +876,14 @@ pub fn strtoul(
     base: i32,
 ) -> u32 {
     set_errno(env, 0);
+    let base = base as u32;
+    if base != 0 && !(2..=36).contains(&base) {
+        if !endptr.is_null() {
+            env.mem.write(endptr, str.cast_mut());
+        }
+        set_errno(env, EINVAL);
+        return 0;
+    }
     let parse_res = str_to_int_inner_generic(
         env,
         |env, s, idx| Ok(env.mem.read(s + idx)),
@@ -909,14 +917,22 @@ fn strtoull(
     base: i32,
 ) -> u64 {
     set_errno(env, 0);
+    let base = base as u32;
+    if base != 0 && !(2..=36).contains(&base) {
+        if !endptr.is_null() {
+            env.mem.write(endptr, str.cast_mut());
+        }
+        set_errno(env, EINVAL);
+        return 0;
+    }
     let parse_res = str_to_int_inner_generic(
         env,
         |env, s, idx| Ok(env.mem.read(s + idx)),
         |_, _, _| (),
         str.cast_mut(),
-        0, // starting offset
-        base.try_into().unwrap(),
-        u32::MAX, // <--- ИСПРАВЛЕНО НА u32::MAX
+        0,
+        base,
+        u32::MAX,
         |s, base| u64::from_str_radix(s, base).unwrap_or(u64::MAX),
         |num| num.wrapping_neg(),
     );
@@ -943,6 +959,14 @@ fn strtoll(
     base: i32,
 ) -> i64 {
     set_errno(env, 0);
+    let base = base as u32;
+    if base != 0 && !(2..=36).contains(&base) {
+        if !endptr.is_null() {
+            env.mem.write(endptr, str.cast_mut());
+        }
+        set_errno(env, EINVAL);
+        return 0;
+    }
     let parse_res = str_to_int_inner_generic(
         env,
         |env, s, idx| Ok(env.mem.read(s + idx)),

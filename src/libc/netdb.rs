@@ -745,6 +745,34 @@ fn gethostent(_env: &mut Environment) -> MutPtr<hostent_guest> {
     Ptr::null()
 }
 
+fn getipnodebyname(
+    env: &mut Environment,
+    name: ConstPtr<u8>,
+    af: i32,
+    _flags: i32,
+    error_num: MutPtr<i32>,
+) -> MutPtr<u8> {
+    if !error_num.is_null() {
+        env.mem.write(error_num, 0);
+    }
+    if af != AF_INET {
+        if !error_num.is_null() {
+            env.mem.write(error_num, EAI_FAMILY);
+        }
+        return MutPtr::null();
+    }
+    gethostbyname(env, name)
+}
+
+fn freehostent(env: &mut Environment, hostent: MutPtr<u8>) {
+    if hostent.to_bits() == env.libc_state.netdb.dummy_hostent_ptr {
+        env.libc_state.netdb.dummy_hostent_ptr = 0;
+    }
+    if !hostent.is_null() {
+        env.mem.free(hostent.cast());
+    }
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(getaddrinfo(_, _, _, _)),
     export_c_func!(freeaddrinfo(_)),
@@ -752,6 +780,8 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(gethostent()),
     export_c_func!(gethostbyname2(_, _)),
     export_c_func!(gethostbyaddr(_, _, _)),
+    export_c_func!(getipnodebyname(_, _, _, _)),
+    export_c_func!(freehostent(_)),
     export_c_func!(getservbyname(_, _)),
     export_c_func!(getservbyport(_, _)),
     export_c_func!(getnameinfo(_, _, _, _, _, _, _)),
