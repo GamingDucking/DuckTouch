@@ -966,12 +966,14 @@ impl GLES for GLES1OnGLES2<'_> {
     }
     unsafe fn GetTexEnviv(&mut self, target: GLenum, pname: GLenum, params: *mut GLint) {
         if target != es1::TEXTURE_ENV || params.is_null() { return; }
-        if pname == es1::TEXTURE_ENV_MODE {
-            *params = self.state.texture_env_mode[self.state.active_texture];
-        } else if pname == es1::TEXTURE_ENV_COLOR {
-            for (index, value) in self.state.texture_env_color[self.state.active_texture].iter().enumerate() {
-                *params.add(index) = *value as GLint;
+        match pname {
+            es1::TEXTURE_ENV_MODE => *params = self.state.texture_env_mode[self.state.active_texture],
+            es1::TEXTURE_ENV_COLOR => {
+                for (index, value) in self.state.texture_env_color[self.state.active_texture].iter().enumerate() {
+                    *params.add(index) = *value as GLint;
+                }
             }
+            _ => {}
         }
     }
     unsafe fn GetTexEnvfv(&mut self, target: GLenum, pname: GLenum, params: *mut GLfloat) {
@@ -983,11 +985,15 @@ impl GLES for GLES1OnGLES2<'_> {
         }
     }
     unsafe fn GetTexEnvxv(&mut self, target: GLenum, pname: GLenum, params: *mut GLfixed) {
-        if params.is_null() { return; }
-        let mut values = [0.0; 4];
-        self.GetTexEnvfv(target, pname, values.as_mut_ptr());
-        for (index, value) in values.iter().enumerate() {
-            *params.add(index) = float_to_fixed(*value);
+        if params.is_null() || target != es1::TEXTURE_ENV { return; }
+        match pname {
+            es1::TEXTURE_ENV_MODE => *params = self.state.texture_env_mode[self.state.active_texture] as GLfixed,
+            es1::TEXTURE_ENV_COLOR => {
+                for (index, value) in self.state.texture_env_color[self.state.active_texture].iter().enumerate() {
+                    *params.add(index) = float_to_fixed(*value);
+                }
+            }
+            _ => {}
         }
     }
     unsafe fn GetLightfv(&mut self, light: GLenum, pname: GLenum, params: *mut GLfloat) {
@@ -1163,7 +1169,7 @@ impl GLES for GLES1OnGLES2<'_> {
     }
     unsafe fn GetFixedv(&mut self, pname: GLenum, params: *mut GLfixed) {
         if params.is_null() { return; }
-        let count = if matches!(pname, es1::MODELVIEW_MATRIX | es1::PROJECTION_MATRIX | es1::TEXTURE_MATRIX) { 16 } else if pname == es1::CURRENT_NORMAL { 3 } else { 4 };
+        let count = if matches!(pname, es1::MODELVIEW_MATRIX | es1::PROJECTION_MATRIX | es1::TEXTURE_MATRIX) { 16 } else if matches!(pname, es1::CURRENT_NORMAL | es1::POINT_DISTANCE_ATTENUATION) { 3 } else { 4 };
         let mut values = [0.0; 16];
         self.GetFloatv(pname, values.as_mut_ptr());
         for i in 0..count { *params.add(i) = float_to_fixed(values[i]); }
