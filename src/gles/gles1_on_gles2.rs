@@ -1493,9 +1493,15 @@ impl GLES for GLES1OnGLES2<'_> {
         gl::DisableVertexAttribArray(ATTR_POSITION);
         gl::DisableVertexAttribArray(ATTR_TEX0);
     }
-    unsafe fn TexImage2D(&mut self, target: GLenum, level: GLint, internalformat: GLint, width: GLsizei, height: GLsizei, border: GLint, format: GLenum, type_: GLenum, pixels: *const GLvoid) { gl::TexImage2D(target, level, internalformat, width, height, border, format, type_, pixels); }
+    unsafe fn TexImage2D(&mut self, target: GLenum, level: GLint, mut internalformat: GLint, width: GLsizei, height: GLsizei, border: GLint, format: GLenum, type_: GLenum, pixels: *const GLvoid) {
+        if format == es1::BGRA_EXT { internalformat = es1::BGRA_EXT as GLint; }
+        gl::TexImage2D(target, level, internalformat, width, height, border, format, type_, pixels);
+    }
     unsafe fn TexSubImage2D(&mut self, target: GLenum, level: GLint, x: GLint, y: GLint, width: GLsizei, height: GLsizei, format: GLenum, type_: GLenum, pixels: *const GLvoid) { gl::TexSubImage2D(target, level, x, y, width, height, format, type_, pixels); }
-    unsafe fn CompressedTexSubImage2D(&mut self, target: GLenum, level: GLint, x: GLint, y: GLint, width: GLsizei, height: GLsizei, format: GLenum, image_size: GLsizei, data: *const GLvoid) { gl::CompressedTexSubImage2D(target, level, x, y, width, height, format, image_size, data); }
+    unsafe fn CompressedTexSubImage2D(&mut self, target: GLenum, level: GLint, x: GLint, y: GLint, width: GLsizei, height: GLsizei, format: GLenum, image_size: GLsizei, data: *const GLvoid) {
+        if data.is_null() && image_size > 0 { return; }
+        gl::CompressedTexSubImage2D(target, level, x, y, width, height, format, image_size, data);
+    }
     unsafe fn GetBufferParameteriv(&mut self, target: GLenum, pname: GLenum, params: *mut GLint) { if !params.is_null() { gl::GetBufferParameteriv(target, pname, params); } }
     unsafe fn MapBufferOES(&mut self, target: GLenum, _access: GLenum) -> *mut GLvoid {
         let binding = match target {
