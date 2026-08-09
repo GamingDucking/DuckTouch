@@ -61,9 +61,11 @@ pub mod media_toolbox;
 pub mod media_player;
 pub mod metal;
 pub mod web_kit;
+pub mod quick_look;
 pub mod message_ui;
 pub mod mobile_core_services;
 pub mod openal;
+pub mod photos;
 pub mod opengles;
 pub mod security;
 pub mod social;
@@ -71,6 +73,7 @@ pub mod store_kit;
 pub mod system_configuration;
 pub mod tw_tweet_compose_view_controller;
 pub mod uikit;
+pub mod xsapitcui;
 
 /// Container for state of various child modules
 #[derive(Default)]

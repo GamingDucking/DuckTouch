@@ -246,6 +246,9 @@ pub const DYLIB_LIST: &[&super::HostDylib] = &[
     &frameworks::core_bluetooth::DYLIB,
     &frameworks::gl_kit::DYLIB,
     &frameworks::image_io::DYLIB,
+    &frameworks::photos::DYLIB,
+    &frameworks::quick_look::DYLIB,
+    &frameworks::xsapitcui::DYLIB,
 ];
 
 #[cfg(test)]
