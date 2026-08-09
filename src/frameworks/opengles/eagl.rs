@@ -99,7 +99,7 @@ pub(super) struct EAGLContextHostObject {
     renderbuffer_drawable_bindings: Rc<RefCell<HashMap<GLuint, id>>>,
     fps_counter: Option<FpsCounter>,
     next_frame_due: Option<Instant>,
-    pub mapped_buffers: HashMap<GLuint, (MutPtr<GLvoid>, *mut GLvoid)>,
+    pub mapped_buffers: HashMap<(GLenum, GLuint), (MutPtr<GLvoid>, *mut GLvoid, usize)>,
 }
 impl HostObject for EAGLContextHostObject {}
 
@@ -239,7 +239,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())dealloc {
     let host_obj = env.objc.borrow_mut::<EAGLContextHostObject>(this);
-    for &(guest_buf, _host_buf) in host_obj.mapped_buffers.values() {
+    for &(guest_buf, _host_buf, _size) in host_obj.mapped_buffers.values() {
         env.mem.free(guest_buf);
     }
     if Rc::strong_count(&host_obj.renderbuffer_drawable_bindings) == 1 {
@@ -678,8 +678,8 @@ pub const CLASSES: ClassExports = objc_classes! {
             maybe_gles.is_some_and(|gles| gles.is_native_es1())
         };
         if native_es1 {
-            log!(
-                "Layer {:?} uses native ES1; presenting renderbuffer {:?} through resolved RAM readback to avoid empty tile-buffer copies.",
+            log_dbg!(
+                "Native ES1 presentation for layer {:?}, renderbuffer {:?}: using resolved RAM readback for tile-buffer compatibility.",
                 drawable,
                 renderbuffer,
             );

@@ -2684,12 +2684,20 @@ fn glMapBufferOES(env: &mut Environment, target: GLenum, access: GLenum) -> MutP
     if host_buffer.is_null() {
         nil.cast()
     } else {
-        let buffer_size = _get_buffer_size(env, target) as u32;
-        let guest_buffer: MutVoidPtr = env.mem.alloc(buffer_size).cast();
+        let buffer_size = match usize::try_from(_get_buffer_size(env, target)) {
+            Ok(size) => size,
+            Err(_) => {
+                with_ctx_and_mem(env, |gles, _mem| unsafe {
+                    gles.UnmapBufferOES(target);
+                });
+                return nil.cast();
+            }
+        };
+        let guest_buffer: MutVoidPtr = env.mem.alloc(buffer_size as GuestUSize).cast();
         unsafe {
             env.mem
-                .bytes_at_mut(guest_buffer.cast(), buffer_size)
-                .copy_from_slice(from_raw_parts(host_buffer as *mut u8, buffer_size as usize));
+                .bytes_at_mut(guest_buffer.cast(), buffer_size as GuestUSize)
+                .copy_from_slice(from_raw_parts(host_buffer as *const u8, buffer_size));
         }
         let Some(current_ctx) = *env
             .framework_state
@@ -2713,9 +2721,9 @@ fn glMapBufferOES(env: &mut Environment, target: GLenum, access: GLenum) -> MutP
         // close to Apple's lenient behaviour, we unmap the stale mapping
         // (freeing the previous guest mirror) and install the new one so
         // the app can continue uploading data instead of crashing.
-        if let Some((stale_guest_buffer, _stale_host_buffer)) = current_ctx_host_object
+        if let Some((stale_guest_buffer, _stale_host_buffer, _stale_size)) = current_ctx_host_object
             .mapped_buffers
-            .remove(&buffer_object_name)
+            .remove(&(target, buffer_object_name))
         {
             log!(
                 "Warning: glMapBufferOES called on buffer {} that was already mapped; \
@@ -2732,49 +2740,59 @@ fn glMapBufferOES(env: &mut Environment, target: GLenum, access: GLenum) -> MutP
             let current_ctx_host_object = env.objc.borrow_mut::<EAGLContextHostObject>(current_ctx);
             current_ctx_host_object
                 .mapped_buffers
-                .insert(buffer_object_name, (guest_buffer, host_buffer));
+                .insert((target, buffer_object_name), (guest_buffer, host_buffer, buffer_size));
         } else {
             current_ctx_host_object
                 .mapped_buffers
-                .insert(buffer_object_name, (guest_buffer, host_buffer));
+                .insert((target, buffer_object_name), (guest_buffer, host_buffer, buffer_size));
         }
         guest_buffer
     }
 }
-fn glUnmapBufferOES(env: &mut Environment, target: GLenum) -> GLboolean {
+fn unmap_buffer(env: &mut Environment, target: GLenum, oes: bool) -> GLboolean {
     let buffer_object_name = _get_currently_bound_buffer_object_name(env, target);
     let Some(current_ctx) = env
         .framework_state
         .opengles
         .current_ctx_for_thread(env.current_thread)
+        .as_ref()
+        .copied()
     else {
         return gles11::FALSE;
     };
     let mapping = env
         .objc
-        .borrow_mut::<EAGLContextHostObject>(*current_ctx)
+        .borrow_mut::<EAGLContextHostObject>(current_ctx)
         .mapped_buffers
-        .remove(&buffer_object_name);
-    let Some((guest_buffer, host_buffer)) = mapping else {
-        log!(
-            "Warning: glUnmapBufferOES called for buffer {} without a tracked mapping; skipping host unmap",
-            buffer_object_name
-        );
-        return gles11::FALSE;
+        .remove(&(target, buffer_object_name));
+    let Some((guest_buffer, host_buffer, buffer_size)) = mapping else {
+        return with_ctx_and_mem(env, |gles, _mem| unsafe {
+            if oes {
+                gles.UnmapBufferOES(target)
+            } else {
+                gles.UnmapBuffer(target)
+            }
+        });
     };
-    let buffer_size = _get_buffer_size(env, target).max(0) as u32;
     unsafe {
         host_buffer.copy_from(
-            env.mem.bytes_at(guest_buffer.cast(), buffer_size).as_ptr() as *mut GLvoid,
-            buffer_size as usize,
+            env.mem.bytes_at(guest_buffer.cast(), buffer_size as GuestUSize).as_ptr()
+                as *mut GLvoid,
+            buffer_size,
         );
     }
     env.mem.free(guest_buffer);
-    let unmapped = with_ctx_and_mem(env, |gles, _mem| unsafe { gles.UnmapBufferOES(target) });
-    if unmapped == gles11::FALSE {
-        log!("Warning: host glUnmapBufferOES returned GL_FALSE for buffer {}", buffer_object_name);
-    }
-    unmapped
+    with_ctx_and_mem(env, |gles, _mem| unsafe {
+        if oes {
+            gles.UnmapBufferOES(target)
+        } else {
+            gles.UnmapBuffer(target)
+        }
+    })
+}
+
+fn glUnmapBufferOES(env: &mut Environment, target: GLenum) -> GLboolean {
+    unmap_buffer(env, target, true)
 }
 
 // =====================================================================
@@ -3852,7 +3870,7 @@ fn glIsVertexArray(env: &mut Environment, array: GLuint) -> GLboolean {
 /// `glUnmapBufferOES` is the matching entry point — share the existing
 /// implementation since the buffer-mapping bookkeeping is identical.
 fn glUnmapBuffer(env: &mut Environment, target: GLenum) -> GLboolean {
-    glUnmapBufferOES(env, target)
+    unmap_buffer(env, target, false)
 }
 
 // ===== OpenGL ES 3.0 guest dispatchers =====
@@ -3900,11 +3918,20 @@ fn glMapBufferRange(
         .framework_state
         .opengles
         .current_ctx_for_thread(env.current_thread);
-    if let Some(ctx) = current_ctx {
-        let host_obj = env.objc.borrow_mut::<EAGLContextHostObject>(ctx);
-        host_obj
-            .mapped_buffers
-            .insert(target, (guest_buf, host_ptr));
+    let Some(ctx) = current_ctx else {
+        env.mem.free(guest_buf);
+        with_ctx_and_mem(env, |gles, _mem| unsafe {
+            gles.UnmapBuffer(target);
+        });
+        return Ptr::null();
+    };
+    let buffer_object_name = _get_currently_bound_buffer_object_name(env, target);
+    let host_obj = env.objc.borrow_mut::<EAGLContextHostObject>(ctx);
+    if let Some((old_guest_buf, _, _)) = host_obj
+        .mapped_buffers
+        .insert((target, buffer_object_name), (guest_buf, host_ptr, length_usize))
+    {
+        env.mem.free(old_guest_buf);
     }
     guest_buf.cast()
 }
@@ -3922,13 +3949,14 @@ fn glFlushMappedBufferRange(
         .opengles
         .current_ctx_for_thread(env.current_thread);
     if let Some(ctx) = current_ctx {
+        let buffer_object_name = _get_currently_bound_buffer_object_name(env, target);
         let mapping = env
             .objc
             .borrow::<EAGLContextHostObject>(ctx)
             .mapped_buffers
-            .get(&target)
+            .get(&(target, buffer_object_name))
             .copied();
-        if let Some((guest_buf, host_ptr)) = mapping {
+        if let Some((guest_buf, host_ptr, mapped_size)) = mapping {
             let offset_usize = match usize::try_from(offset) {
                 Ok(value) => value,
                 Err(_) => return,
@@ -3938,8 +3966,8 @@ fn glFlushMappedBufferRange(
                 Err(_) => return,
             };
             let end = match offset_usize.checked_add(length_usize) {
-                Some(value) => value,
-                None => return,
+                Some(value) if value <= mapped_size => value,
+                _ => return,
             };
             let guest_slice = env.mem.bytes_at(guest_buf.cast(), end as GuestUSize);
             unsafe {
