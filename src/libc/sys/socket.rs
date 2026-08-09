@@ -727,14 +727,19 @@ fn select(
         true
     };
     let mut count = 0;
+    let mut invalid_fd = false;
 
     if !read_fds.is_null() {
         let mut read_set = env.mem.read(read_fds);
         log_dbg!("select: read_set before {:?}", read_set);
         count += process_set(env, &mut read_set, n_fds, |env, fd, bits, bit_index| {
             log_dbg!("select: bit set in read_set at fd: {}", fd);
-            // Only sockets for now
-            assert!(is_socket(env, fd));
+            if !is_socket(env, fd) {
+                log!("select: read_set contains non-socket fd {}; ignoring", fd);
+                *bits &= !(1 << bit_index);
+                invalid_fd = true;
+                return false;
+            }
             // Clean bit in the set for the current socket
             *bits &= !(1 << bit_index);
             let socket_host_object = State::get(env).sockets.get(&fd).unwrap();
@@ -878,9 +883,13 @@ fn select(
         log_dbg!("select: write_set before {:?}", write_set);
         count += process_set(env, &mut write_set, n_fds, |env, fd, bits, bit_index| {
             log_dbg!("select: bit set in write_set at fd: {}", fd);
-            // Only sockets for now
-            assert!(is_socket(env, fd));
-            // Clean bit in the set for the current socket
+            if !is_socket(env, fd) {
+                log!("select: write_set contains non-socket fd {}; ignoring", fd);
+                *bits &= !(1 << bit_index);
+                invalid_fd = true;
+                return false;
+            }
+            // Clean bit in the current socket set
             *bits &= !(1 << bit_index);
             let socket_host_object = State::get(env).sockets.get(&fd).unwrap();
             let type_ = socket_host_object.type_;
@@ -933,9 +942,13 @@ fn select(
         log_dbg!("select: error_set before {:?}", error_set);
         count += process_set(env, &mut error_set, n_fds, |env, fd, bits, bit_index| {
             log_dbg!("select: bit set in error_set at fd: {}", fd);
-            // Only sockets for now
-            assert!(is_socket(env, fd));
-            // Clean bit in the set for the current socket
+            if !is_socket(env, fd) {
+                log!("select: error_set contains non-socket fd {}; ignoring", fd);
+                *bits &= !(1 << bit_index);
+                invalid_fd = true;
+                return false;
+            }
+            // Clean bit in the current socket set
             *bits &= !(1 << bit_index);
             let socket_host_object = State::get(env).sockets.get(&fd).unwrap();
             let type_ = socket_host_object.type_;
@@ -989,14 +1002,19 @@ fn select(
         env.mem.write(error_fds, error_set);
     }
 
+    if invalid_fd {
+        set_errno(env, EBADF);
+        return -1;
+    }
+
     count
 }
 
-fn process_set<F: Fn(&mut Environment, FileDescriptor, &mut i32, i32) -> bool>(
+fn process_set<F: FnMut(&mut Environment, FileDescriptor, &mut i32, i32) -> bool>(
     env: &mut Environment,
     set: &mut fd_set,
     n_fds: i32,
-    process_bit: F,
+    mut process_bit: F,
 ) -> i32 {
     let mut fds_bits = set.fds_bits;
     let mut count = 0;
