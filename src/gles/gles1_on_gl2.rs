@@ -2456,8 +2456,10 @@ impl GLES for GLES1OnGL2<'_> {
         type_: GLenum,
         pixels: *const GLvoid,
     ) {
-        assert!(target == gl21::TEXTURE_2D);
-        assert!(level >= 0);
+        if target != gl21::TEXTURE_2D || level < 0 || width <= 0 || height <= 0 {
+            log!("Warning: TexImage2D: invalid arguments; skipping upload.");
+            return;
+        }
         assert!(
             internalformat as GLenum == gl21::ALPHA
                 || internalformat as GLenum == gl21::RGB
@@ -2504,8 +2506,14 @@ impl GLES for GLES1OnGL2<'_> {
         type_: GLenum,
         pixels: *const GLvoid,
     ) {
-        assert!(target == gl21::TEXTURE_2D);
-        assert!(level >= 0);
+        if target != gl21::TEXTURE_2D || level < 0 || width <= 0 || height <= 0 {
+            log!("Warning: TexSubImage2D: invalid arguments; skipping upload.");
+            return;
+        }
+        if pixels.is_null() {
+            log!("Warning: TexSubImage2D: null pixel data; skipping upload.");
+            return;
+        }
         assert!(
             format == gl21::ALPHA
                 || format == gl21::RGB
@@ -2535,6 +2543,10 @@ impl GLES for GLES1OnGL2<'_> {
         image_size: GLsizei,
         data: *const GLvoid,
     ) {
+        if target != gl21::TEXTURE_2D || level < 0 || width <= 0 || height <= 0 || border != 0 || image_size < 0 || (data.is_null() && image_size > 0) {
+            log!("Warning: CompressedTexImage2D: invalid arguments; skipping upload.");
+            return;
+        }
         let data = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), image_size as usize) };
         // IMG_texture_compression_pvrtc (only on Imagination/Apple GPUs)
         // TODO: It would be more efficient to use hardware decoding where
@@ -2558,8 +2570,10 @@ impl GLES for GLES1OnGL2<'_> {
             palette_entry_type,
         }) = PalettedTextureFormat::get_info(internalformat)
         {
-            // This should be invalid use? (TODO)
-            assert!(border == 0);
+            if border != 0 || level < 0 || width <= 0 || height <= 0 {
+                log!("Warning: CompressedTexImage2D: invalid texture dimensions; skipping upload.");
+                return;
+            }
 
             let palette_entry_size = match palette_entry_type {
                 gl21::UNSIGNED_BYTE => match palette_entry_format {
@@ -2585,9 +2599,15 @@ impl GLES for GLES1OnGL2<'_> {
             };
             let indices_size = index_word_size * index_word_count;
 
-            // TODO: support multiple miplevels in one image
-            assert!(level == 0);
-            assert_eq!(data.len(), palette_size + indices_size);
+            if level != 0 {
+                log!("Warning: CompressedTexImage2D: paletted mip levels are unsupported; skipping upload.");
+                return;
+            }
+            let expected_size = palette_size + indices_size;
+            if data.len() < expected_size {
+                log!("Warning: CompressedTexImage2D: paletted payload is truncated; skipping upload.");
+                return;
+            }
             let (palette, indices) = data.split_at(palette_size);
 
             let mut decoded = Vec::<u8>::with_capacity(palette_entry_size * index_count);
@@ -2633,8 +2653,10 @@ impl GLES for GLES1OnGL2<'_> {
         image_size: GLsizei,
         data: *const GLvoid,
     ) {
-        assert!(target == gl21::TEXTURE_2D);
-        assert!(level >= 0);
+        if target != gl21::TEXTURE_2D || level < 0 || width <= 0 || height <= 0 || image_size < 0 || (data.is_null() && image_size > 0) {
+            log!("Warning: CompressedTexSubImage2D: invalid arguments; skipping upload.");
+            return;
+        }
         // PVRTC sub-image updates are very rare (Apple's OpenGL ES 1.1
         // surface rejects them too), but if we ever see one we
         // software-decode the entire sub-region to RGBA and use the
