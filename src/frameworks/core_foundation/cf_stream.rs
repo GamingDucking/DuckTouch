@@ -15,7 +15,7 @@ use crate::frameworks::core_foundation::{CFRelease, CFRetain, CFTypeRef};
 use crate::frameworks::foundation::ns_string;
 use crate::fs::GuestPath;
 use crate::mem::{ConstPtr, MutPtr, MutVoidPtr};
-use crate::objc::{nil, objc_classes, ClassExports, HostObject};
+use crate::objc::{msg, nil, objc_classes, ClassExports, HostObject};
 use crate::Environment;
 
 pub type CFReadStreamRef = CFTypeRef;
@@ -555,9 +555,19 @@ fn CFWriteStreamOpen(env: &mut Environment, stream: CFWriteStreamRef) -> bool {
     if stream.is_null() {
         return false;
     }
-    env.objc
-        .borrow_mut::<CFWriteStreamHostObject>(stream)
-        .status = kCFStreamStatusOpen;
+
+    let (path, append) = {
+        let host = env.objc.borrow::<CFWriteStreamHostObject>(stream);
+        (host.file_path.clone(), host.append)
+    };
+    let initial_data = match path.as_deref() {
+        Some(path) if append => env.fs.read(GuestPath::new(path)).unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let host = env.objc.borrow_mut::<CFWriteStreamHostObject>(stream);
+    host.data = initial_data;
+    host.offset = host.data.len();
+    host.status = kCFStreamStatusOpen;
     true
 }
 
@@ -691,28 +701,23 @@ fn CFWriteStreamWrite(
         return -1;
     }
     let bytes = env.mem.bytes_at(buffer, buffer_length as u32).to_vec();
-    let (path, append) = {
-        let host = env.objc.borrow_mut::<CFWriteStreamHostObject>(stream);
+    let (path, mut data, offset) = {
+        let host = env.objc.borrow::<CFWriteStreamHostObject>(stream);
         if host.status != kCFStreamStatusOpen && host.status != kCFStreamStatusWriting {
             return -1;
         }
-        host.data.extend_from_slice(&bytes);
-        host.status = kCFStreamStatusWriting;
-        (host.file_path.clone(), host.append)
+        (host.file_path.clone(), host.data.clone(), host.offset)
     };
+    data.extend_from_slice(&bytes);
     if let Some(path) = path {
-        let guest_path = GuestPath::new(&path);
-        let result = if append {
-            let mut current = env.fs.read(guest_path).unwrap_or_default();
-            current.extend_from_slice(&bytes);
-            env.fs.write(guest_path, &current)
-        } else {
-            env.fs.write(guest_path, &bytes)
-        };
-        if result.is_err() {
+        if env.fs.write(GuestPath::new(&path), &data).is_err() {
             return -1;
         }
     }
+    let host = env.objc.borrow_mut::<CFWriteStreamHostObject>(stream);
+    host.data = data;
+    host.offset = offset.saturating_add(bytes.len());
+    host.status = kCFStreamStatusWriting;
     buffer_length
 }
 
