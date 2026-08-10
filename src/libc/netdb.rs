@@ -749,28 +749,60 @@ fn getipnodebyname(
     env: &mut Environment,
     name: ConstPtr<u8>,
     af: i32,
-    _flags: i32,
+    flags: i32,
     error_num: MutPtr<i32>,
 ) -> MutPtr<u8> {
+    let host = if name.is_null() {
+        "localhost".to_owned()
+    } else {
+        env.mem.cstr_at_utf8(name).unwrap_or_default().to_owned()
+    };
+    let allowed_flags = AI_V4MAPPED | AI_ALL | AI_ADDRCONFIG;
+
     if !error_num.is_null() {
         env.mem.write(error_num, 0);
     }
+
     if af != AF_INET {
         if !error_num.is_null() {
-            env.mem.write(error_num, EAI_FAMILY);
+            env.mem.write(error_num, NO_RECOVERY);
         }
+        log!(
+            "getipnodebyname(\"{}\"): unsupported family {} -> NO_RECOVERY",
+            host,
+            af
+        );
         return MutPtr::null();
     }
-    gethostbyname(env, name)
+
+    if flags & !allowed_flags != 0 {
+        if !error_num.is_null() {
+            env.mem.write(error_num, NO_RECOVERY);
+        }
+        log!(
+            "getipnodebyname(\"{}\"): unsupported flags 0x{:x} -> NO_RECOVERY",
+            host,
+            flags
+        );
+        return MutPtr::null();
+    }
+
+    let result = gethostbyname(env, name);
+    if result.is_null() && !error_num.is_null() {
+        env.mem.write(error_num, H_ERRNO_HOST_NOT_FOUND);
+    }
+    result
 }
 
 fn freehostent(env: &mut Environment, hostent: MutPtr<u8>) {
+    if hostent.is_null() {
+        return;
+    }
+
     if hostent.to_bits() == env.libc_state.netdb.dummy_hostent_ptr {
         env.libc_state.netdb.dummy_hostent_ptr = 0;
     }
-    if !hostent.is_null() {
-        env.mem.free(hostent.cast());
-    }
+    env.mem.free(hostent.cast());
 }
 
 pub const FUNCTIONS: FunctionExports = &[
