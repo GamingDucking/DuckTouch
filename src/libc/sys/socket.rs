@@ -25,7 +25,7 @@
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::libc::errno::{
     set_errno, EACCES, EADDRINUSE, EADDRNOTAVAIL, EAGAIN, EBADF, ECONNREFUSED, ECONNRESET, EINVAL,
-    EIO, EISCONN, ENETUNREACH, ENOTCONN, EPROTONOSUPPORT, ESOCKTNOSUPPORT, ETIMEDOUT,
+    EAFNOSUPPORT, EIO, EISCONN, ENETUNREACH, ENOTCONN, EPROTONOSUPPORT, ESOCKTNOSUPPORT, ETIMEDOUT,
 };
 use crate::libc::posix_io::{close, find_or_create_socket, is_socket, FileDescriptor};
 use crate::libc::time::timeval;
@@ -182,9 +182,20 @@ fn socket(env: &mut Environment, domain: i32, type_: i32, protocol: i32) -> File
         return -1;
     }
 
-    assert_eq!(domain, AF_INET);
-    assert!(type_ == SOCK_STREAM || type_ == SOCK_DGRAM);
-    assert!(protocol == IPPROTO_TCP || protocol == IPPROTO_UDP || protocol == 0);
+    if domain != AF_INET {
+        set_errno(env, EAFNOSUPPORT);
+        return -1;
+    }
+
+    if type_ != SOCK_STREAM && type_ != SOCK_DGRAM {
+        set_errno(env, ESOCKTNOSUPPORT);
+        return -1;
+    }
+
+    if protocol != IPPROTO_TCP && protocol != IPPROTO_UDP && protocol != 0 {
+        set_errno(env, EPROTONOSUPPORT);
+        return -1;
+    }
 
     let fd = find_or_create_socket(env);
     assert!(!State::get(env).sockets.contains_key(&fd));
