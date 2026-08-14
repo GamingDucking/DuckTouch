@@ -276,7 +276,6 @@ const CLASSES: ClassExports = objc_classes! {
                 echo!("Couldn't open file manager at {:?}: {}", url, e);
             } else {
                 echo!("Opened game folder at {:?}, returning to the picker.", url);
-                env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).apps_refresh_requested = true;
             }
         },
         Err(e) => echo!("Couldn't open file manager: {}", e),
@@ -531,7 +530,7 @@ fn app_picker_inner(
         app_frame.size,
         buttons_row_center,
         &[
-            ("File manager", "openFileManager"),
+            ("Add game folder", "openFileManager"),
             ("Quick options", "quickOptionsShow"),
         ],
         None,
