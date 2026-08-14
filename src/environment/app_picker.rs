@@ -64,16 +64,6 @@ pub fn app_picker(options: Options) -> Result<(PathBuf, Vec<String>), String> {
                     err
                 )
             })
-            .and_then(|apps| {
-                if apps.is_empty() {
-                    Err(format!(
-                        "No apps were found in the {} directory.",
-                        apps_dir.display()
-                    ))
-                } else {
-                    Ok(apps)
-                }
-            })
     };
 
     show_app_picker_gui(options, apps)
@@ -81,51 +71,49 @@ pub fn app_picker(options: Options) -> Result<(PathBuf, Vec<String>), String> {
 
 fn enumerate_apps(apps_dir: &Path) -> Result<Vec<AppInfo>, std::io::Error> {
     let mut apps = Vec::new();
-    for app in std::fs::read_dir(apps_dir)? {
-        let app_path = app?.path();
-        if app_path.extension() != Some(OsStr::new("app"))
-            && app_path.extension() != Some(OsStr::new("ipa"))
-        {
-            continue;
+    let mut directories = vec![apps_dir.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(directory)? {
+            let app_path = entry?.path();
+            let extension = app_path.extension();
+            if extension == Some(OsStr::new("app")) || extension == Some(OsStr::new("ipa")) {
+                let (bundle, fs) = match BundleData::open_any(&app_path).and_then(|bundle_data| {
+                    Bundle::new_bundle_and_fs_from_host_path(bundle_data, /* read_only_mode: */ true)
+                }) {
+                    Ok(ok) => ok,
+                    Err(e) => {
+                        log!(
+                            "Warning: couldn't open app bundle {}: {} (skipping)",
+                            app_path.display(),
+                            e
+                        );
+                        continue;
+                    }
+                };
+
+                let display_name = bundle.display_name().to_owned();
+                let icon = match bundle.load_icon(&fs) {
+                    Ok(icon) => Some(icon),
+                    Err(e) => {
+                        log!("Warning: couldn't load icon for app bundle {}: {} (displaying placeholder instead)", app_path.display(), e);
+                        None
+                    }
+                };
+
+                apps.push(AppInfo {
+                    path: app_path,
+                    display_name,
+                    icon,
+                    display_name_ns_string: None,
+                    icon_ui_image: None,
+                });
+            } else if app_path.is_dir() {
+                directories.push(app_path);
+            }
         }
-
-        // TODO: avoid loading the whole FS somehow?
-        let (bundle, fs) = match BundleData::open_any(&app_path).and_then(|bundle_data| {
-            Bundle::new_bundle_and_fs_from_host_path(bundle_data, /* read_only_mode: */ true)
-        }) {
-            Ok(ok) => ok,
-            Err(e) => {
-                log!(
-                    "Warning: couldn't open app bundle {}: {} (skipping)",
-                    app_path.display(),
-                    e
-                );
-                continue;
-            }
-        };
-
-        // TODO: what if this crashes?
-        let display_name = bundle.display_name().to_owned();
-
-        let icon = match bundle.load_icon(&fs) {
-            Ok(icon) => Some(icon),
-            Err(e) => {
-                log!("Warning: couldn't load icon for app bundle {}: {} (displaying placeholder instead)", app_path.display(), e);
-                None
-            }
-        };
-
-        apps.push(AppInfo {
-            path: app_path,
-            display_name,
-            icon,
-            display_name_ns_string: None,
-            icon_ui_image: None,
-        });
     }
 
     apps.sort_by_key(|app| app.display_name.to_uppercase());
-
     Ok(apps)
 }
 
@@ -150,11 +138,17 @@ struct AppPickerDelegateHostObject {
     analog_stick_tilt_controls: Option<bool>,
     network: Option<bool>,
     gles1_on_gles2: Option<bool>,
+    show_fps: Option<bool>,
     fullscreen: Option<bool>,
     device_model_tag: Option<i32>,
     device_model_toggle: bool,
     device_model_scroll_up: bool,
     device_model_scroll_down: bool,
+    apps_refresh_requested: bool,
+    ios_version_latest: bool,
+    ios_version_43: bool,
+    ios_version_61: bool,
+    ios_version_93: bool,
 }
 impl HostObject for AppPickerDelegateHostObject {}
 
@@ -243,6 +237,20 @@ const CLASSES: ClassExports = objc_classes! {
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).network = Some(switch_state);
 }
+- (())showFPS:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).show_fps = Some(switch_state);
+    // Immediately reflect the runtime change so users see the overlay without
+    // having to re-launch or wait for the option to be applied.
+    // SAFETY: calling into the runtime-level API is safe from the UI thread.
+    if switch_state {
+        std::env::set_var("TOUCHHLE_ONSCREEN_FPS", "1");
+        crate::gles::present::set_onscreen_fps_enabled(true);
+    } else {
+        std::env::remove_var("TOUCHHLE_ONSCREEN_FPS");
+        crate::gles::present::set_onscreen_fps_enabled(false);
+    }
+}
 - (())fullscreen:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).fullscreen = Some(switch_state);
@@ -260,12 +268,27 @@ const CLASSES: ClassExports = objc_classes! {
 - (())deviceModelScrollDown {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).device_model_scroll_down = true;
 }
+- (())refreshApps {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).apps_refresh_requested = true;
+}
+- (())iosVersionLatest {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).ios_version_latest = true;
+}
+- (())iosVersion43 {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).ios_version_43 = true;
+}
+- (())iosVersion61 {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).ios_version_61 = true;
+}
+- (())iosVersion93 {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).ios_version_93 = true;
+}
 
 - (())openFileManager {
     // Assert (see above).
     let _ = env.objc.borrow_mut::<AppPickerDelegateHostObject>(this);
 
-    match paths::url_for_opening_user_data_dir() {
+    match paths::url_for_opening_apps_dir() {
         Ok(url) => {
             // Our `openURL:` implementation is bypassed because it doesn't
             // allow non-web URLs.
@@ -273,8 +296,8 @@ const CLASSES: ClassExports = objc_classes! {
             if let Err(e) = url_res {
                 echo!("Couldn't open file manager at {:?}: {}", url, e);
             } else {
-                echo!("Opened file manager at {:?}, exiting.", url);
-                std::process::exit(0);
+                echo!("Opened game folder at {:?}, returning to the picker.", url);
+                env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).apps_refresh_requested = true;
             }
         },
         Err(e) => echo!("Couldn't open file manager: {}", e),
@@ -313,11 +336,13 @@ fn show_app_picker_gui(
         };
         let mut image = Image::from_bytes(bytes).unwrap();
         // should match Bundle::load_icon()
-        image.round_corners(
-            (10.0 / 57.0) * (image.dimensions().0 as f32),
-            /* four_corners: */ true,
-            /* add_sheen: */ true,
-        );
+        // Use a slightly smaller corner radius for larger icons for a cleaner look.
+                let corner_radius_px = 12.0;
+                image.round_corners(
+                    corner_radius_px,
+                    /* four_corners: */ true,
+                    /* add_sheen: */ true,
+                );
         image
     };
     let environment = Environment::new_without_app(options, icon)?;
@@ -527,7 +552,7 @@ fn app_picker_inner(
         app_frame.size,
         buttons_row_center,
         &[
-            ("File manager", "openFileManager"),
+            ("Add game folder", "openFileManager"),
             ("Quick options", "quickOptionsShow"),
         ],
         None,
@@ -556,9 +581,11 @@ fn app_picker_inner(
     let mut quick_options_analog_stick_tilt_controls = true;
     let mut quick_options_network = false;
     let mut quick_options_gles1_on_gles2 = false;
+    let mut quick_options_show_fps = false;
     let mut quick_options_device_tag: Option<i32> = None;
     let mut quick_options_device_model_open = false;
     let mut quick_options_device_model_scroll: isize = 0;
+    let mut quick_options_ios_version: Option<(i32, i32, i32)> = None;
 
     fn update_quick_option_buttons(env: &mut Environment, buttons: &[id], selected_idx: usize) {
         for (idx, &button) in buttons.iter().enumerate() {
@@ -572,6 +599,23 @@ fn app_picker_inner(
     }
     fn update_scale_hack_buttons(env: &mut Environment, buttons: &[id], value: Option<NonZeroU32>) {
         update_quick_option_buttons(env, buttons, value.map_or(0, |v| v.get() as usize));
+    }
+    fn update_ios_version_buttons(
+        env: &mut Environment,
+        buttons: &[id],
+        value: Option<(i32, i32, i32)>,
+    ) {
+        update_quick_option_buttons(
+            env,
+            buttons,
+            match value {
+                None => 0,
+                Some((4, 3, 0)) => 1,
+                Some((6, 1, 0)) => 2,
+                Some((9, 3, 0)) => 3,
+                _ => 0,
+            },
+        );
     }
     fn update_orientation_buttons(
         env: &mut Environment,
@@ -589,6 +633,11 @@ fn app_picker_inner(
             }),
         );
     }
+    update_ios_version_buttons(
+        env,
+        &quick_options_stuff.ios_version_buttons,
+        quick_options_ios_version,
+    );
     update_scale_hack_buttons(
         env,
         &quick_options_stuff.scale_hack_buttons,
@@ -681,6 +730,38 @@ fn app_picker_inner(
             () = msg![env; (quick_options_stuff.main_view) setHidden:false];
         } else if std::mem::take(&mut host_obj.quick_options_hide) {
             () = msg![env; (quick_options_stuff.main_view) setHidden:true];
+        } else if std::mem::take(&mut host_obj.apps_refresh_requested) {
+            let apps_dir = paths::user_data_base_path().join(paths::APPS_DIR);
+            match enumerate_apps(&apps_dir) {
+                Ok(new_apps) if !new_apps.is_empty() => {
+                    apps = Ok(new_apps);
+                    if let Some(icon_grid) = icon_grid_stuff.as_mut() {
+                        *icon_grid = make_icon_grid(
+                            env,
+                            delegate,
+                            main_view,
+                            app_frame,
+                            apps.as_ref().unwrap().len(),
+                            have_wallpaper,
+                        );
+                        update_icon_grid(env, icon_grid, apps.as_mut().unwrap(), 0);
+                    }
+                }
+                Ok(_) => echo!("No games found in the game folder yet."),
+                Err(e) => echo!("Couldn't refresh the game list: {}", e),
+            }
+        } else if std::mem::take(&mut host_obj.ios_version_latest) {
+            quick_options_ios_version = None;
+            update_ios_version_buttons(env, &quick_options_stuff.ios_version_buttons, quick_options_ios_version);
+        } else if std::mem::take(&mut host_obj.ios_version_43) {
+            quick_options_ios_version = Some((4, 3, 0));
+            update_ios_version_buttons(env, &quick_options_stuff.ios_version_buttons, quick_options_ios_version);
+        } else if std::mem::take(&mut host_obj.ios_version_61) {
+            quick_options_ios_version = Some((6, 1, 0));
+            update_ios_version_buttons(env, &quick_options_stuff.ios_version_buttons, quick_options_ios_version);
+        } else if std::mem::take(&mut host_obj.ios_version_93) {
+            quick_options_ios_version = Some((9, 3, 0));
+            update_ios_version_buttons(env, &quick_options_stuff.ios_version_buttons, quick_options_ios_version);
         } else if std::mem::take(&mut host_obj.scale_hack_default) {
             quick_options_scale_hack = None;
             update_scale_hack_buttons(
@@ -804,6 +885,8 @@ fn app_picker_inner(
             quick_options_network = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.gles1_on_gles2) {
             quick_options_gles1_on_gles2 = enabled;
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.show_fps) {
+            quick_options_show_fps = enabled;
         } else if let Some(fullscreen) = std::mem::take(&mut host_obj.fullscreen) {
             quick_options_fullscreen = match fullscreen {
                 false => None,
@@ -813,6 +896,9 @@ fn app_picker_inner(
     };
 
     // Apply user-specified overrides
+    if let Some((major, minor, patch)) = quick_options_ios_version {
+        option_args.push(format!("--ios-version={major}.{minor}.{patch}"));
+    }
     if let Some(scale_hack) = quick_options_scale_hack {
         option_args.push(format!("--scale-hack={}", scale_hack.get()));
     }
@@ -840,6 +926,15 @@ fn app_picker_inner(
         option_args.push("--allow-network-access".to_string());
     }
 
+    if quick_options_show_fps {
+        // Reuse existing CLI flag to enable FPS logging/counter behaviour.
+        option_args.push("--print-fps".to_string());
+        // Also enable the on-screen FPS overlay both via env var and runtime
+        // flag so users don't need to set env vars manually.
+        std::env::set_var("TOUCHHLE_ONSCREEN_FPS", "1");
+        crate::gles::present::set_onscreen_fps_enabled(true);
+    }
+
     if let Some(tag) = quick_options_device_tag {
         let tag = tag as NSInteger;
         if tag == DEVICE_TAG_DEFAULT {
@@ -858,9 +953,10 @@ fn app_picker_inner(
 }
 
 const ICON_SIZE: CGSize = CGSize {
-    width: 57.0,
-    height: 57.0,
+    width: 76.0,
+    height: 76.0,
 };
+const ICON_IMAGE_INSET: CGFloat = 10.0;
 
 enum TappedIcon {
     App(usize),
@@ -920,7 +1016,17 @@ fn make_icon_grid(
         () = msg![env; icon_button setFrame:icon_frame];
         let image_view: id = msg![env; icon_button imageView];
         let bounds: CGRect = msg![env; icon_button bounds];
-        () = msg![env; image_view setFrame:bounds];
+        let inset = ICON_IMAGE_INSET;
+        () = msg![env; image_view setFrame:(CGRect {
+            origin: CGPoint { x: inset, y: inset },
+            size: CGSize {
+                width: (bounds.size.width - inset * 2.0).max(1.0),
+                height: (bounds.size.height - inset * 2.0).max(1.0),
+            },
+        })];
+        let layer: id = msg![env; image_view layer];
+        let gravity = ns_string::get_static_str(env, "resizeAspect");
+        () = msg![env; layer setContentsGravity:gravity];
         () = msg![env; icon_button addTarget:delegate
                                       action:icon_tapped_sel
                             forControlEvents:UIControlEventTouchUpInside];
@@ -959,6 +1065,9 @@ fn make_icon_grid(
 
     // TODO: Use UIScrollView pagination and UIPageControl once available.
     let mut pages = Vec::new();
+    if total_app_count == 0 {
+        pages.push(0..0);
+    }
     let mut start = 0;
     while start < total_app_count {
         let mut end = start + icon_buttons_and_labels.len();
@@ -1035,7 +1144,7 @@ fn make_icon_from_glyph(
     let cg_image = CGBitmapContextCreateImage(env, context);
     // This radius should match the one in src/bundle.rs.
     cg_image::borrow_image_mut(&mut env.objc, cg_image).round_corners(
-        (10.0 / 57.0) * ICON_SIZE.width,
+            12.0,
         /* four_corners: */ true,
         /* add_sheen: */ true,
     );
@@ -1368,6 +1477,7 @@ fn change_copyright_page(
 
 struct QuickOptionsStuff {
     main_view: id,
+    ios_version_buttons: [id; 4],
     scale_hack_buttons: [id; 5],
     orientation_buttons: [id; 4],
     /// The button that toggles the "Device model" dropdown open/closed. Its
@@ -1506,6 +1616,18 @@ fn setup_quick_options(
         Switch(&'static str, bool),
     }
     let rows = [
+        RowKind::Label("iOS version"),
+        RowKind::Buttons(&[
+            ("Latest", "iosVersionLatest"),
+            ("4.3", "iosVersion43"),
+            ("6.1", "iosVersion61"),
+            ("9.3", "iosVersion93"),
+        ]),
+        RowKind::Label("Game folder"),
+        RowKind::Buttons(&[
+            ("Open folder", "openFileManager"),
+            ("Refresh", "refreshApps"),
+        ]),
         RowKind::Label("Scale hack"),
         RowKind::Buttons(&[
             ("Default", "scaleHackDefault"),
@@ -1525,6 +1647,8 @@ fn setup_quick_options(
         RowKind::DeviceDropdown,
         RowKind::Label("Network access"),
         RowKind::Switch("network:", false),
+        RowKind::Label("Show FPS"),
+        RowKind::Switch("showFPS:", false),
         RowKind::Label("Use analog sticks for tilt controls"),
         RowKind::Switch("analogStickTiltControls:", true),
         RowKind::Label("Use GLES1 → GLES2 translator"),
@@ -1618,8 +1742,9 @@ fn setup_quick_options(
 
     QuickOptionsStuff {
         main_view,
-        scale_hack_buttons: button_rows[0][..].try_into().unwrap(),
-        orientation_buttons: button_rows[1][..].try_into().unwrap(),
+        ios_version_buttons: button_rows[0][..].try_into().unwrap(),
+        scale_hack_buttons: button_rows[2][..].try_into().unwrap(),
+        orientation_buttons: button_rows[3][..].try_into().unwrap(),
         device_model_btn,
         device_model_menu,
         device_model_items,
