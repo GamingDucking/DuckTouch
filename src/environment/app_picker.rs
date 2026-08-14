@@ -144,11 +144,6 @@ struct AppPickerDelegateHostObject {
     device_model_toggle: bool,
     device_model_scroll_up: bool,
     device_model_scroll_down: bool,
-    apps_refresh_requested: bool,
-    ios_version_latest: bool,
-    ios_version_43: bool,
-    ios_version_61: bool,
-    ios_version_93: bool,
 }
 impl HostObject for AppPickerDelegateHostObject {}
 
@@ -268,22 +263,6 @@ const CLASSES: ClassExports = objc_classes! {
 - (())deviceModelScrollDown {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).device_model_scroll_down = true;
 }
-- (())refreshApps {
-    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).apps_refresh_requested = true;
-}
-- (())iosVersionLatest {
-    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).ios_version_latest = true;
-}
-- (())iosVersion43 {
-    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).ios_version_43 = true;
-}
-- (())iosVersion61 {
-    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).ios_version_61 = true;
-}
-- (())iosVersion93 {
-    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).ios_version_93 = true;
-}
-
 - (())openFileManager {
     // Assert (see above).
     let _ = env.objc.borrow_mut::<AppPickerDelegateHostObject>(this);
@@ -552,7 +531,7 @@ fn app_picker_inner(
         app_frame.size,
         buttons_row_center,
         &[
-            ("Add game folder", "openFileManager"),
+            ("File manager", "openFileManager"),
             ("Quick options", "quickOptionsShow"),
         ],
         None,
@@ -585,7 +564,6 @@ fn app_picker_inner(
     let mut quick_options_device_tag: Option<i32> = None;
     let mut quick_options_device_model_open = false;
     let mut quick_options_device_model_scroll: isize = 0;
-    let mut quick_options_ios_version: Option<(i32, i32, i32)> = None;
 
     fn update_quick_option_buttons(env: &mut Environment, buttons: &[id], selected_idx: usize) {
         for (idx, &button) in buttons.iter().enumerate() {
@@ -599,23 +577,6 @@ fn app_picker_inner(
     }
     fn update_scale_hack_buttons(env: &mut Environment, buttons: &[id], value: Option<NonZeroU32>) {
         update_quick_option_buttons(env, buttons, value.map_or(0, |v| v.get() as usize));
-    }
-    fn update_ios_version_buttons(
-        env: &mut Environment,
-        buttons: &[id],
-        value: Option<(i32, i32, i32)>,
-    ) {
-        update_quick_option_buttons(
-            env,
-            buttons,
-            match value {
-                None => 0,
-                Some((4, 3, 0)) => 1,
-                Some((6, 1, 0)) => 2,
-                Some((9, 3, 0)) => 3,
-                _ => 0,
-            },
-        );
     }
     fn update_orientation_buttons(
         env: &mut Environment,
@@ -633,11 +594,6 @@ fn app_picker_inner(
             }),
         );
     }
-    update_ios_version_buttons(
-        env,
-        &quick_options_stuff.ios_version_buttons,
-        quick_options_ios_version,
-    );
     update_scale_hack_buttons(
         env,
         &quick_options_stuff.scale_hack_buttons,
@@ -730,38 +686,6 @@ fn app_picker_inner(
             () = msg![env; (quick_options_stuff.main_view) setHidden:false];
         } else if std::mem::take(&mut host_obj.quick_options_hide) {
             () = msg![env; (quick_options_stuff.main_view) setHidden:true];
-        } else if std::mem::take(&mut host_obj.apps_refresh_requested) {
-            let apps_dir = paths::user_data_base_path().join(paths::APPS_DIR);
-            match enumerate_apps(&apps_dir) {
-                Ok(new_apps) if !new_apps.is_empty() => {
-                    apps = Ok(new_apps);
-                    if let Some(icon_grid) = icon_grid_stuff.as_mut() {
-                        *icon_grid = make_icon_grid(
-                            env,
-                            delegate,
-                            main_view,
-                            app_frame,
-                            apps.as_ref().unwrap().len(),
-                            have_wallpaper,
-                        );
-                        update_icon_grid(env, icon_grid, apps.as_mut().unwrap(), 0);
-                    }
-                }
-                Ok(_) => echo!("No games found in the game folder yet."),
-                Err(e) => echo!("Couldn't refresh the game list: {}", e),
-            }
-        } else if std::mem::take(&mut host_obj.ios_version_latest) {
-            quick_options_ios_version = None;
-            update_ios_version_buttons(env, &quick_options_stuff.ios_version_buttons, quick_options_ios_version);
-        } else if std::mem::take(&mut host_obj.ios_version_43) {
-            quick_options_ios_version = Some((4, 3, 0));
-            update_ios_version_buttons(env, &quick_options_stuff.ios_version_buttons, quick_options_ios_version);
-        } else if std::mem::take(&mut host_obj.ios_version_61) {
-            quick_options_ios_version = Some((6, 1, 0));
-            update_ios_version_buttons(env, &quick_options_stuff.ios_version_buttons, quick_options_ios_version);
-        } else if std::mem::take(&mut host_obj.ios_version_93) {
-            quick_options_ios_version = Some((9, 3, 0));
-            update_ios_version_buttons(env, &quick_options_stuff.ios_version_buttons, quick_options_ios_version);
         } else if std::mem::take(&mut host_obj.scale_hack_default) {
             quick_options_scale_hack = None;
             update_scale_hack_buttons(
@@ -896,9 +820,6 @@ fn app_picker_inner(
     };
 
     // Apply user-specified overrides
-    if let Some((major, minor, patch)) = quick_options_ios_version {
-        option_args.push(format!("--ios-version={major}.{minor}.{patch}"));
-    }
     if let Some(scale_hack) = quick_options_scale_hack {
         option_args.push(format!("--scale-hack={}", scale_hack.get()));
     }
@@ -1477,7 +1398,6 @@ fn change_copyright_page(
 
 struct QuickOptionsStuff {
     main_view: id,
-    ios_version_buttons: [id; 4],
     scale_hack_buttons: [id; 5],
     orientation_buttons: [id; 4],
     /// The button that toggles the "Device model" dropdown open/closed. Its
@@ -1616,18 +1536,6 @@ fn setup_quick_options(
         Switch(&'static str, bool),
     }
     let rows = [
-        RowKind::Label("iOS version"),
-        RowKind::Buttons(&[
-            ("Latest", "iosVersionLatest"),
-            ("4.3", "iosVersion43"),
-            ("6.1", "iosVersion61"),
-            ("9.3", "iosVersion93"),
-        ]),
-        RowKind::Label("Game folder"),
-        RowKind::Buttons(&[
-            ("Open folder", "openFileManager"),
-            ("Refresh", "refreshApps"),
-        ]),
         RowKind::Label("Scale hack"),
         RowKind::Buttons(&[
             ("Default", "scaleHackDefault"),
@@ -1742,9 +1650,8 @@ fn setup_quick_options(
 
     QuickOptionsStuff {
         main_view,
-        ios_version_buttons: button_rows[0][..].try_into().unwrap(),
-        scale_hack_buttons: button_rows[2][..].try_into().unwrap(),
-        orientation_buttons: button_rows[3][..].try_into().unwrap(),
+        scale_hack_buttons: button_rows[0][..].try_into().unwrap(),
+        orientation_buttons: button_rows[1][..].try_into().unwrap(),
         device_model_btn,
         device_model_menu,
         device_model_items,
