@@ -24,6 +24,7 @@ use sdl2::mouse::MouseButton;
 use sdl2::pixels::PixelFormatEnum;
 use sdl2::surface::Surface;
 use sdl2_sys::SDL_PowerState;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::f32::consts::{FRAC_PI_2, PI};
@@ -656,6 +657,9 @@ pub struct Window {
     virtual_cursor_last: Option<(f32, f32, bool, bool)>,
     virtual_cursor_last_unsticky: Option<(f32, f32, Instant)>,
     virtual_accelerometer_last: Option<(f32, f32, bool)>,
+    show_fps_counter: Cell<bool>,
+    fps_frame_count: Cell<u32>,
+    fps_last_log: RefCell<Instant>,
     /// Whether or not we are on the "main" environment stack (rather than
     /// a coroutine stack). Checked in various functions to make sure that
     /// certain SDL functions (that call JNI functions) are on the main
@@ -877,6 +881,9 @@ impl Window {
             virtual_cursor_last: None,
             virtual_cursor_last_unsticky: None,
             virtual_accelerometer_last: None,
+            show_fps_counter: Cell::new(false),
+            fps_frame_count: Cell::new(0),
+            fps_last_log: RefCell::new(Instant::now()),
             on_main_stack: true,
         };
 

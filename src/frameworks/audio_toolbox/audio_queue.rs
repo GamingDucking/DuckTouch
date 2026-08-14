@@ -1020,7 +1020,7 @@ pub fn decode_buffer(
             let actual_bytes_per_frame = format.channels_per_frame * bytes_per_channel;
             let actual_channels_per_frame = format.bytes_per_frame / bytes_per_channel;
 
-            let processed_data: Vec<u8> = if actual_bytes_per_frame == format.bytes_per_frame {
+            let mut processed_data: Vec<u8> = if actual_bytes_per_frame == format.bytes_per_frame {
                 data_slice.to_owned()
             } else {
                 let actual_frame_count = data_slice.len() / actual_bytes_per_frame as usize;
@@ -1291,21 +1291,21 @@ fn prime_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
             );
             let err = context.GetError();
             if err != 0 {
-                log!("Warning: audio queue {} OpenAL query failed: {:#x}; skipping refill.", in_aq, err);
+                log!("Warning: audio queue {:?} OpenAL query failed: {:#x}; skipping refill.", in_aq, err);
                 break;
             }
         }
         let Ok(al_buffers_queued) = usize::try_from(al_buffers_queued) else {
-            log!("Warning: audio queue {} reported negative queued-buffer count.", in_aq);
+            log!("Warning: audio queue {:?} reported negative queued-buffer count.", in_aq);
             break;
         };
         let Ok(al_buffers_processed) = usize::try_from(al_buffers_processed) else {
-            log!("Warning: audio queue {} reported negative processed-buffer count.", in_aq);
+            log!("Warning: audio queue {:?} reported negative processed-buffer count.", in_aq);
             break;
         };
 
         if al_buffers_processed > al_buffers_queued || al_buffers_queued > host_object.buffer_queue.len() {
-            log!("Warning: audio queue {} reported inconsistent buffer counts (queued={}, processed={}, tracked={}); skipping refill.", in_aq, al_buffers_queued, al_buffers_processed, host_object.buffer_queue.len());
+            log!("Warning: audio queue {:?} reported inconsistent buffer counts (queued={}, processed={}, tracked={}); skipping refill.", in_aq, al_buffers_queued, al_buffers_processed, host_object.buffer_queue.len());
             break;
         }
         let unprocessed_buffers = al_buffers_queued - al_buffers_processed;
@@ -1324,16 +1324,19 @@ fn prime_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
             in_aq
         );
 
-        let next_al_buffer = host_object.al_unused_buffers.pop().unwrap_or_else(|| {
-            let mut al_buffer = 0;
-            unsafe { context.GenBuffers(1, &mut al_buffer) };
-            let err = unsafe { context.GetError() };
-            if err != 0 || al_buffer == 0 {
-                log!("Warning: audio queue {} could not allocate an OpenAL buffer: {:#x}; stopping refill.", in_aq, err);
-                return;
+        let next_al_buffer = match host_object.al_unused_buffers.pop() {
+            Some(buffer) => buffer,
+            None => {
+                let mut al_buffer = 0;
+                unsafe { context.GenBuffers(1, &mut al_buffer) };
+                let err = unsafe { context.GetError() };
+                if err != 0 || al_buffer == 0 {
+                    log!("Warning: audio queue {:?} could not allocate an OpenAL buffer: {:#x}; stopping refill.", in_aq, err);
+                    break;
+                }
+                al_buffer
             }
-            al_buffer
-        });
+        };
 
         let (al_format, al_frequency, data) = decode_buffer(
             &env.mem,
