@@ -200,6 +200,27 @@ pub fn try_decode_pvrtc(
         _ => return false,
     };
 
+    // The `COMPRESSED_RGB_PVRTC_*` formats have a base internal format of RGB
+    // per the IMG_texture_compression_pvrtc spec, so their sampled alpha must
+    // be 1.0. The `COMPRESSED_RGBA_PVRTC_*` formats carry real alpha.
+    let is_opaque = matches!(
+        internalformat,
+        gles11::COMPRESSED_RGB_PVRTC_4BPPV1_IMG | gles11::COMPRESSED_RGB_PVRTC_2BPPV1_IMG
+    );
+    // OpenGL ES 1.1 and ES 2.0 both require `internalformat` to match `format`
+    // exactly in glTexImage2D — ES performs no format conversion, so a mismatch
+    // raises GL_INVALID_OPERATION (0x502) on strict drivers such as the native
+    // Qualcomm Adreno ES driver (per the Khronos OpenGL ES 2.0 glTexImage2D
+    // reference). The decoder always emits tightly-packed RGBA8 and, for the
+    // opaque `COMPRESSED_RGB_PVRTC_*` variants, `decode_pvrtc_with_alpha` has
+    // already forced every alpha byte to 0xFF, so sampling as RGBA yields the
+    // same 1.0 alpha the RGB base format would. We therefore always upload with
+    // matching RGBA/RGBA internalformat/format to stay spec-compliant on both
+    // native backends. Uploading an RGB internalformat with an RGBA `format`
+    // (the previous behaviour) black-screened Rush Rally 2 on Adreno because
+    // every opaque PVRTC upload failed with 0x502.
+    let upload_format = gles11::RGBA;
+
     if border != 0 {
         log!(
             "Warning: try_decode_pvrtc: invalid non-zero border ({border}) for PVRTC \
@@ -246,125 +267,25 @@ pub fn try_decode_pvrtc(
         return true;
     }
 
-    let is_opaque = matches!(
-        internalformat,
-        gles11::COMPRESSED_RGB_PVRTC_4BPPV1_IMG | gles11::COMPRESSED_RGB_PVRTC_2BPPV1_IMG
-    );
-    let upload_format = gles11::RGBA;
     let pixels =
         crate::image::decode_pvrtc_with_alpha(pvrtc_data, is_2bit, width_u, height_u, is_opaque);
     unsafe {
         gles.TexImage2D(
             target,
             level,
+            // Always RGBA: it must match the `format` argument below, and the
+            // decoder has baked the correct (1.0 for opaque) alpha into the
+            // tightly-packed RGBA8 pixel data.
             upload_format as _,
             width,
             height,
             border,
-            upload_format,
+            gles11::RGBA,
             gles11::UNSIGNED_BYTE,
             pixels.as_ptr() as *const _,
         )
     };
     true
-}
-
-/// Convert an uncompressed guest texture to RGBA8888 so GLES backends do not
-/// depend on optional BGRA or packed-pixel upload support.
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn decode_texture_to_rgba8(
-    width: GLsizei,
-    height: GLsizei,
-    format: GLenum,
-    type_: GLenum,
-    pixels: *const std::ffi::c_void,
-    unpack_alignment: GLint,
-) -> Option<Vec<u8>> {
-    if pixels.is_null() || width < 0 || height < 0 {
-        return None;
-    }
-    let width = width as usize;
-    let height = height as usize;
-    let bytes_per_pixel = match type_ {
-        gles11::UNSIGNED_BYTE => match format {
-            gles11::ALPHA | gles11::LUMINANCE => 1,
-            gles11::LUMINANCE_ALPHA => 2,
-            gles11::RGB => 3,
-            gles11::RGBA | gles11::BGRA_EXT => 4,
-            _ => return None,
-        },
-        gles11::UNSIGNED_SHORT_5_6_5
-        | gles11::UNSIGNED_SHORT_4_4_4_4
-        | gles11::UNSIGNED_SHORT_5_5_5_1 => 2,
-        _ => return None,
-    };
-    let alignment = unpack_alignment.max(1) as usize;
-    let row_bytes = width.checked_mul(bytes_per_pixel)?;
-    let row_stride = row_bytes.checked_add(alignment - 1)? / alignment * alignment;
-    let output_len = width.checked_mul(height)?.checked_mul(4)?;
-    let mut output = vec![0u8; output_len];
-    for y in 0..height {
-        let row = (pixels as *const u8).add(y * row_stride);
-        for x in 0..width {
-            let src = row.add(x * bytes_per_pixel);
-            let dst = output.as_mut_ptr().add((y * width + x) * 4);
-            let (r, g, b, a) = match type_ {
-                gles11::UNSIGNED_BYTE => match format {
-                    gles11::ALPHA => (255, 255, 255, src.read()),
-                    gles11::LUMINANCE => {
-                        let l = src.read();
-                        (l, l, l, 255)
-                    }
-                    gles11::LUMINANCE_ALPHA => {
-                        let l = src.read();
-                        (l, l, l, src.add(1).read())
-                    }
-                    gles11::RGB => (src.read(), src.add(1).read(), src.add(2).read(), 255),
-                    gles11::RGBA => (
-                        src.read(),
-                        src.add(1).read(),
-                        src.add(2).read(),
-                        src.add(3).read(),
-                    ),
-                    gles11::BGRA_EXT => (
-                        src.add(2).read(),
-                        src.add(1).read(),
-                        src.read(),
-                        src.add(3).read(),
-                    ),
-                    _ => return None,
-                },
-                gles11::UNSIGNED_SHORT_5_6_5
-                | gles11::UNSIGNED_SHORT_4_4_4_4
-                | gles11::UNSIGNED_SHORT_5_5_5_1 => {
-                    let value = (src as *const u16).read_unaligned();
-                    match type_ {
-                        gles11::UNSIGNED_SHORT_5_6_5 => (
-                            ((((value >> 11) & 0x1f) as u32 * 255 / 31) as u8),
-                            ((((value >> 5) & 0x3f) as u32 * 255 / 63) as u8),
-                            (((value & 0x1f) as u32 * 255 / 31) as u8),
-                            255,
-                        ),
-                        gles11::UNSIGNED_SHORT_4_4_4_4 => (
-                            ((((value >> 12) & 0xf) as u8) * 17),
-                            ((((value >> 8) & 0xf) as u8) * 17),
-                            ((((value >> 4) & 0xf) as u8) * 17),
-                            (((value & 0xf) as u8) * 17),
-                        ),
-                        _ => (
-                            ((((value >> 11) & 0x1f) as u32 * 255 / 31) as u8),
-                            ((((value >> 6) & 0x1f) as u32 * 255 / 31) as u8),
-                            ((((value >> 1) & 0x1f) as u32 * 255 / 31) as u8),
-                            if value & 1 == 0 { 0 } else { 255 },
-                        ),
-                    }
-                }
-                _ => return None,
-            };
-            std::slice::from_raw_parts_mut(dst, 4).copy_from_slice(&[r, g, b, a]);
-        }
-    }
-    Some(output)
 }
 
 pub struct PalettedTextureFormat {
@@ -378,51 +299,6 @@ pub struct PalettedTextureFormat {
     pub palette_entry_type: GLenum,
 }
 impl PalettedTextureFormat {
-    pub fn decode_rgba8(internalformat: GLenum, width: GLsizei, height: GLsizei, payload: &[u8]) -> Option<Vec<u8>> {
-        let info = Self::get_info(internalformat)?;
-        let width = usize::try_from(width).ok()?;
-        let height = usize::try_from(height).ok()?;
-        let entry_size = match info.palette_entry_type {
-            gles11::UNSIGNED_BYTE => if info.palette_entry_format == gles11::RGB { 3 } else { 4 },
-            gles11::UNSIGNED_SHORT_5_6_5 | gles11::UNSIGNED_SHORT_4_4_4_4 | gles11::UNSIGNED_SHORT_5_5_5_1 => 2,
-            _ => return None,
-        };
-        let palette_count: usize = if info.index_is_nibble { 16 } else { 256 };
-        let palette_size = palette_count.checked_mul(entry_size)?;
-        let pixel_count = width.checked_mul(height)?;
-        let index_size = if info.index_is_nibble { pixel_count.checked_add(1)? / 2 } else { pixel_count };
-        let total_size = palette_size.checked_add(index_size)?;
-        if payload.len() < total_size { return None; }
-        let (palette, indices) = payload.split_at(palette_size);
-        let mut output = Vec::with_capacity(pixel_count.checked_mul(4)?);
-        for pixel in 0..pixel_count {
-            let index = if info.index_is_nibble {
-                let byte = indices[pixel / 2];
-                if pixel % 2 == 0 { byte >> 4 } else { byte & 0xf }
-            } else { indices[pixel] } as usize;
-            let entry = &palette[index * entry_size..][..entry_size];
-            let (r, g, b, a) = match info.palette_entry_type {
-                gles11::UNSIGNED_BYTE if entry_size == 3 => (entry[0], entry[1], entry[2], 255),
-                gles11::UNSIGNED_BYTE => (entry[0], entry[1], entry[2], entry[3]),
-                gles11::UNSIGNED_SHORT_5_6_5 => {
-                    let value = u16::from_ne_bytes([entry[0], entry[1]]);
-                    ((((value >> 11) & 31) as u32 * 255 / 31) as u8, (((value >> 5) & 63) as u32 * 255 / 63) as u8, ((value & 31) as u32 * 255 / 31) as u8, 255)
-                }
-                gles11::UNSIGNED_SHORT_4_4_4_4 => {
-                    let value = u16::from_ne_bytes([entry[0], entry[1]]);
-                    ((((value >> 12) & 15) as u8) * 17, (((value >> 8) & 15) as u8) * 17, (((value >> 4) & 15) as u8) * 17, ((value & 15) as u8) * 17)
-                }
-                gles11::UNSIGNED_SHORT_5_5_5_1 => {
-                    let value = u16::from_ne_bytes([entry[0], entry[1]]);
-                    ((((value >> 11) & 31) as u32 * 255 / 31) as u8, (((value >> 6) & 31) as u32 * 255 / 31) as u8, (((value >> 1) & 31) as u32 * 255 / 31) as u8, if value & 1 == 0 { 0 } else { 255 })
-                }
-                _ => return None,
-            };
-            output.extend_from_slice(&[r, g, b, a]);
-        }
-        Some(output)
-    }
-
     /// If the provided format is from `OES_compressed_paletted_texture`,
     /// return [Some] with information about it, or [None] otherwise.
     pub fn get_info(internalformat: GLenum) -> Option<Self> {
