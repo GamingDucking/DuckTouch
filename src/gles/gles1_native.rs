@@ -12,8 +12,9 @@ use super::gles_generic::GLES;
 use super::util::{try_decode_pvrtc, PalettedTextureFormat};
 use super::GLESContext;
 use crate::window::{GLContext, GLVersion, Window};
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
+use std::sync::{Mutex, OnceLock};
 
 pub struct GLES1NativeContext {
     gl_ctx: GLContext,
@@ -164,14 +165,18 @@ impl GLES for GLES1Native<'_> {
         true
     }
     unsafe fn driver_description(&self) -> String {
-        let version = CStr::from_ptr(gles11::GetString(gles11::VERSION) as *const _);
-        let vendor = CStr::from_ptr(gles11::GetString(gles11::VENDOR) as *const _);
-        let renderer = CStr::from_ptr(gles11::GetString(gles11::RENDERER) as *const _);
+        fn gl_string(name: GLenum) -> String {
+            let ptr = gles11::GetString(name);
+            if ptr.is_null() {
+                return "<unavailable>".to_string();
+            }
+            CStr::from_ptr(ptr as *const _).to_string_lossy().into_owned()
+        }
         format!(
             "{} / {} / {}",
-            version.to_string_lossy(),
-            vendor.to_string_lossy(),
-            renderer.to_string_lossy()
+            gl_string(gles11::VERSION),
+            gl_string(gles11::VENDOR),
+            gl_string(gles11::RENDERER)
         )
     }
 
@@ -268,21 +273,25 @@ impl GLES for GLES1Native<'_> {
     // MALI HACK: Прячем сломанные расширения
     unsafe fn GetString(&mut self, name: GLenum) -> *const GLubyte {
         if name == gles11::EXTENSIONS {
-            static mut FILTERED_EXTS: *mut std::os::raw::c_char = std::ptr::null_mut();
-            if FILTERED_EXTS.is_null() {
-                let orig_ptr = gles11::GetString(name);
-                if !orig_ptr.is_null() {
-                    let orig_str = std::ffi::CStr::from_ptr(orig_ptr as *const _).to_string_lossy();
-                    // Вырезаем OES_matrix_palette чтобы заставить AC2
-                    // использовать CPU анимацию
-                    let filtered = orig_str.replace("GL_OES_matrix_palette", "");
-                    let c_str = std::ffi::CString::new(filtered).unwrap();
-                    FILTERED_EXTS = c_str.into_raw();
-                } else {
-                    return std::ptr::null();
-                }
-            }
-            return FILTERED_EXTS as *const GLubyte;
+            static FILTERED_EXTS: OnceLock<Mutex<Option<CString>>> = OnceLock::new();
+            return FILTERED_EXTS
+                .get_or_init(|| {
+                    let original = gles11::GetString(name);
+                    if original.is_null() {
+                        return Mutex::new(None);
+                    }
+                    let original = CStr::from_ptr(original as *const _).to_string_lossy();
+                    let filtered = original
+                        .split_whitespace()
+                        .filter(|extension| *extension != "GL_OES_matrix_palette")
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    Mutex::new(CString::new(filtered).ok())
+                })
+                .lock()
+                .ok()
+                .and_then(|guard| guard.as_ref().map(|value| value.as_ptr() as *const GLubyte))
+                .unwrap_or(std::ptr::null());
         }
         gles11::GetString(name)
     }
@@ -990,17 +999,19 @@ impl GLES for GLES1Native<'_> {
     }
 
     unsafe fn TexEnvfv(&mut self, target: GLenum, pname: GLenum, params: *const GLfloat) {
-        if target == gles11::TEXTURE_FILTER_CONTROL_EXT {
-            assert!(pname == gles11::TEXTURE_LOD_BIAS_EXT);
-            unsafe {
-                if !CStr::from_ptr(gles11::GetString(gles11::EXTENSIONS) as _)
-                    .to_str()
-                    .unwrap()
-                    .contains("EXT_texture_lod_bias")
-                {
-                    return;
-                }
-            };
+        if target == gles11::TEXTURE_FILTER_CONTROL_EXT && pname == gles11::TEXTURE_LOD_BIAS_EXT {
+            let extensions = gles11::GetString(gles11::EXTENSIONS);
+            if extensions.is_null()
+                || !CStr::from_ptr(extensions as *const _)
+                    .to_string_lossy()
+                    .split_whitespace()
+                    .any(|extension| extension == "GL_EXT_texture_lod_bias")
+            {
+                return;
+            }
+        }
+        if params.is_null() {
+            return;
         }
         gles11::TexEnvfv(target, pname, params)
     }
