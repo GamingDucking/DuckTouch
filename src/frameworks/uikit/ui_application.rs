@@ -573,7 +573,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())registerForRemoteNotificationTypes:(UIRemoteNotificationType)types {
-    log!("TODO: ignoring registerForRemoteNotificationTypes:{}", types);
+    log_dbg!("registerForRemoteNotificationTypes: {}", types);
+    env.objc.borrow_mut::<UIApplicationHostObject>(this).registered_notification_types = types;
 }
 
 // `- (UIRemoteNotificationType)enabledRemoteNotificationTypes` —
