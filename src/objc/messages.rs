@@ -129,6 +129,11 @@ fn objc_msgSend_inner(
         selector.as_str(&env.mem),
         receiver
     );
+    log!(
+        "[MSG TRACE] receiver={:#010x} selector={}",
+        receiver.to_bits(),
+        selector.as_str(&env.mem)
+    );
     // Host-side recursion guard. If an Objective-C method (typically
     // `hitTest:withEvent:` or `pointInside:withEvent:`) ends up recursing
     // into itself indirectly, the host call stack balloons because every
