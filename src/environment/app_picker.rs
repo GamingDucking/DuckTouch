@@ -314,13 +314,11 @@ fn show_app_picker_gui(
         };
         let mut image = Image::from_bytes(bytes).unwrap();
         // should match Bundle::load_icon()
-        // Use a slightly smaller corner radius for larger icons for a cleaner look.
-                let corner_radius_px = 12.0;
-                image.round_corners(
-                    corner_radius_px,
-                    /* four_corners: */ true,
-                    /* add_sheen: */ true,
-                );
+        image.round_corners(
+            (10.0 / 57.0) * (image.dimensions().0 as f32),
+            /* four_corners: */ true,
+            /* add_sheen: */ true,
+        );
         image
     };
     let environment = Environment::new_without_app(options, icon)?;
@@ -873,8 +871,8 @@ fn app_picker_inner(
 }
 
 const ICON_SIZE: CGSize = CGSize {
-    width: 76.0,
-    height: 76.0,
+    width: 57.0,
+    height: 57.0,
 };
 const ICON_IMAGE_INSET: CGFloat = 10.0;
 
@@ -1064,7 +1062,7 @@ fn make_icon_from_glyph(
     let cg_image = CGBitmapContextCreateImage(env, context);
     // This radius should match the one in src/bundle.rs.
     cg_image::borrow_image_mut(&mut env.objc, cg_image).round_corners(
-            12.0,
+            (10.0 / 57.0) * ICON_SIZE.width,
         /* four_corners: */ true,
         /* add_sheen: */ true,
     );
