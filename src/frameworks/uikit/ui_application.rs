@@ -85,6 +85,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         application_icon_badge_number: 0,
         remote_notifications_registered: false,
         user_notification_settings: nil,
+        registered_notification_types: 0,
     });
     env.objc.alloc_static_object(this, host_object, &mut env.mem)
 }
