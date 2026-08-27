@@ -40,6 +40,7 @@ struct UIApplicationHostObject {
     application_icon_badge_number: NSInteger,
     remote_notifications_registered: bool,
     user_notification_settings: id,
+    registered_notification_types: NSUInteger,
 }
 impl HostObject for UIApplicationHostObject {}
 
