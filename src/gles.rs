@@ -82,6 +82,7 @@ pub use touchHLE_gl_bindings::gles2 as gles2_raw;
 pub use touchHLE_gl_bindings::gles30 as gles30_raw;
 
 use crate::environment::Environment;
+use crate::window::GLVersion;
 use gles1_native::GLES1NativeContext;
 use gles1_on_gl2::GLES1OnGL2Context;
 use gles1_on_gles2::GLES1OnGLES2Context;
@@ -91,6 +92,69 @@ use gles3_native::GLES3NativeContext;
 use gles3_on_gl3::GLES3OnGL3Context;
 pub use gles_generic::GLESContext;
 pub use gles_generic::GLES;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+static TRANSLATOR_TRACE_EVENTS: AtomicU32 = AtomicU32::new(0);
+
+pub(crate) fn configure_translator_tracing(_enabled: bool) {}
+
+pub(crate) fn translator_tracing_enabled() -> bool {
+    std::env::var_os("TOUCHHLE_TRACE_TRANSLATOR").is_some()
+}
+
+pub(crate) fn trace_translator_event(event: String) {
+    if !translator_tracing_enabled() {
+        return;
+    }
+    let number = TRANSLATOR_TRACE_EVENTS.fetch_add(1, Ordering::Relaxed);
+    if number < 512 {
+        log!("[translator] #{:03} {}", number + 1, event);
+    } else if number == 512 {
+        log!("[translator] further events suppressed after 512 entries");
+    }
+}
+
+pub fn configure_angle_driver(enabled: bool) {
+    if !enabled {
+        return;
+    }
+
+    let default_egl = if cfg!(target_os = "windows") {
+        "libEGL.dll"
+    } else if cfg!(target_os = "macos") {
+        "libEGL.dylib"
+    } else {
+        "libEGL.so"
+    };
+    let default_gles = if cfg!(target_os = "windows") {
+        "libGLESv2.dll"
+    } else if cfg!(target_os = "macos") {
+        "libGLESv2.dylib"
+    } else {
+        "libGLESv2.so"
+    };
+    let egl_path = std::env::var("TOUCHHLE_ANGLE_EGL").unwrap_or_else(|_| default_egl.to_owned());
+    let gles_path =
+        std::env::var("TOUCHHLE_ANGLE_GLES").unwrap_or_else(|_| default_gles.to_owned());
+    let egl_exists = std::path::Path::new(&egl_path).exists();
+    let gles_exists = std::path::Path::new(&gles_path).exists();
+
+    unsafe {
+        std::env::set_var("SDL_VIDEO_EGL_DRIVER", &egl_path);
+        std::env::set_var("SDL_VIDEO_GL_DRIVER", &gles_path);
+    }
+    sdl2::hint::set("SDL_OPENGL_ES_DRIVER", "1");
+    log!(
+        "ANGLE override requested: EGL={} (exists={}), GLES={} (exists={}); SDL will try these before the first window",
+        egl_path,
+        egl_exists,
+        gles_path,
+        gles_exists
+    );
+    if !egl_exists || !gles_exists {
+        log!("ANGLE libraries are not present at the configured paths; SDL may fall back or context creation may fail");
+    }
+}
 
 /// Labels for [GLES] implementations and an abstraction for constructing them.
 #[derive(Copy, Clone)]
@@ -99,6 +163,7 @@ pub enum GLESImplementation {
     GLES1Native,
     /// [gles1_on_gl2::GLES1OnGL2].
     GLES1OnGL2,
+    /// [gles1_on_gles2::GLES1OnGLES2].
     GLES1OnGLES2,
 }
 impl GLESImplementation {
@@ -136,6 +201,39 @@ impl GLESImplementation {
             Self::GLES1OnGLES2 => GLES1OnGLES2Context::new(window).map(boxer),
         }
     }
+}
+
+pub fn create_gles1_translator_ctx_no_parent_stack(
+    window: &mut crate::window::Window,
+) -> Box<dyn GLESContext> {
+    assert!(window.on_main_stack());
+    log!("Creating the OpenGL ES 1.1 to native OpenGL ES 2.0 translator");
+    Box::new(
+        GLES1OnGLES2Context::new(window)
+            .expect("Couldn't create OpenGL ES 1.1-on-GLES2 translator context!"),
+    )
+}
+pub fn create_gles1_gles3_translator_ctx_no_parent_stack(
+    window: &mut crate::window::Window,
+) -> Box<dyn GLESContext> {
+    assert!(window.on_main_stack());
+    log!("Creating the OpenGL ES 1.1 to native OpenGL ES 3.0 translator");
+    Box::new(
+        GLES1OnGLES2Context::new_with_gl_version(window, GLVersion::GLES30)
+            .expect("Couldn't create OpenGL ES 1.1-on-GLES3 translator context!"),
+    )
+}
+
+pub fn create_gles1_gles3_translator_ctx(env: &mut Environment) -> Box<dyn GLESContext> {
+    env.on_parent_stack_in_coroutine(|window, _options| {
+        create_gles1_gles3_translator_ctx_no_parent_stack(window)
+    })
+}
+
+pub fn create_gles1_translator_ctx(env: &mut Environment) -> Box<dyn GLESContext> {
+    env.on_parent_stack_in_coroutine(|window, _options| {
+        create_gles1_translator_ctx_no_parent_stack(window)
+    })
 }
 
 /// Try to create an OpenGL ES 1.1 context using the configured strategies,

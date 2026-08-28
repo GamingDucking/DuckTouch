@@ -20,7 +20,7 @@ use super::gles11_raw as gles11;
 use super::gles11_raw::types::*;
 use super::gles30_raw as gles30;
 use super::gles_generic::{GLchar, GLES};
-use super::util::{fixed_to_float, try_decode_pvrtc, PalettedTextureFormat};
+use super::util::{try_decode_pvrtc, PalettedTextureFormat};
 use super::GLESContext;
 use crate::window::{GLContext, GLVersion, Window};
 use std::ffi::CStr;
@@ -286,30 +286,6 @@ impl GLES for GLES3Native<'_> {
     unsafe fn GetString(&mut self, name: GLenum) -> *const GLubyte {
         gles30::GetString(name)
     }
-    unsafe fn Fogf(&mut self, _pname: GLenum, _param: GLfloat) {}
-    unsafe fn Fogx(&mut self, _pname: GLenum, _param: GLfixed) {}
-    unsafe fn Fogfv(&mut self, _pname: GLenum, _params: *const GLfloat) {}
-    unsafe fn Fogxv(&mut self, _pname: GLenum, _params: *const GLfixed) {}
-    unsafe fn Lightx(&mut self, _light: GLenum, _pname: GLenum, _param: GLfixed) {}
-
-    unsafe fn ClearColorx(&mut self, r: GLclampx, g: GLclampx, b: GLclampx, a: GLclampx) {
-        self.ClearColor(fixed_to_float(r), fixed_to_float(g), fixed_to_float(b), fixed_to_float(a));
-    }
-    unsafe fn ClearDepthx(&mut self, depth: GLfixed) {
-        self.ClearDepthf(fixed_to_float(depth));
-    }
-    unsafe fn DepthRangex(&mut self, near: GLclampx, far: GLclampx) {
-        self.DepthRangef(fixed_to_float(near), fixed_to_float(far));
-    }
-    unsafe fn LineWidthx(&mut self, width: GLfixed) {
-        self.LineWidth(fixed_to_float(width));
-    }
-    unsafe fn PolygonOffsetx(&mut self, factor: GLfixed, units: GLfixed) {
-        self.PolygonOffset(fixed_to_float(factor), fixed_to_float(units));
-    }
-    unsafe fn SampleCoveragex(&mut self, value: GLclampx, invert: GLboolean) {
-        self.SampleCoverage(fixed_to_float(value), invert);
-    }
 
     // Other state manipulation
     unsafe fn BlendFunc(&mut self, sfactor: GLenum, dfactor: GLenum) {
@@ -504,7 +480,7 @@ impl GLES for GLES3Native<'_> {
         &mut self,
         target: GLenum,
         level: GLint,
-        internalformat: GLint,
+        mut internalformat: GLint,
         width: GLsizei,
         height: GLsizei,
         border: GLint,
@@ -512,15 +488,13 @@ impl GLES for GLES3Native<'_> {
         type_: GLenum,
         pixels: *const GLvoid,
     ) {
-        let host_internalformat = if format == gles11::BGRA_EXT {
-            gles11::BGRA_EXT as GLint
-        } else {
-            internalformat
-        };
+        if format == gles11::BGRA_EXT {
+            internalformat = gles11::BGRA_EXT as GLint;
+        }
         gles30::TexImage2D(
             target,
             level,
-            host_internalformat,
+            internalformat,
             width,
             height,
             border,
@@ -568,7 +542,7 @@ impl GLES for GLES3Native<'_> {
         // GL_INVALID_ENUM and leaves the texture in its default (black)
         // state. Mirror the behaviour of the ES 1.1 backends here and
         // software-decode PVRTC to plain RGBA when the host can't do it.
-        if !self.pvrtc_native && !data.is_null() && image_size > 0 && width > 0 && height > 0 {
+        if !self.pvrtc_native && !data.is_null() && image_size > 0 {
             let payload = std::slice::from_raw_parts(data.cast::<u8>(), image_size as usize);
             if try_decode_pvrtc(
                 self,
@@ -1228,6 +1202,27 @@ impl GLES for GLES3Native<'_> {
     // keeps the existing `present_renderbuffer` save/restore code paths quiet
     // without crashing. Real apps that rely on a true ES 2.0 driver will not
     // call these.
+    unsafe fn Fogf(&mut self, _pname: GLenum, _param: GLfloat) {}
+    unsafe fn Fogx(&mut self, _pname: GLenum, _param: GLfixed) {}
+    unsafe fn Fogfv(&mut self, _pname: GLenum, _params: *const GLfloat) {}
+    unsafe fn Fogxv(&mut self, _pname: GLenum, _params: *const GLfixed) {}
+    unsafe fn Lightf(&mut self, _light: GLenum, _pname: GLenum, _param: GLfloat) {}
+    unsafe fn Lightx(&mut self, _light: GLenum, _pname: GLenum, _param: GLfixed) {}
+    unsafe fn Lightfv(&mut self, _light: GLenum, _pname: GLenum, _params: *const GLfloat) {}
+    unsafe fn Lightxv(&mut self, _light: GLenum, _pname: GLenum, _params: *const GLfixed) {}
+    unsafe fn LightModelf(&mut self, _pname: GLenum, _param: GLfloat) {}
+    unsafe fn LightModelx(&mut self, _pname: GLenum, _param: GLfixed) {}
+    unsafe fn LightModelfv(&mut self, _pname: GLenum, _params: *const GLfloat) {}
+    unsafe fn LightModelxv(&mut self, _pname: GLenum, _params: *const GLfixed) {}
+    unsafe fn Materialf(&mut self, _face: GLenum, _pname: GLenum, _param: GLfloat) {}
+    unsafe fn Materialx(&mut self, _face: GLenum, _pname: GLenum, _param: GLfixed) {}
+    unsafe fn Materialfv(&mut self, _face: GLenum, _pname: GLenum, _params: *const GLfloat) {}
+    unsafe fn Materialxv(&mut self, _face: GLenum, _pname: GLenum, _params: *const GLfixed) {}
+    unsafe fn GetLightfv(&mut self, _light: GLenum, _pname: GLenum, _params: *mut GLfloat) {}
+    unsafe fn GetLightxv(&mut self, _light: GLenum, _pname: GLenum, _params: *mut GLfixed) {}
+    unsafe fn GetMaterialfv(&mut self, _face: GLenum, _pname: GLenum, _params: *mut GLfloat) {}
+    unsafe fn GetMaterialxv(&mut self, _face: GLenum, _pname: GLenum, _params: *mut GLfixed) {}
+
     unsafe fn ClientActiveTexture(&mut self, _texture: GLenum) {}
     unsafe fn EnableClientState(&mut self, _array: GLenum) {}
     unsafe fn DisableClientState(&mut self, _array: GLenum) {}
@@ -1375,12 +1370,7 @@ impl GLES for GLES3Native<'_> {
     ) {
         gles30::GetBufferPointerv(target, pname, params)
     }
-    unsafe fn GetBufferParameteri64v(
-        &mut self,
-        target: GLenum,
-        pname: GLenum,
-        params: *mut i64,
-    ) {
+    unsafe fn GetBufferParameteri64v(&mut self, target: GLenum, pname: GLenum, params: *mut i64) {
         gles30::GetBufferParameteri64v(target, pname, params as *mut gles30::types::GLint64)
     }
     unsafe fn CopyBufferSubData(
@@ -1452,8 +1442,7 @@ impl GLES for GLES3Native<'_> {
         pixels: *const GLvoid,
     ) {
         gles30::TexSubImage3D(
-            target, level, xoffset, yoffset, zoffset, width, height, depth, format, type_,
-            pixels,
+            target, level, xoffset, yoffset, zoffset, width, height, depth, format, type_, pixels,
         )
     }
     unsafe fn CopyTexSubImage3D(
@@ -1634,15 +1623,7 @@ impl GLES for GLES3Native<'_> {
         width: GLsizei,
         height: GLsizei,
     ) {
-        gles30::InvalidateSubFramebuffer(
-            target,
-            num_attachments,
-            attachments,
-            x,
-            y,
-            width,
-            height,
-        )
+        gles30::InvalidateSubFramebuffer(target, num_attachments, attachments, x, y, width, height)
     }
     unsafe fn ReadBuffer(&mut self, src: GLenum) {
         gles30::ReadBuffer(src)
@@ -1661,28 +1642,13 @@ impl GLES for GLES3Native<'_> {
     ) {
         gles30::DrawRangeElements(mode, start, end, count, type_, indices)
     }
-    unsafe fn ClearBufferiv(
-        &mut self,
-        buffer: GLenum,
-        drawbuffer: GLint,
-        value: *const GLint,
-    ) {
+    unsafe fn ClearBufferiv(&mut self, buffer: GLenum, drawbuffer: GLint, value: *const GLint) {
         gles30::ClearBufferiv(buffer, drawbuffer, value)
     }
-    unsafe fn ClearBufferuiv(
-        &mut self,
-        buffer: GLenum,
-        drawbuffer: GLint,
-        value: *const GLuint,
-    ) {
+    unsafe fn ClearBufferuiv(&mut self, buffer: GLenum, drawbuffer: GLint, value: *const GLuint) {
         gles30::ClearBufferuiv(buffer, drawbuffer, value)
     }
-    unsafe fn ClearBufferfv(
-        &mut self,
-        buffer: GLenum,
-        drawbuffer: GLint,
-        value: *const GLfloat,
-    ) {
+    unsafe fn ClearBufferfv(&mut self, buffer: GLenum, drawbuffer: GLint, value: *const GLfloat) {
         gles30::ClearBufferfv(buffer, drawbuffer, value)
     }
     unsafe fn ClearBufferfi(
@@ -1734,12 +1700,7 @@ impl GLES for GLES3Native<'_> {
     unsafe fn SamplerParameteri(&mut self, sampler: GLuint, pname: GLenum, param: GLint) {
         gles30::SamplerParameteri(sampler, pname, param)
     }
-    unsafe fn SamplerParameteriv(
-        &mut self,
-        sampler: GLuint,
-        pname: GLenum,
-        params: *const GLint,
-    ) {
+    unsafe fn SamplerParameteriv(&mut self, sampler: GLuint, pname: GLenum, params: *const GLint) {
         gles30::SamplerParameteriv(sampler, pname, params)
     }
     unsafe fn SamplerParameterf(&mut self, sampler: GLuint, pname: GLenum, param: GLfloat) {
@@ -1753,12 +1714,7 @@ impl GLES for GLES3Native<'_> {
     ) {
         gles30::SamplerParameterfv(sampler, pname, params)
     }
-    unsafe fn GetSamplerParameteriv(
-        &mut self,
-        sampler: GLuint,
-        pname: GLenum,
-        params: *mut GLint,
-    ) {
+    unsafe fn GetSamplerParameteriv(&mut self, sampler: GLuint, pname: GLenum, params: *mut GLint) {
         gles30::GetSamplerParameteriv(sampler, pname, params)
     }
     unsafe fn GetSamplerParameterfv(
@@ -1814,9 +1770,7 @@ impl GLES for GLES3Native<'_> {
         type_: *mut GLenum,
         name: *mut GLchar,
     ) {
-        gles30::GetTransformFeedbackVarying(
-            program, index, buf_size, length, size, type_, name,
-        )
+        gles30::GetTransformFeedbackVarying(program, index, buf_size, length, size, type_, name)
     }
 
     // -- Integer vertex attributes --
@@ -1830,30 +1784,13 @@ impl GLES for GLES3Native<'_> {
     ) {
         gles30::VertexAttribIPointer(index, size, type_, stride, pointer)
     }
-    unsafe fn GetVertexAttribIiv(
-        &mut self,
-        index: GLuint,
-        pname: GLenum,
-        params: *mut GLint,
-    ) {
+    unsafe fn GetVertexAttribIiv(&mut self, index: GLuint, pname: GLenum, params: *mut GLint) {
         gles30::GetVertexAttribIiv(index, pname, params)
     }
-    unsafe fn GetVertexAttribIuiv(
-        &mut self,
-        index: GLuint,
-        pname: GLenum,
-        params: *mut GLuint,
-    ) {
+    unsafe fn GetVertexAttribIuiv(&mut self, index: GLuint, pname: GLenum, params: *mut GLuint) {
         gles30::GetVertexAttribIuiv(index, pname, params)
     }
-    unsafe fn VertexAttribI4i(
-        &mut self,
-        index: GLuint,
-        x: GLint,
-        y: GLint,
-        z: GLint,
-        w: GLint,
-    ) {
+    unsafe fn VertexAttribI4i(&mut self, index: GLuint, x: GLint, y: GLint, z: GLint, w: GLint) {
         gles30::VertexAttribI4i(index, x, y, z, w)
     }
     unsafe fn VertexAttribI4ui(
@@ -1905,12 +1842,7 @@ impl GLES for GLES3Native<'_> {
     unsafe fn Uniform4uiv(&mut self, location: GLint, count: GLsizei, value: *const GLuint) {
         gles30::Uniform4uiv(location, count, value)
     }
-    unsafe fn GetUniformuiv(
-        &mut self,
-        program: GLuint,
-        location: GLint,
-        params: *mut GLuint,
-    ) {
+    unsafe fn GetUniformuiv(&mut self, program: GLuint, location: GLint, params: *mut GLuint) {
         gles30::GetUniformuiv(program, location, params)
     }
     unsafe fn UniformMatrix2x3fv(
@@ -2068,12 +2000,7 @@ impl GLES for GLES3Native<'_> {
     unsafe fn DeleteSync(&mut self, sync: usize) {
         gles30::DeleteSync(sync as gles30::types::GLsync)
     }
-    unsafe fn ClientWaitSync(
-        &mut self,
-        sync: usize,
-        flags: GLbitfield,
-        timeout: u64,
-    ) -> GLenum {
+    unsafe fn ClientWaitSync(&mut self, sync: usize, flags: GLbitfield, timeout: u64) -> GLenum {
         gles30::ClientWaitSync(sync as gles30::types::GLsync, flags, timeout)
     }
     unsafe fn WaitSync(&mut self, sync: usize, flags: GLbitfield, timeout: u64) {
@@ -2087,7 +2014,13 @@ impl GLES for GLES3Native<'_> {
         length: *mut GLsizei,
         values: *mut GLint,
     ) {
-        gles30::GetSynciv(sync as gles30::types::GLsync, pname, buf_size, length, values)
+        gles30::GetSynciv(
+            sync as gles30::types::GLsync,
+            pname,
+            buf_size,
+            length,
+            values,
+        )
     }
 
     // -- 64-bit / indexed getters --
@@ -2129,11 +2062,7 @@ impl GLES for GLES3Native<'_> {
     unsafe fn GetStringi(&mut self, name: GLenum, index: GLuint) -> *const GLubyte {
         gles30::GetStringi(name, index)
     }
-    unsafe fn GetFragDataLocation(
-        &mut self,
-        program: GLuint,
-        name: *const GLchar,
-    ) -> GLint {
+    unsafe fn GetFragDataLocation(&mut self, program: GLuint, name: *const GLchar) -> GLint {
         gles30::GetFragDataLocation(program, name)
     }
     unsafe fn GetInternalformativ(
