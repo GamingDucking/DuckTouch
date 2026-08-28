@@ -428,4 +428,4 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(objc_setAssociatedObject(_, _, _, _)),
     export_c_func!(objc_getAssociatedObject(_, _)),
     export_c_func!(objc_removeAssociatedObjects(_)),
-}
+];
