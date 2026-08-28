@@ -58,6 +58,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // NSLocking protocol implementation
 - (())lock {
+    log_dbg!("[(NSLock *){:?} lock]", this);
     let host_object = env.objc.borrow::<NSLockHostObject>(this);
     if host_object.mutex_id != 0 {
         env.lock_mutex(host_object.mutex_id).unwrap();
@@ -118,6 +119,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // NSLocking protocol implementation
 - (())lock {
+    log_dbg!("[(NSLock *){:?} lock]", this);
     let host_object = env.objc.borrow::<NSLockHostObject>(this);
     if host_object.mutex_id != 0 {
         env.lock_mutex(host_object.mutex_id).unwrap();
