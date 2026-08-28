@@ -1002,13 +1002,18 @@ impl GLES for GLES1Native<'_> {
 
     unsafe fn TexEnvfv(&mut self, target: GLenum, pname: GLenum, params: *const GLfloat) {
         if target == gles11::TEXTURE_FILTER_CONTROL_EXT && pname == gles11::TEXTURE_LOD_BIAS_EXT {
-            let extensions = c_string_from_gl(gles11::GetString(gles11::EXTENSIONS));
-            if !extensions
-                .split_whitespace()
-                .any(|extension| extension == "GL_EXT_texture_lod_bias")
+            let extensions = gles11::GetString(gles11::EXTENSIONS);
+            if extensions.is_null()
+                || !CStr::from_ptr(extensions as *const _)
+                    .to_string_lossy()
+                    .split_whitespace()
+                    .any(|extension| extension == "GL_EXT_texture_lod_bias")
             {
                 return;
             }
+        }
+        if params.is_null() {
+            return;
         }
         gles11::TexEnvfv(target, pname, params)
     }
