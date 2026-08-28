@@ -7,7 +7,7 @@
 //! Objective-C runtime.
 //!
 //! Apple's [Programming with Objective-C](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/ProgrammingWithObjectiveC/Introduction/Introduction.html)
-//! is a useful introduction to the language from a user's perspective.
+//! is a useful introduction to the language from a developer's perspective.
 //! There are further resources in the child modules of this module, but they
 //! are more implementation-specific.
 //!
@@ -18,7 +18,7 @@
 //! originate from the guest app, classes defined by the host, and sometimes
 //! classes that are both (considering Objective-C's support for inheritance,
 //! categories and dynamic class editing).
-
+//!
 use crate::dyld::{
     export_c_func, export_c_func_aliased, ConstantExports, FunctionExports, HostConstant, HostDylib,
 };
@@ -26,7 +26,7 @@ use crate::MutexId;
 use std::collections::{HashMap, HashSet};
 
 mod classes;
-mod messages;
+pub(crate) mod messages;
 mod methods;
 mod objects;
 mod properties;
@@ -79,7 +79,7 @@ use properties::{
     objc_setProperty_atomic_copy, objc_setProperty_nonatomic, objc_setProperty_nonatomic_copy,
 };
 use properties::objc_setProperty_atomic;
-use properties::{property_getAttributes, property_getName};
+use properties::{property_get_name, property_getName};
 use selectors::{sel_getName, sel_getUid, sel_isEqual, sel_registerName};
 use synchronization::{objc_sync_enter, objc_sync_exit};
 
@@ -92,7 +92,7 @@ pub(crate) fn objc_msgSend(env: &mut Environment, receiver: id, selector: SEL) {
 /// Typedef for `NSZone *`. This is a [fossil type] found in the signature of
 /// `allocWithZone:` and similar methods. Its value is always ignored.
 ///
-/// [fossil type]: https://en.wiktionary.org/wiki/fossil_word
+/// [fossil type]: a la the original `objc4` reference.
 pub type NSZonePtr = crate::mem::MutVoidPtr;
 
 /// Main type holding Objective-C runtime state.
@@ -125,7 +125,7 @@ pub struct ObjC {
     /// false-share the lock between unrelated objects.
     ///
     /// The mutex is recursive because Apple's accessors can re-enter
-    /// themselves indirectly: a `@property (atomic, copy)` setter calls
+    /// themselves indirectly, e.g. a `@property (atomic, copy)` setter calls
     /// `[newValue copyWithZone:]` while holding the lock, and the
     /// `copyWithZone:` of e.g. `NSMutableString` may itself synthesize
     /// further atomic-property reads on the same object. Lazy created
@@ -137,29 +137,27 @@ pub struct ObjC {
     /// channel is needed.
     message_type_info: Option<(std::any::TypeId, &'static str)>,
 
-    /// Set of classes that have already had `+initialize` sent to them
-    /// (or were determined not to need it). Used to implement Apple's lazy
-    /// `+initialize` dispatch contract:
-    /// <https://developer.apple.com/documentation/objectivec/nsobject/1418639-initialize>
-    pub(super) initialized_classes: HashSet<Class>,
+    /// Cache of token pointers minted for host `IMP`s, keyed by the
+    /// (defining class, selector) whose implementation the token stands in
+    /// for. Keeps the token pointer stable so that
+    /// `method_getImplementation(m) == method_getImplementation(m)` holds,
+    /// matching Apple's behaviour.
+    pub(super) host_imp_tokens: HashMap<(Class, SEL), crate::mem::MutVoidPtr>,
 
-    /// ARC weak-reference side table.
-    ///
-    /// `objc_storeWeak(location, value)` registers `location` (a guest
-    /// `id*`) as a slot that should be zeroed when `value` is
-    /// deallocated. Per the clang ARC specification this is the only
-    /// way the runtime can guarantee that "weak references load nil
-    /// once the referenced object has been destroyed". We mirror that
-    /// behaviour exactly: every `dealloc_object` walks the entry for
-    /// the object being torn down and writes `nil` into every
-    /// registered location before freeing the object's memory.
-    ///
-    /// References:
-    /// - clang ARC documentation, "Runtime support",
-    ///   `objc_storeWeak` / `objc_loadWeakRetained` / `objc_destroyWeak`.
-    /// - Apple `objc-runtime-new.mm` `weak_table_t` (open-source on
-    ///   <https://opensource.apple.com/source/objc4/>).
-    pub(crate) weak_refs: HashMap<id, Vec<crate::mem::MutPtr<id>>>,
+    /// Reverse map from a synthesised `IMP` token pointer (see ubuntu's
+    /// [Self::host_imp_tokens]) back to the real [methods::IMP]. Host
+    /// (Rust-backed) methods have no guest code address, so they use
+    /// a unique token pointer for them, and record the mapping here so
+    /// `method_setImplementation` / `method_exchangeImplementations`
+    /// can round-trip host implementations.
+    pub(super) imp_tokens: HashMap<crate::mem::GuestUSize, methods::IMP>,
+
+    /// Cache of token pointers minted for host `IMP`s, keyed by the
+    /// (defining class, selector) whose implementation the token stands in
+    /// for. Keeps the token pointer stable so that
+    /// `method_getImplementation(m) == method_getImplementation(m)` holds,
+    /// matching Apple's behaviour.
+    pub(super) host_imp_tokens: HashMap<(Class, SEL), crate::mem::MutVoidPtr>,
 
     /// Per-object table of values set via `objc_setAssociatedObject`.
     ///
@@ -167,8 +165,7 @@ pub struct ObjC {
     /// Value: `(associated id, is_retained)`.  `is_retained` is true for
     /// RETAIN and COPY policies; the value will be released when the
     /// association is overwritten, removed, or the object is deallocated.
-    /// ASSIGN policy (0) stores without retaining — the caller is
-    /// responsible for ensuring the value outlives the association.
+    /// ASSIGN policy (0) stores without retaining — the weak storage.
     ///
     /// References:
     /// - <https://developer.apple.com/documentation/objectivec/1418509-objc_setassociatedobject>
@@ -183,26 +180,10 @@ pub struct ObjC {
     /// class+selector every time. touchHLE stores methods in a Rust
     /// `HashMap` instead, so we synthesise a small guest allocation per
     /// (defining class, selector) pair and hand out its pointer as the
-    /// opaque `Method`. Caching keeps that pointer stable, which real code
-    /// relies on (e.g. it compares `Method` pointers, or expects
-    /// `method_getImplementation` on the returned handle to see the effect
-    /// of a prior `method_setImplementation`).
+    /// opaque `Method`. CH caching keeps that pointer stable, which real code
+    /// relies on (e.g. it compares `Method` pointers, or expects `method_getImplementation`
+    /// on the returned handle to see the effect of a prior `method_setImplementation`).
     pub(super) method_handles: HashMap<(Class, SEL), crate::mem::MutVoidPtr>,
-
-    /// Reverse map from a synthesised `IMP` token pointer (see
-    /// [Self::host_imp_tokens]) back to the real [methods::IMP]. Host
-    /// (Rust-backed) methods have no guest code address, so
-    /// `method_getImplementation` hands out a unique token pointer for them
-    /// and records the mapping here so `method_setImplementation` /
-    /// `method_exchangeImplementations` can round-trip host implementations.
-    pub(super) imp_tokens: HashMap<crate::mem::GuestUSize, methods::IMP>,
-
-    /// Cache of token pointers minted for host `IMP`s, keyed by the
-    /// (defining class, selector) whose implementation the token stands in
-    /// for. Keeps the token pointer stable so that
-    /// `method_getImplementation(m) == method_getImplementation(m)` holds,
-    /// matching Apple's behaviour.
-    pub(super) host_imp_tokens: HashMap<(Class, SEL), crate::mem::MutVoidPtr>,
 }
 
 impl ObjC {
@@ -232,7 +213,6 @@ impl ObjC {
             .expect("get_selector_name: unknown selector")
     }
 }
-
 
 // ──────────────────────────────────────────────────────────────────
 // Associated objects  (<objc/runtime.h>)
@@ -302,7 +282,7 @@ fn objc_setAssociatedObject(
 /// `id objc_getAssociatedObject(id object, const void *key)`
 ///
 /// Returns the value associated with a given object for a given key.
-/// <https://developer.apple.com/documentation/objectivec/1418625-objc_getassociatedobject>
+/// <https://developer.apple.com/documentation/objectivec/1418509-objc_getassociatedobject>
 fn objc_getAssociatedObject(
     env: &mut Environment,
     object: id,
@@ -321,6 +301,7 @@ fn objc_getAssociatedObject(
 /// `void objc_removeAssociatedObjects(id object)`
 ///
 /// Removes all associations for a given object.
+/// <https://developer.apple.com/documentation/objectivec/runtime.h>
 /// <https://developer.apple.com/documentation/objectivec/1418718-objc_removeassociatedobjects>
 fn objc_removeAssociatedObjects(env: &mut Environment, object: id) {
     if object.is_null() {
@@ -352,17 +333,11 @@ pub const DYLIB: HostDylib = HostDylib {
 };
 
 const CONSTANTS: ConstantExports = &[
-    // We don't use these in our Objective-C runtime, but exporting useless
-    // symbols for these silences the warning about the unhandled relocation,
-    // and avoids a linker error for the integration tests.
+    // We don't use these and would only silence warnings.
     ("__objc_empty_vtable", HostConstant::NullPtr),
     ("__objc_empty_cache", HostConstant::NullPtr),
     ("_OBJC_EHTYPE_$_NSException", HostConstant::NullPtr),
     ("_OBJC_EHTYPE_id", HostConstant::NullPtr),
-    // `NSObject`'s only ivar (`isa`) lives at offset 0 in the object layout
-    // on 32-bit iOS, so resolving the ivar-offset symbol to a 4-byte zero
-    // gives any binary that does `obj + _OBJC_IVAR_$_NSObject.isa` the
-    // correct address (i.e. the object base).
     ("_OBJC_IVAR_$_NSObject.isa", HostConstant::NullPtr),
     ("_kCFTypeArrayCallBacks", HostConstant::NullPtr),
     ("_NSKeyValueChangeNewKey", HostConstant::NSString("new")),
@@ -410,7 +385,7 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(class_getSuperclass(_)),
     export_c_func!(class_getInstanceSize(_, _)),
     export_c_func!(class_getInstanceMethod(_, _)),
-    export_c_func!(class_getClassMethod(_, _)),
+    export_c_func!(class_getClassMethod(_)),
     export_c_func!(class_respondsToSelector(_, _)),
     export_c_func!(class_addMethod(_, _, _, _)),
     export_c_func!(class_getProperty(_, _)),
@@ -427,38 +402,30 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(method_getName(_)),
     export_c_func!(method_exchangeImplementations(_, _)),
     export_c_func!(class_getMethodImplementation(_, _)),
-    export_c_func!(class_getMethodImplementation_stret(_, _)),
+    export_c_func!(class_getMethodImplementation_stret(_, _, _)),
     export_c_func!(objc_storeStrong(_, _)),
     export_c_func!(___objc_personality_v0(_, _, _, _, _)),
     export_c_func_aliased!("_objc_msgForward", objc_msgForward(_, _)),
     export_c_func_aliased!("_objc_msgForward_stret", objc_msgForward_stret(_, _, _)),
-    // Additional ObjC runtime helpers needed by iOS 5/6 binaries.
     export_c_func!(class_getName(_)),
     export_c_func!(objc_lookUpClass(_)),
     export_c_func!(objc_getRequiredClass(_)),
-    export_c_func!(objc_allocateClassPair(_, _, _)),
+    export_c_func!(objc_allocateClassPair(_, _, _, _)),
     export_c_func!(objc_readClassPair(_, _)),
-    export_c_func!(objc_registerClassPair(_)),
+    export_c_func!(objc_registerClassPair(_, _)),
     export_c_func!(objc_disposeClassPair(_)),
     export_c_func!(class_setSuperclass(_, _)),
     export_c_func!(objc_getProtocol(_)),
     export_c_func!(protocol_getName(_)),
-    export_c_func!(objc_getClassList(_, _)),
+    export_c_func!(objc_getClassList(_)),
     export_c_func!(protocol_conformsToProtocol(_, _)),
     export_c_func!(objc_copyClassNamesForImage(_, _)),
     export_c_func!(object_getIndexedIvars(_)),
-    // `_objc_deallocOnMainThreadHelper` (one leading underscore in the C
-    // name) is exported by libobjc as the Mach-O symbol
-    // `__objc_deallocOnMainThreadHelper` (two leading underscores). The
-    // Rust function uses two leading underscores so that the alias above
-    // matches the Mach-O symbol exactly.
     export_c_func_aliased!(
         "_objc_deallocOnMainThreadHelper",
         __objc_deallocOnMainThreadHelper(_)
     ),
-    // Associated objects — available since iOS 3.1 / Mac OS X 10.6.
-    // Reference: <https://developer.apple.com/documentation/objectivec/1418509-objc_setassociatedobject>
     export_c_func!(objc_setAssociatedObject(_, _, _, _)),
     export_c_func!(objc_getAssociatedObject(_, _)),
     export_c_func!(objc_removeAssociatedObjects(_)),
-];
+}
