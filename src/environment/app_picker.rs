@@ -56,14 +56,13 @@ pub fn app_picker(options: Options) -> Result<(PathBuf, Vec<String>), String> {
     let apps: Result<Vec<AppInfo>, String> = if !apps_dir.is_dir() {
         Err(format!("The {} directory couldn't be found. Check you're running touchHLE from the right directory.", apps_dir.display()))
     } else {
-        enumerate_apps(&apps_dir)
-            .map_err(|err| {
-                format!(
-                    "Couldn't get list of apps in the {} directory: {}.",
-                    apps_dir.display(),
-                    err
-                )
-            })
+        enumerate_apps(&apps_dir).map_err(|err| {
+            format!(
+                "Couldn't get list of apps in the {} directory: {}.",
+                apps_dir.display(),
+                err
+            )
+        })
     };
 
     show_app_picker_gui(options, apps)
@@ -78,7 +77,10 @@ fn enumerate_apps(apps_dir: &Path) -> Result<Vec<AppInfo>, std::io::Error> {
             let extension = app_path.extension();
             if extension == Some(OsStr::new("app")) || extension == Some(OsStr::new("ipa")) {
                 let (bundle, fs) = match BundleData::open_any(&app_path).and_then(|bundle_data| {
-                    Bundle::new_bundle_and_fs_from_host_path(bundle_data, /* read_only_mode: */ true)
+                    Bundle::new_bundle_and_fs_from_host_path(
+                        bundle_data,
+                        /* read_only_mode: */ true,
+                    )
                 }) {
                     Ok(ok) => ok,
                     Err(e) => {
@@ -139,6 +141,7 @@ struct AppPickerDelegateHostObject {
     network: Option<bool>,
     gles1_on_gles2: Option<bool>,
     show_fps: Option<bool>,
+    trace_gl_errors: Option<bool>,
     fullscreen: Option<bool>,
     device_model_tag: Option<i32>,
     device_model_toggle: bool,
@@ -232,6 +235,10 @@ const CLASSES: ClassExports = objc_classes! {
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).network = Some(switch_state);
 }
+- (())traceGLErrors:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).trace_gl_errors = Some(switch_state);
+}
 - (())showFPS:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).show_fps = Some(switch_state);
@@ -315,12 +322,12 @@ fn show_app_picker_gui(
         let mut image = Image::from_bytes(bytes).unwrap();
         // should match Bundle::load_icon()
         // Use a slightly smaller corner radius for larger icons for a cleaner look.
-                let corner_radius_px = 12.0;
-                image.round_corners(
-                    corner_radius_px,
-                    /* four_corners: */ true,
-                    /* add_sheen: */ true,
-                );
+        let corner_radius_px = 12.0;
+        image.round_corners(
+            corner_radius_px,
+            /* four_corners: */ true,
+            /* add_sheen: */ true,
+        );
         image
     };
     let environment = Environment::new_without_app(options, icon)?;
@@ -458,30 +465,32 @@ fn app_picker_inner(
         msg_class![env; UIColor grayColor]
     };
 
-    for i in 1..=7 {
-        let label_frame = CGRect {
-            origin: CGPoint {
-                x: 0.0,
-                y: (app_frame.size.height / 8.0) * (i as f32) - 25.0,
-            },
-            size: CGSize {
-                width: app_frame.size.width,
-                height: 50.0,
-            },
-        };
-        let label: id = msg_class![env; UILabel alloc];
-        let label: id = msg![env; label initWithFrame:label_frame];
-        let text = ns_string::from_rust_string(env, crate::branding().to_owned());
-        () = msg![env; label setText:text];
-        () = msg![env; label setTextAlignment:(if i % 2 == 0 { UITextAlignmentLeft } else { UITextAlignmentRight })];
-        let font_size: CGFloat = 48.0;
-        let font: id = msg_class![env; UIFont systemFontOfSize:font_size];
-        () = msg![env; label setFont:font];
-        () = msg![env; label setTextColor:brand_color];
-        let bg_color: id = msg_class![env; UIColor clearColor];
-        () = msg![env; label setBackgroundColor:bg_color];
-        () = msg![env; main_view addSubview:label];
-    }
+    let title_frame = CGRect {
+        origin: CGPoint {
+            x: 12.0,
+            y: 8.0,
+        },
+        size: CGSize {
+            width: app_frame.size.width - 24.0,
+            height: 34.0,
+        },
+    };
+    let title: id = msg_class![env; UILabel alloc];
+    let title: id = msg![env; title initWithFrame:title_frame];
+    let text = if crate::branding().is_empty() {
+        ns_string::from_rust_string(env, "touchHLE".to_string())
+    } else {
+        ns_string::from_rust_string(env, format!("touchHLE {}", crate::branding()))
+    };
+    () = msg![env; title setText:text];
+    () = msg![env; title setTextAlignment:UITextAlignmentCenter];
+    let font_size: CGFloat = 28.0;
+    let font: id = msg_class![env; UIFont boldSystemFontOfSize:font_size];
+    () = msg![env; title setFont:font];
+    () = msg![env; title setTextColor:brand_color];
+    let bg_color: id = msg_class![env; UIColor clearColor];
+    () = msg![env; title setBackgroundColor:bg_color];
+    () = msg![env; main_view addSubview:title];
 
     let divider = app_frame.size.height - 100.0;
 
@@ -560,6 +569,7 @@ fn app_picker_inner(
     let mut quick_options_network = false;
     let mut quick_options_gles1_on_gles2 = false;
     let mut quick_options_show_fps = false;
+    let mut quick_options_trace_gl_errors = false;
     let mut quick_options_device_tag: Option<i32> = None;
     let mut quick_options_device_model_open = false;
     let mut quick_options_device_model_scroll: isize = 0;
@@ -768,7 +778,11 @@ fn app_picker_inner(
             quick_options_device_model_open = !quick_options_device_model_open;
             () = msg![env; (quick_options_stuff.device_model_menu)
                 setHidden:(!quick_options_device_model_open)];
-            let arrow = if quick_options_device_model_open { "▲" } else { "▼" };
+            let arrow = if quick_options_device_model_open {
+                "▲"
+            } else {
+                "▼"
+            };
             let title = format!(
                 "{} {}",
                 device_model_label_for_tag(quick_options_device_tag),
@@ -810,6 +824,8 @@ fn app_picker_inner(
             quick_options_gles1_on_gles2 = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.show_fps) {
             quick_options_show_fps = enabled;
+        } else if let Some(trace_gl_errors) = std::mem::take(&mut host_obj.trace_gl_errors) {
+            quick_options_trace_gl_errors = trace_gl_errors;
         } else if let Some(fullscreen) = std::mem::take(&mut host_obj.fullscreen) {
             quick_options_fullscreen = match fullscreen {
                 false => None,
@@ -855,15 +871,17 @@ fn app_picker_inner(
         crate::gles::present::set_onscreen_fps_enabled(true);
     }
 
+    if quick_options_trace_gl_errors {
+        option_args.push("--trace-gl-errors".to_string());
+    }
+
     if let Some(tag) = quick_options_device_tag {
         let tag = tag as NSInteger;
         if tag == DEVICE_TAG_DEFAULT {
             // No override — fall back to the app bundle / built-in default.
         } else if tag == DEVICE_TAG_AUTO {
             option_args.push("--device-family=auto".to_string());
-        } else if let Some(family) =
-            crate::window::DeviceFamily::ALL_SELECTABLE.get(tag as usize)
-        {
+        } else if let Some(family) = crate::window::DeviceFamily::ALL_SELECTABLE.get(tag as usize) {
             option_args.push(format!("--device-family={}", family.option_name()));
         }
     }
@@ -912,7 +930,7 @@ fn make_icon_grid(
     let icon_grid_width = (ICON_SIZE.width * num_cols_f) + icon_gap_x * (num_cols_f - 1.0);
     let icon_grid_origin = CGPoint {
         x: (app_frame.size.width - icon_grid_width) / 2.0,
-        y: 12.0,
+        y: 50.0,
     };
 
     let icon_tapped_sel = env.objc.lookup_selector("iconTapped:").unwrap();
@@ -1064,9 +1082,7 @@ fn make_icon_from_glyph(
     let cg_image = CGBitmapContextCreateImage(env, context);
     // This radius should match the one in src/bundle.rs.
     cg_image::borrow_image_mut(&mut env.objc, cg_image).round_corners(
-            12.0,
-        /* four_corners: */ true,
-        /* add_sheen: */ true,
+        12.0, /* four_corners: */ true, /* add_sheen: */ true,
     );
     CGContextRelease(env, context);
 
@@ -1556,6 +1572,8 @@ fn setup_quick_options(
         RowKind::Switch("network:", false),
         RowKind::Label("Show FPS"),
         RowKind::Switch("showFPS:", false),
+        RowKind::Label("Trace GL errors"),
+        RowKind::Switch("traceGLErrors:", false),
         RowKind::Label("Use analog sticks for tilt controls"),
         RowKind::Switch("analogStickTiltControls:", true),
         RowKind::Label("Use GLES1 → GLES2 translator"),
@@ -1580,7 +1598,7 @@ fn setup_quick_options(
     for (i, row) in rows.iter().enumerate() {
         let row_center = divider
             + ((1 + i) as CGFloat)
-                * ((main_frame.size.height - divider) / ((rows_len_full + 1) as CGFloat));
+                * ((main_frame.size.height - divider) / ((rows.len() + 1) as CGFloat));
 
         match *row {
             RowKind::Label(text) => {
@@ -1841,7 +1859,10 @@ fn make_device_model_dropdown(
     // Scrollbar track (full height) and thumb.
     let track_view: id = msg_class![env; UIView alloc];
     let track_frame = CGRect {
-        origin: CGPoint { x: list_width, y: 0.0 },
+        origin: CGPoint {
+            x: list_width,
+            y: 0.0,
+        },
         size: CGSize {
             width: scrollbar_width,
             height: visible_menu_height,
@@ -1854,7 +1875,10 @@ fn make_device_model_dropdown(
 
     let thumb_view: id = msg_class![env; UIView alloc];
     let thumb_frame = CGRect {
-        origin: CGPoint { x: list_width, y: 0.0 },
+        origin: CGPoint {
+            x: list_width,
+            y: 0.0,
+        },
         size: CGSize {
             width: scrollbar_width,
             height: 54.0,
@@ -1869,7 +1893,10 @@ fn make_device_model_dropdown(
     let clear: id = msg_class![env; UIColor clearColor];
     let up_btn: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
     let up_frame = CGRect {
-        origin: CGPoint { x: list_width, y: 0.0 },
+        origin: CGPoint {
+            x: list_width,
+            y: 0.0,
+        },
         size: CGSize {
             width: scrollbar_width,
             height: visible_menu_height / 2.0,
