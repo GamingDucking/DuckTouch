@@ -477,11 +477,7 @@ fn app_picker_inner(
     };
     let title: id = msg_class![env; UILabel alloc];
     let title: id = msg![env; title initWithFrame:title_frame];
-    let text = if crate::branding().is_empty() {
-        ns_string::from_rust_string(env, "touchHLE".to_string())
-    } else {
-        ns_string::from_rust_string(env, format!("touchHLE {}", crate::branding()))
-    };
+    let text = ns_string::from_rust_string(env, "HyperHLE-Fork".to_string());
     () = msg![env; title setText:text];
     () = msg![env; title setTextAlignment:UITextAlignmentCenter];
     let font_size: CGFloat = 28.0;
@@ -918,7 +914,13 @@ fn make_icon_grid(
     total_app_count: usize,
     have_wallpaper: bool,
 ) -> IconGridStuff {
-    let num_cols = 4;
+    let num_cols = if app_frame.size.width >= 380.0 {
+        4
+    } else if app_frame.size.width >= 270.0 {
+        3
+    } else {
+        2
+    };
     let num_cols_f = num_cols as CGFloat;
     let num_rows = 4;
     let label_size = CGSize {
@@ -1008,15 +1010,13 @@ fn make_icon_grid(
     }
     let mut start = 0;
     while start < total_app_count {
-        let mut end = start + icon_buttons_and_labels.len();
-        if start > 0 {
-            end -= 1; // one icon space taken by "previous" button
+        let previous_button_slots = usize::from(start > 0);
+        let mut available_slots = icon_buttons_and_labels.len() - previous_button_slots;
+        let remaining_apps = total_app_count - start;
+        if remaining_apps > available_slots {
+            available_slots -= 1;
         }
-        if end < total_app_count {
-            end -= 1; // one icon space taken by "next" button
-        } else {
-            end = total_app_count;
-        }
+        let end = (start + available_slots).min(total_app_count);
         pages.push(start..end);
         start = end;
     }
