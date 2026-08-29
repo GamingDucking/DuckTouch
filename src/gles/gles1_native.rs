@@ -787,6 +787,20 @@ impl GLES for GLES1Native<'_> {
             return;
         }
 
+        if width <= 0 || height <= 0 {
+            gles11::CompressedTexImage2D(
+                target,
+                level,
+                internalformat,
+                width,
+                height,
+                border,
+                image_size,
+                data,
+            );
+            return;
+        }
+
         // Slice the guest payload exactly once. Even when the host driver
         // advertises PVRTC natively, we need a `&[u8]` for the paletted /
         // decode fallbacks below.
