@@ -932,7 +932,7 @@ fn make_icon_grid(
     let icon_grid_width = (ICON_SIZE.width * num_cols_f) + icon_gap_x * (num_cols_f - 1.0);
     let icon_grid_origin = CGPoint {
         x: (app_frame.size.width - icon_grid_width) / 2.0,
-        y: 50.0,
+        y: 46.0,
     };
 
     let icon_tapped_sel = env.objc.lookup_selector("iconTapped:").unwrap();
@@ -1008,15 +1008,16 @@ fn make_icon_grid(
     if total_app_count == 0 {
         pages.push(0..0);
     }
+    let total_slots = icon_buttons_and_labels.len();
     let mut start = 0;
     while start < total_app_count {
-        let previous_button_slots = usize::from(start > 0);
-        let mut available_slots = icon_buttons_and_labels.len() - previous_button_slots;
-        let remaining_apps = total_app_count - start;
-        if remaining_apps > available_slots {
-            available_slots -= 1;
+        let has_prev = start != 0;
+        let mut app_slots = total_slots - usize::from(has_prev);
+        let remaining = total_app_count - start;
+        if remaining > app_slots {
+            app_slots -= 1;
         }
-        let end = (start + available_slots).min(total_app_count);
+        let end = (start + app_slots).min(total_app_count);
         pages.push(start..end);
         start = end;
     }
