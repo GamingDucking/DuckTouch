@@ -433,7 +433,7 @@ fn app_picker_inner(
         let text = ns_string::from_rust_string(
             env,
             format!(
-                "HyperHLE-Fork {}{}{}",
+                "touchHLE {}{}{}",
                 crate::branding(),
                 if crate::branding().is_empty() {
                     ""
@@ -922,17 +922,20 @@ fn make_icon_grid(
         2
     };
     let num_cols_f = num_cols as CGFloat;
-    let num_rows = 4;
     let label_size = CGSize {
         width: 74.0,
         height: 13.0,
     };
     let icon_gap_x: CGFloat = 19.0;
     let icon_gap_y: CGFloat = 4.0 + label_size.height + 14.0;
+    let grid_top = 40.0;
+    let footer_top = app_frame.size.height - 124.0;
+    let cell_step_y = ICON_SIZE.height + icon_gap_y;
+    let num_rows = (((footer_top - grid_top - 8.0) / cell_step_y).floor() as usize + 1).clamp(1, 4);
     let icon_grid_width = (ICON_SIZE.width * num_cols_f) + icon_gap_x * (num_cols_f - 1.0);
     let icon_grid_origin = CGPoint {
         x: (app_frame.size.width - icon_grid_width) / 2.0,
-        y: 24.0,
+        y: grid_top,
     };
 
     let icon_tapped_sel = env.objc.lookup_selector("iconTapped:").unwrap();
