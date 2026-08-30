@@ -433,7 +433,7 @@ fn app_picker_inner(
         let text = ns_string::from_rust_string(
             env,
             format!(
-                "touchHLE {}{}{}",
+                "HyperHLE-Fork {}{}{}",
                 crate::branding(),
                 if crate::branding().is_empty() {
                     ""
@@ -488,7 +488,7 @@ fn app_picker_inner(
     () = msg![env; title setBackgroundColor:bg_color];
     () = msg![env; main_view addSubview:title];
 
-    let divider = app_frame.size.height - 100.0;
+    let divider = app_frame.size.height - 124.0;
 
     let mut icon_grid_stuff = match &mut apps {
         Ok(ref mut apps) => {
@@ -526,8 +526,8 @@ fn app_picker_inner(
         }
     };
 
-    let buttons_row_center = divider + (app_frame.size.height - divider) / 4.0;
-    let buttons_row2_center = divider + (app_frame.size.height - divider) / 1.6;
+    let buttons_row_center = divider + (app_frame.size.height - divider) / 3.0;
+    let buttons_row2_center = divider + (app_frame.size.height - divider) / 1.45;
     make_button_row(
         env,
         delegate,
@@ -932,7 +932,7 @@ fn make_icon_grid(
     let icon_grid_width = (ICON_SIZE.width * num_cols_f) + icon_gap_x * (num_cols_f - 1.0);
     let icon_grid_origin = CGPoint {
         x: (app_frame.size.width - icon_grid_width) / 2.0,
-        y: 40.0,
+        y: 24.0,
     };
 
     let icon_tapped_sel = env.objc.lookup_selector("iconTapped:").unwrap();
