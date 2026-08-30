@@ -22,11 +22,6 @@ use crate::abi::{CallFromHost, GuestRet};
 use crate::mem::{ConstPtr, MutVoidPtr, Ptr, SafeRead};
 use crate::Environment;
 use std::any::TypeId;
-use std::cell::RefCell;
-
-thread_local! {
-    static OBJ_C_BREADCRUMBS: RefCell<Vec<(u32, String)>> = RefCell::new(Vec::with_capacity(16));
-}
 
 /// Implements Apple's lazy `+initialize` contract:
 /// > The runtime sends `initialize` to each class in a program just before the
@@ -134,22 +129,6 @@ fn objc_msgSend_inner(
         selector.as_str(&env.mem),
         receiver
     );
-
-    // Update breadcrumbs
-    OBJ_C_BREADCRUMBS.with(|b| {
-        let mut buf = b.borrow_mut();
-        if buf.len() >= 10 {
-            buf.remove(0);
-        }
-        buf.push((receiver.to_bits(), selector.as_str(&env.mem).to_string()));
-    });
-    // The [MSG TRACE] logging was removed as it was too spammy for the developer.
-    // If debugging is needed, re-enable the log! block here.
-    // log!(
-    //     "[MSG TRACE] receiver={:#010x} selector={}",
-    //     receiver.to_bits(),
-    //     selector.as_str(&env.mem)
-    // );
     // Host-side recursion guard. If an Objective-C method (typically
     // `hitTest:withEvent:` or `pointInside:withEvent:`) ends up recursing
     // into itself indirectly, the host call stack balloons because every

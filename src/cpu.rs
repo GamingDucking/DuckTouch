@@ -9,7 +9,7 @@
 //!
 //! iPhone OS apps used either ARMv6 or ARMv7-A, which are both 32-bit ISAs.
 //! For the moment, only ARMv6 has been tested.
-
+// KlugKlugTG was here!
 use crate::abi::GuestFunction;
 use crate::mem::{ConstPtr, GuestUSize, Mem, MutPtr, Ptr, SafeRead, SafeWrite};
 
@@ -278,6 +278,7 @@ impl Cpu {
     /// something else happened which requires attention from the host.
     #[must_use]
     pub fn run_or_step(&mut self, mem: &mut Mem, ticks: Option<&mut u64>) -> CpuState {
+        log!("CPU: run_or_step called");
         // See ::new() for why this is done.
         if !self.direct_memory_access_ptr.is_null() {
             assert!(self.direct_memory_access_ptr == unsafe { mem.direct_memory_access_ptr() });

@@ -787,6 +787,20 @@ impl GLES for GLES1Native<'_> {
             return;
         }
 
+        if width <= 0 || height <= 0 {
+            gles11::CompressedTexImage2D(
+                target,
+                level,
+                internalformat,
+                width,
+                height,
+                border,
+                image_size,
+                data,
+            );
+            return;
+        }
+
         // Slice the guest payload exactly once. Even when the host driver
         // advertises PVRTC natively, we need a `&[u8]` for the paletted /
         // decode fallbacks below.
@@ -805,7 +819,7 @@ impl GLES for GLES1Native<'_> {
         // before uploading. The decision is based on the
         // `GL_EXTENSIONS` string queried at context creation; see
         // [`GLES1NativeContext::pvrtc_native`].
-        if !self.pvrtc_native && !payload.is_empty() && width > 0 && height > 0 {
+        if !self.pvrtc_native && !payload.is_empty() {
             if try_decode_pvrtc(
                 self,
                 target,
@@ -1002,13 +1016,18 @@ impl GLES for GLES1Native<'_> {
 
     unsafe fn TexEnvfv(&mut self, target: GLenum, pname: GLenum, params: *const GLfloat) {
         if target == gles11::TEXTURE_FILTER_CONTROL_EXT && pname == gles11::TEXTURE_LOD_BIAS_EXT {
-            let extensions = c_string_from_gl(gles11::GetString(gles11::EXTENSIONS));
-            if !extensions
-                .split_whitespace()
-                .any(|extension| extension == "GL_EXT_texture_lod_bias")
+            let extensions = gles11::GetString(gles11::EXTENSIONS);
+            if extensions.is_null()
+                || !CStr::from_ptr(extensions as *const _)
+                    .to_string_lossy()
+                    .split_whitespace()
+                    .any(|extension| extension == "GL_EXT_texture_lod_bias")
             {
                 return;
             }
+        }
+        if params.is_null() {
+            return;
         }
         gles11::TexEnvfv(target, pname, params)
     }
@@ -1665,8 +1684,7 @@ impl<'gl_ctx> GLES1Native<'gl_ctx> {
         // The synthetic error must be queued on *every* call, because the
         // ES 2.0 spec requires `GL_INVALID_OPERATION` to be reported each
         // time one of these entry points is hit on an ES 1.1 context.
-        self.pending_synthetic_error
-            .set(gles11::INVALID_OPERATION);
+        self.pending_synthetic_error.set(gles11::INVALID_OPERATION);
 
         // The accompanying human-readable warning, however, must only be
         // emitted once per distinct entry point. Apps such as Cut the Rope

@@ -30,6 +30,7 @@ use super::GLESContext;
 use crate::window::{GLContext, GLVersion, Window};
 use std::collections::HashSet;
 use std::ffi::CStr;
+use std::sync::{Mutex, OnceLock};
 
 /// List of capabilities shared by OpenGL ES 1.1 and OpenGL 2.1.
 ///
@@ -885,7 +886,10 @@ impl GLES1OnGL2<'_> {
         let mut vertex_stride: GLint = 0;
         gl21::GetIntegerv(gl21::VERTEX_ARRAY_STRIDE, &mut vertex_stride);
         let mut vertex_buffer_binding: GLint = 0;
-        gl21::GetIntegerv(gl21::VERTEX_ARRAY_BUFFER_BINDING, &mut vertex_buffer_binding);
+        gl21::GetIntegerv(
+            gl21::VERTEX_ARRAY_BUFFER_BINDING,
+            &mut vertex_buffer_binding,
+        );
         let mut vertex_pointer: *mut GLvoid = std::ptr::null_mut();
         #[allow(clippy::unnecessary_mut_passed)]
         gl21::GetPointerv(gl21::VERTEX_ARRAY_POINTER, &mut vertex_pointer);
@@ -900,14 +904,10 @@ impl GLES1OnGL2<'_> {
             return None;
         }
 
-        let mut previous_array_buffer_binding: GLint = 0;
-        gl21::GetIntegerv(gl21::ARRAY_BUFFER_BINDING, &mut previous_array_buffer_binding);
-
         // Resolve all three source arrays to host pointers.
         let (vertex_base, vertex_mapped) =
             Self::resolve_array_base(vertex_pointer.cast_const(), vertex_buffer_binding as GLuint);
         if vertex_base.is_null() {
-            gl21::BindBuffer(gl21::ARRAY_BUFFER, previous_array_buffer_binding as GLuint);
             return None;
         }
         let (weight_base, weight_mapped) =
@@ -915,19 +915,11 @@ impl GLES1OnGL2<'_> {
         let (index_base, index_mapped) =
             Self::resolve_array_base(index.pointer, index.buffer_binding);
         if weight_base.is_null() || index_base.is_null() {
-            if index_mapped {
-                gl21::BindBuffer(gl21::ARRAY_BUFFER, index.buffer_binding);
-                gl21::UnmapBuffer(gl21::ARRAY_BUFFER);
-            }
-            if weight_mapped {
-                gl21::BindBuffer(gl21::ARRAY_BUFFER, weight.buffer_binding);
-                gl21::UnmapBuffer(gl21::ARRAY_BUFFER);
-            }
             if vertex_mapped {
                 gl21::BindBuffer(gl21::ARRAY_BUFFER, vertex_buffer_binding as GLuint);
                 gl21::UnmapBuffer(gl21::ARRAY_BUFFER);
+                gl21::BindBuffer(gl21::ARRAY_BUFFER, 0);
             }
-            gl21::BindBuffer(gl21::ARRAY_BUFFER, previous_array_buffer_binding as GLuint);
             return None;
         }
 
@@ -973,8 +965,7 @@ impl GLES1OnGL2<'_> {
                 }
                 weight_sum += w;
                 let mat_index = (indices[u] as i64).clamp(0, (palette_count as i64) - 1) as usize;
-                let transformed =
-                    mat4_transform(&self.state.palette_matrices[mat_index], object);
+                let transformed = mat4_transform(&self.state.palette_matrices[mat_index], object);
                 for c in 0..4 {
                     blended[c] += w * transformed[c];
                 }
@@ -1006,7 +997,6 @@ impl GLES1OnGL2<'_> {
             gl21::BindBuffer(gl21::ARRAY_BUFFER, 0);
         }
 
-        gl21::BindBuffer(gl21::ARRAY_BUFFER, previous_array_buffer_binding as GLuint);
         Some(out)
     }
 
@@ -1023,7 +1013,10 @@ impl GLES1OnGL2<'_> {
             return None;
         }
         let mut index_buffer_binding = 0;
-        gl21::GetIntegerv(gl21::ELEMENT_ARRAY_BUFFER_BINDING, &mut index_buffer_binding);
+        gl21::GetIntegerv(
+            gl21::ELEMENT_ARRAY_BUFFER_BINDING,
+            &mut index_buffer_binding,
+        );
         let base = if index_buffer_binding != 0 {
             let mapped = gl21::MapBuffer(gl21::ELEMENT_ARRAY_BUFFER, gl21::READ_ONLY);
             if mapped.is_null() {
@@ -1116,7 +1109,12 @@ impl GLES1OnGL2<'_> {
 
         // Restore the previous vertex array binding/pointer.
         gl21::BindBuffer(gl21::ARRAY_BUFFER, old_buffer as GLuint);
-        gl21::VertexPointer(old_size, old_type as GLenum, old_stride, old_pointer.cast_const());
+        gl21::VertexPointer(
+            old_size,
+            old_type as GLenum,
+            old_stride,
+            old_pointer.cast_const(),
+        );
         gl21::BindBuffer(gl21::ARRAY_BUFFER, 0);
     }
 
@@ -1179,12 +1177,6 @@ impl GLES for GLES1OnGL2<'_> {
         if ARRAYS.iter().any(|&ArrayInfo { name, .. }| name == cap) {
             log_dbg!("Tolerating glEnable({:#x}) of client state", cap);
         } else if cap == gles11::MATRIX_PALETTE_OES {
-            // GL_OES_matrix_palette: enable CPU-side palette skinning. Desktop
-            // GL 2.1 has no fixed-function palette skinning and Mesa does not
-            // expose GL_ARB_matrix_palette, so we emulate it ourselves at draw
-            // time (see draw_with_matrix_palette). Track the flag here and do
-            // NOT forward to gl21::Enable (0x8840 is not a valid desktop cap
-            // and would raise GL_INVALID_ENUM).
             self.state.matrix_palette_enabled = true;
             return;
         } else if cap == gl21::PERSPECTIVE_CORRECTION_HINT
@@ -1194,8 +1186,6 @@ impl GLES for GLES1OnGL2<'_> {
             || cap == gl21::TEXTURE
         {
             log_dbg!("Tolerating glEnable({:#x})", cap);
-            // Don't forward shading-model / hint enums to gl21::Enable —
-            // they're not valid capabilities and would set GL_INVALID_ENUM.
             return;
         } else if !CAPABILITIES.contains(&cap) {
             // Per the GLES 1.1 spec, invalid caps set GL_INVALID_ENUM but
@@ -1244,7 +1234,6 @@ impl GLES for GLES1OnGL2<'_> {
     }
     unsafe fn Disable(&mut self, cap: GLenum) {
         if cap == gles11::MATRIX_PALETTE_OES {
-            // See Enable: emulated, never forwarded to the desktop driver.
             self.state.matrix_palette_enabled = false;
             return;
         } else if CAPABILITIES.contains(&cap) {
@@ -1256,10 +1245,18 @@ impl GLES for GLES1OnGL2<'_> {
         } else if GET_PARAMS.contains(cap) || UNSUPPORTED_GET_PARAMS.contains(cap) {
             log_dbg!("Tolerating glDisable({:#x}) of parameter", cap);
         } else {
-            log!(
-                "Warning: Tolerating glDisable({:#x}) of unrecognized capability",
-                cap
-            );
+            static UNKNOWN_DISABLES: OnceLock<Mutex<HashSet<GLenum>>> = OnceLock::new();
+            let first = UNKNOWN_DISABLES
+                .get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+                .lock()
+                .map(|mut seen| seen.insert(cap))
+                .unwrap_or(true);
+            if first {
+                log!(
+                    "Warning: Tolerating glDisable({:#x}) of unrecognized capability [first occurrence only]",
+                    cap
+                );
+            }
             return;
         }
         gl21::Disable(cap);
@@ -2252,9 +2249,7 @@ impl GLES for GLES1OnGL2<'_> {
         // GL_OES_matrix_palette skinning for indexed draws: skin the full
         // range of referenced vertices, then draw with blended positions.
         if self.matrix_palette_active() {
-            if let Some((first, vcount)) =
-                self.indexed_draw_vertex_range(count, type_, indices)
-            {
+            if let Some((first, vcount)) = self.indexed_draw_vertex_range(count, type_, indices) {
                 if let Some(skinned) = self.skin_vertices(first, vcount) {
                     self.draw_elements_skinned(mode, count, type_, indices, &skinned);
                     return;
@@ -2469,10 +2464,13 @@ impl GLES for GLES1OnGL2<'_> {
         type_: GLenum,
         pixels: *const GLvoid,
     ) {
-        if target != gl21::TEXTURE_2D || level < 0 || width <= 0 || height <= 0 {
-            log!("Warning: TexImage2D: invalid arguments; skipping upload.");
-            return;
-        }
+        assert!(target == gl21::TEXTURE_2D);
+        assert!(level >= 0);
+        let internalformat = if format == gl21::BGRA {
+            gl21::BGRA as GLint
+        } else {
+            internalformat
+        };
         assert!(
             internalformat as GLenum == gl21::ALPHA
                 || internalformat as GLenum == gl21::RGB
@@ -2519,14 +2517,8 @@ impl GLES for GLES1OnGL2<'_> {
         type_: GLenum,
         pixels: *const GLvoid,
     ) {
-        if target != gl21::TEXTURE_2D || level < 0 || width <= 0 || height <= 0 {
-            log!("Warning: TexSubImage2D: invalid arguments; skipping upload.");
-            return;
-        }
-        if pixels.is_null() {
-            log!("Warning: TexSubImage2D: null pixel data; skipping upload.");
-            return;
-        }
+        assert!(target == gl21::TEXTURE_2D);
+        assert!(level >= 0);
         assert!(
             format == gl21::ALPHA
                 || format == gl21::RGB
@@ -2556,10 +2548,6 @@ impl GLES for GLES1OnGL2<'_> {
         image_size: GLsizei,
         data: *const GLvoid,
     ) {
-        if target != gl21::TEXTURE_2D || level < 0 || width <= 0 || height <= 0 || border != 0 || image_size < 0 || (data.is_null() && image_size > 0) {
-            log!("Warning: CompressedTexImage2D: invalid arguments; skipping upload.");
-            return;
-        }
         let data = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), image_size as usize) };
         // IMG_texture_compression_pvrtc (only on Imagination/Apple GPUs)
         // TODO: It would be more efficient to use hardware decoding where
@@ -2583,10 +2571,8 @@ impl GLES for GLES1OnGL2<'_> {
             palette_entry_type,
         }) = PalettedTextureFormat::get_info(internalformat)
         {
-            if border != 0 || level < 0 || width <= 0 || height <= 0 {
-                log!("Warning: CompressedTexImage2D: invalid texture dimensions; skipping upload.");
-                return;
-            }
+            // This should be invalid use? (TODO)
+            assert!(border == 0);
 
             let palette_entry_size = match palette_entry_type {
                 gl21::UNSIGNED_BYTE => match palette_entry_format {
@@ -2612,15 +2598,9 @@ impl GLES for GLES1OnGL2<'_> {
             };
             let indices_size = index_word_size * index_word_count;
 
-            if level != 0 {
-                log!("Warning: CompressedTexImage2D: paletted mip levels are unsupported; skipping upload.");
-                return;
-            }
-            let expected_size = palette_size + indices_size;
-            if data.len() < expected_size {
-                log!("Warning: CompressedTexImage2D: paletted payload is truncated; skipping upload.");
-                return;
-            }
+            // TODO: support multiple miplevels in one image
+            assert!(level == 0);
+            assert_eq!(data.len(), palette_size + indices_size);
             let (palette, indices) = data.split_at(palette_size);
 
             let mut decoded = Vec::<u8>::with_capacity(palette_entry_size * index_count);
@@ -2666,10 +2646,8 @@ impl GLES for GLES1OnGL2<'_> {
         image_size: GLsizei,
         data: *const GLvoid,
     ) {
-        if target != gl21::TEXTURE_2D || level < 0 || width <= 0 || height <= 0 || image_size < 0 || (data.is_null() && image_size > 0) {
-            log!("Warning: CompressedTexSubImage2D: invalid arguments; skipping upload.");
-            return;
-        }
+        assert!(target == gl21::TEXTURE_2D);
+        assert!(level >= 0);
         // PVRTC sub-image updates are very rare (Apple's OpenGL ES 1.1
         // surface rejects them too), but if we ever see one we
         // software-decode the entire sub-region to RGBA and use the
@@ -2690,25 +2668,14 @@ impl GLES for GLES1OnGL2<'_> {
         );
         if is_pvrtc_2bit || is_pvrtc_4bit {
             let Ok(width_u) = u32::try_from(width) else {
-                log!(
-                    "Warning: CompressedTexSubImage2D: invalid width {width}; skipping."
-                );
+                log!("Warning: CompressedTexSubImage2D: invalid width {width}; skipping.");
                 return;
             };
             let Ok(height_u) = u32::try_from(height) else {
-                log!(
-                    "Warning: CompressedTexSubImage2D: invalid height {height}; skipping."
-                );
+                log!("Warning: CompressedTexSubImage2D: invalid height {height}; skipping.");
                 return;
             };
-            let is_opaque = matches!(
-                format,
-                gles11::COMPRESSED_RGB_PVRTC_2BPPV1_IMG
-                    | gles11::COMPRESSED_RGB_PVRTC_4BPPV1_IMG
-            );
-            let pixels = crate::image::decode_pvrtc_with_alpha(
-                data_slice, is_pvrtc_2bit, width_u, height_u, is_opaque,
-            );
+            let pixels = crate::image::decode_pvrtc(data_slice, is_pvrtc_2bit, width_u, height_u);
             gl21::TexSubImage2D(
                 target,
                 level,
@@ -3262,13 +3229,7 @@ impl GLES for GLES1OnGL2<'_> {
         width: GLsizei,
         height: GLsizei,
     ) {
-        gl21::RenderbufferStorageMultisampleEXT(
-            target,
-            samples,
-            internalformat,
-            width,
-            height,
-        )
+        gl21::RenderbufferStorageMultisampleEXT(target, samples, internalformat, width, height)
     }
     unsafe fn ResolveMultisampleFramebufferAPPLE(&mut self) {
         // Apple's GL_APPLE_framebuffer_multisample doesn't take any arguments:

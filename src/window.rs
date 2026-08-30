@@ -2007,9 +2007,9 @@ impl Window {
                 // Also show FPS in the window title so it's visible when the
                 // app is running fullscreen or without console.
                 let base_title = if crate::branding().is_empty() {
-                    format!("DuckTouch {}", crate::VERSION)
+                    format!("touchHLE {}", crate::VERSION)
                 } else {
-                    format!("DuckTouch {} {}", crate::branding(), crate::VERSION)
+                    format!("touchHLE {} {}", crate::branding(), crate::VERSION)
                 };
                 let title = format!("{} - FPS: {:.1}", base_title, fps);
                 // Ignore any error setting the title.

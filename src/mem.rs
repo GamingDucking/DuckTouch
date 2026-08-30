@@ -481,17 +481,11 @@ impl Mem {
     // further occurrences are silently counted. This prevents the log from
     // being flooded when the game repeatedly probes null-page addresses.
     #[cold]
-    #[cold]
     fn null_check_fail(at: VAddr, size: GuestUSize, is_write: bool, caller: &str) {
         use std::collections::HashSet;
         use std::sync::Mutex;
         static SEEN: Mutex<Option<HashSet<(VAddr, bool)>>> = Mutex::new(None);
         const MAX_UNIQUE_LOGS: usize = 64;
-
-        // Breadcrumb dump: what were the last ObjC messages dispatched?
-        let breadcrumbs = crate::objc::messages::OBJ_C_BREADCRUMBS.with(|b| {
-            b.borrow().clone()
-        });
 
         let mut guard = SEEN.lock().unwrap();
         let set = guard.get_or_insert_with(HashSet::new);
@@ -534,13 +528,6 @@ impl Mem {
             set.len(),
             MAX_UNIQUE_LOGS
         );
-
-        if !breadcrumbs.is_empty() {
-            log!("  -> Breadcrumbs (last 10 ObjC calls):");
-            for (i, (recv, sel)) in breadcrumbs.iter().enumerate() {
-                log!("     {}. receiver=0x{:08x} selector={}", i + 1, recv, sel);
-            }
-        }
     }
 
     /// Special version of [Self::bytes_at] that returns [None] rather than
