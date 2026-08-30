@@ -974,7 +974,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())setTranslatesAutoresizingMaskIntoConstraints:(bool)_translates { }
 - (bool)translatesAutoresizingMaskIntoConstraints { true }
 - (())setNeedsLayout { }
-- (())layoutIfNeeded { }
 - (())addConstraint:(id)_constraint { }
 - (())addConstraints:(id)_constraints { }
 - (())removeConstraint:(id)_constraint { }
@@ -1139,12 +1138,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 // In our simplified implementation, we just call layoutSubviews.
 - (())layoutIfNeeded {
     () = msg![env; this layoutSubviews];
-}
-
-- (())setNeedsLayout {
-    // In a real implementation this would mark the view as needing layout
-    // on the next run loop iteration. Since we don't track dirty flags,
-    // this is a no-op — layoutSubviews will be called when appropriate.
 }
 
 // MARK: - Gesture recognizers

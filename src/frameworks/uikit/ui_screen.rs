@@ -12,6 +12,10 @@ use crate::objc::{id, msg, msg_class, nil, objc_classes, ClassExports, TrivialHo
 pub struct State {
     main_screen: Option<id>,
     current_mode: Option<id>,
+    /// `-brightness`, clamped to the documented 0.0-1.0 range.
+    brightness: CGFloat,
+    /// `-wantsSoftwareDimming`.
+    wants_software_dimming: bool,
 }
 
 fn screen_size_for_current_orientation(env: &mut crate::Environment) -> (u32, u32) {
@@ -29,6 +33,19 @@ fn screen_size_for_current_orientation(env: &mut crate::Environment) -> (u32, u3
     }
 
     (portrait_width, portrait_height)
+}
+
+
+/// Per Apple documentation for `-setBrightness:`, values are clamped to the
+/// documented 0.0-1.0 range by the setter below.
+fn clamp_brightness(value: CGFloat) -> CGFloat {
+    if value < 0.0 {
+        0.0
+    } else if value > 1.0 {
+        1.0
+    } else {
+        value
+    }
 }
 
 pub const CLASSES: ClassExports = objc_classes! {
@@ -114,19 +131,31 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: - Brightness
 
 - (CGFloat)brightness {
-    1.0
+    env.framework_state.uikit.ui_screen.brightness
 }
 
-- (())setBrightness:(CGFloat)_brightness {
-    log!("TODO: [UIScreen setBrightness:] (not implemented)");
+- (())setBrightness:(CGFloat)brightness {
+    // Per Apple documentation, brightness is in the range 0.0 (darkest)
+    // to 1.0 (lightest); clamp out-of-range values like the real UIKit.
+    let clamped = clamp_brightness(brightness);
+    if clamped != env.framework_state.uikit.ui_screen.brightness {
+        log!(
+            "[UIScreen setBrightness:] {} -> {} (host display unaffected)",
+            env.framework_state.uikit.ui_screen.brightness,
+            clamped
+        );
+        env.framework_state.uikit.ui_screen.brightness = clamped;
+    }
 }
 
 - (bool)wantsSoftwareDimming {
-    false
+    env.framework_state.uikit.ui_screen.wants_software_dimming
 }
 
-- (())setWantsSoftwareDimming:(bool)_value {
-    log!("TODO: [UIScreen setWantsSoftwareDimming:] (not implemented)");
+- (())setWantsSoftwareDimming:(bool)value {
+    // Per Apple documentation this only selects whether brightness changes
+    // are implemented by dimming; store the preference.
+    env.framework_state.uikit.ui_screen.wants_software_dimming = value;
 }
 
 // MARK: - Display mode / overscan

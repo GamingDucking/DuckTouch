@@ -1686,9 +1686,28 @@ pub fn AudioFileGetGlobalInfo(
 // MARK: - Optimizing Audio Files
 // =========================================================================
 
-pub fn AudioFileOptimize(_env: &mut Environment, _in_audio_file: AudioFileID) -> OSStatus {
-    log!("TODO: AudioFileOptimize stubbed");
-    kAudioFileOperationNotSupportedError
+pub fn AudioFileOptimize(env: &mut Environment, in_audio_file: AudioFileID) -> OSStatus {
+    // Per Apple's Audio File Services reference, AudioFileOptimize is a hint
+    // that the file's data should be laid out for efficient random access.
+    // The call never fails for a valid file: our in-memory (Real/Dummy/
+    // Writable) storage is already byte-addressable, so there is nothing to
+    // do beyond validating the handle. An invalid handle gets
+    // kAudioFileNotOpenError, matching AudioFileGetProperty's behavior.
+    return_if_null!(in_audio_file);
+
+    if State::get(&mut env.framework_state)
+        .audio_files
+        .get(&in_audio_file)
+        .is_none()
+    {
+        log!(
+            "Warning: AudioFileOptimize for {:?} (not open), returning kAudioFileNotOpenError.",
+            in_audio_file
+        );
+        return kAudioFileNotOpenError;
+    }
+
+    kAudioFileSuccess
 }
 
 // =========================================================================

@@ -31,6 +31,9 @@ struct NSOperationHostObject {
     // Completion block
     completion_block: id,
 
+    // NSBlockOperation: retained NSMutableArray of execution blocks, or nil
+    execution_blocks: id,
+
     // Properties
     name: id,
     queue_priority: i32,
@@ -73,11 +76,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())dealloc {
     // Extract all properties to temporary variables to avoid borrow checker
     // conflicts
-    let (deps, completion, name, target, arg, invocation) = {
+    let (deps, completion, execution_blocks, name, target, arg, invocation) = {
         let host_object = env.objc.borrow::<NSOperationHostObject>(this);
         (
             host_object.dependencies,
             host_object.completion_block,
+            host_object.execution_blocks,
             host_object.name,
             host_object.target,
             host_object.arg,
@@ -87,6 +91,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     release(env, deps);
     release(env, completion);
+    release(env, execution_blocks);
     release(env, name);
     release(env, target);
     release(env, arg);
@@ -392,10 +397,99 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 @end
 
+// Implementation per Apple's documentation for NSBlockOperation:
+// - `blockOperationWithBlock:` returns a new operation whose `main`
+//   executes the given block.
+// - `addExecutionBlock:` appends a block; execution blocks run in the
+//   order they were added.
+// - `executionBlocks` returns a copy of the list of blocks.
+// Per the docs, adding a block after execution has started or finished
+// raises NSInvalidArgumentException; in HLE that would abort the guest
+// process, so adding after start logs a warning and ignores the block.
 @implementation NSBlockOperation: NSOperation
 
-// TODO: Implement NSBlockOperation with block storage and execution
-// This would require proper block support in the HLE
++ (id)blockOperationWithBlock:(id)block {
+    let op: id = msg_class![env; NSBlockOperation alloc];
+    () = msg![env; op init];
+    if block != nil {
+        () = msg![env; op addExecutionBlock:block];
+    }
+    op
+}
+
+- (())addExecutionBlock:(id)block {
+    if block == nil {
+        return;
+    }
+
+    let state = env.objc.borrow::<NSOperationHostObject>(this).state;
+    if state != OperationState::Ready {
+        log!(
+            "Warning: [NSBlockOperation addExecutionBlock:] called after execution started; ignoring"
+        );
+        return;
+    }
+
+    let blocks = if env
+        .objc
+        .borrow::<NSOperationHostObject>(this)
+        .execution_blocks
+        == nil
+    {
+        let new_arr: id = msg_class![env; NSMutableArray alloc];
+        let new_arr: id = msg![env; new_arr init];
+        env.objc
+            .borrow_mut::<NSOperationHostObject>(this)
+            .execution_blocks = new_arr;
+        new_arr
+    } else {
+        env.objc
+            .borrow::<NSOperationHostObject>(this)
+            .execution_blocks
+    };
+    retain(env, block);
+    () = msg![env; blocks addObject:block];
+}
+
+- (id)executionBlocks {
+    let blocks = env.objc.borrow::<NSOperationHostObject>(this).execution_blocks;
+    if blocks == nil {
+        msg_class![env; NSArray array]
+    } else {
+        let copy: id = msg![env; blocks copy];
+        autorelease(env, copy)
+    }
+}
+
+- (())main {
+    // Check for cancellation
+    let cancelled = env.objc.borrow::<NSOperationHostObject>(this).cancelled;
+    if cancelled {
+        return;
+    }
+
+    let blocks = env.objc.borrow::<NSOperationHostObject>(this).execution_blocks;
+
+    if blocks == nil {
+        return;
+    }
+
+    // Per the docs, the execution blocks run in the order they were added.
+    let count: usize = msg![env; blocks count];
+    for i in 0..count {
+        // Re-check cancellation before each block, like a well-behaved
+        // operation should.
+        let cancelled = env.objc.borrow::<NSOperationHostObject>(this).cancelled;
+        if cancelled {
+            return;
+        }
+
+        let block: id = msg![env; blocks objectAtIndex:i];
+        if block != nil {
+            let _: () = msg![env; block invoke];
+        }
+    }
+}
 
 @end
 
@@ -488,8 +582,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         return;
     }
 
-    log!("Warning: NSOperationQueue addOperationWithBlock: requires NSBlockOperation support");
-    // Would create an NSBlockOperation and add it
+    let op: id = msg_class![env; NSBlockOperation blockOperationWithBlock:block];
+    () = msg![env; this addOperation:op];
 }
 
 // MARK: - Queue control

@@ -214,6 +214,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)operatingSystemVersionString {
     assert_process_info_singleton(env, this);
+    // Per Apple's documentation this returns a human-readable version string.
+    // Apps (e.g. Puzzle Agent) use it together with operatingSystemName for
+    // platform diagnostics.
     let (major, minor, patch) = os_version(env);
     let s = format!("Version {major}.{minor}.{patch} (Build 16A366)");
     let cstr = env.mem.alloc_and_write_cstr(s.as_bytes());
@@ -317,13 +320,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     assert_process_info_singleton(env, this); // TODO
     // This is the value documented by Foundation for the Darwin/Mach family.
     ns_string::get_static_str(env, "NSMACHOperatingSystem")
-}
-
-- (id)operatingSystemVersionString {
-    assert_process_info_singleton(env, this); // TODO
-    // Human-readable only. Puzzle Agent uses this together with
-    // operatingSystemName while collecting platform diagnostics.
-    ns_string::get_static_str(env, "Version 3.1.3 (Build 7E18)")
 }
 
 @end
