@@ -120,5 +120,7 @@ pub const ENABLED_MODULES: &[&str] = &[
     "touchHLE::frameworks::uikit::ui_view",
     "touchHLE::frameworks::uikit::ui_view_controller",
     "touchHLE::frameworks::foundation::ns_run_loop",
-    "touchHLE::frameworks::core_animation::ca_display_link",
+    "touchHLE::frameworks::core_animation::ca_display_link"
+    "touchHLE::abi"
+    "touchHLE::dyld",
 ];
