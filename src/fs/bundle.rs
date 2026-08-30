@@ -81,10 +81,20 @@ pub enum BundleData {
 impl BundleData {
     fn find_bundle_path_in_archive(zip: &mut ZipArchive<std::fs::File>) -> Result<String, String> {
         for i in 0..zip.len() {
-            let file = zip
-                .by_index(i)
-                .map_err(|e| format!("Could not open IPA archive entry: {e}"))?;
-            let path = file.name();
+            // Some IPAs found in the wild contain entries whose local file
+            // header is corrupt (even though the central directory is fine).
+            // Skipping such entries is better than rejecting the whole IPA.
+            let path = match zip.by_index(i).map(|file| file.name().to_string()) {
+                Ok(path) => path,
+                Err(e) => {
+                    log!(
+                        "Warning: BundleData::find_bundle_path_in_archive(): skipping unreadable IPA archive entry #{}: {}",
+                        i,
+                        e
+                    );
+                    continue;
+                }
+            };
             if let Some(name) = path
                 .strip_prefix("Payload/")
                 .and_then(|path| path.split_once('/'))
@@ -153,11 +163,28 @@ impl BundleData {
 
                 let mut builder = FsNodeBuilder::new();
                 for i in 0..archive_guard.len() {
-                    let file = archive_guard.by_index(i).unwrap(); // TODO: report IO error?
-                    let name = file.name();
+                    // Unreadable entries (e.g. with corrupt local file
+                    // headers) are skipped rather than causing a panic; the
+                    // rest of the bundle is still loaded. If a skipped entry
+                    // is actually needed later, `IpaFileRef::open()` will
+                    // return an empty file and log a warning.
+                    let (name, is_dir) = match archive_guard
+                        .by_index(i)
+                        .map(|file| (file.name().to_string(), file.is_dir()))
+                    {
+                        Ok(name_and_dir) => name_and_dir,
+                        Err(e) => {
+                            log!(
+                                "Warning: BundleData::into_fs_node(): skipping unreadable IPA archive entry #{}: {}",
+                                i,
+                                e
+                            );
+                            continue;
+                        }
+                    };
                     if let Some(path) = name.strip_prefix(&bundle_path) {
                         let path = GuestPath::new(path);
-                        if file.is_dir() {
+                        if is_dir {
                             builder.add_directory(path);
                         } else {
                             builder.add_file(
@@ -354,5 +381,57 @@ impl Read for IpaFile {
 impl std::io::Seek for IpaFile {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
         self.file.seek(pos)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Regression test: IPAs with entries whose local file header is corrupt
+    /// used to cause a panic (`InvalidArchive("Invalid local file header")`)
+    /// when the bundle was loaded. Now such entries are skipped instead.
+    #[test]
+    fn test_ipa_with_corrupt_local_file_header() {
+        let dir = std::env::temp_dir().join("touchHLE_test_corrupt_ipa");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ipa_path = dir.join("TestApp.ipa");
+
+        // Build a minimal IPA.
+        let file = std::fs::File::create(&ipa_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::FileOptions::default();
+        zip.start_file("Payload/TestApp.app/Info.plist", options).unwrap();
+        zip.write_all(b"plist").unwrap();
+        zip.start_file("Payload/TestApp.app/broken.bin", options).unwrap();
+        zip.write_all(b"data").unwrap();
+        zip.finish().unwrap();
+
+        // Corrupt the local file header of the second entry (keep the
+        // central directory intact), mimicking IPAs found in the wild.
+        {
+            let mut zip = ZipArchive::new(std::fs::File::open(&ipa_path).unwrap()).unwrap();
+            let header_start = zip.by_index(1).unwrap().header_start();
+            drop(zip);
+            let mut data = std::fs::read(&ipa_path).unwrap();
+            let start = header_start as usize;
+            data[start..start + 4].copy_from_slice(b"XXXX");
+            std::fs::write(&ipa_path, data).unwrap();
+        }
+
+        // Opening the IPA must succeed ...
+        let mut bundle = BundleData::open_any(&ipa_path).unwrap();
+        assert_eq!(bundle.bundle_name(), "TestApp");
+        // ... reading the plist must work ...
+        assert_eq!(bundle.read_plist().unwrap(), b"plist");
+        // ... and building the filesystem node must not panic; the broken
+        // entry is skipped, the valid one is still present.
+        let node = bundle.into_fs_node();
+        let FsNode::Directory { children, .. } = &node else {
+            panic!("expected directory");
+        };
+        assert!(children.contains_key("Info.plist"));
+        assert!(!children.contains_key("broken.bin"));
     }
 }
