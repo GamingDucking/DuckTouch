@@ -920,22 +920,62 @@ fn CFURLGetByteRangeForComponent(
 
 // MARK: - Percent Escaping
 
-fn CFURLCreateStringByReplacingPercentEscapes(
-    env: &mut Environment,
-    allocator: CFAllocatorRef,
-    original_string: CFStringRef,
-    _characters_to_leave_escaped: CFStringRef,
-) -> CFStringRef {
-    if !validate_allocator(env, allocator) {
-        return nil;
+// Decodes every `%XX` percent escape in `original`, per the documented
+// behaviour of `CFURLCreateStringByReplacingPercentEscapesUsingEncoding`:
+// each escape is replaced by the corresponding character, escapes for
+// characters listed in `characters_to_leave_escaped` are left intact, and
+// invalid or incomplete escape sequences make the function return NULL.
+// Passing an empty string as `characters_to_leave_escaped` removes all
+// percent escapes.
+// https://developer.apple.com/documentation/corefoundation/1541961-cfurlcreatestringbyreplacingpercente
+fn decode_percent_escapes(original: &str, leave_escaped: Option<&str>) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(original.len());
+    let src = original.as_bytes();
+    let mut i = 0;
+    while i < src.len() {
+        if src[i] != b'%' {
+            out.push(src[i]);
+            i += 1;
+            continue;
+        }
+        let (Some(&high), Some(&low)) = (src.get(i + 1), src.get(i + 2)) else {
+            log_dbg!(
+                "CFURLCreateStringByReplacingPercentEscapesUsingEncoding: {:?} has an \
+                 incomplete percent escape at byte {}",
+                original,
+                i
+            );
+            return None;
+        };
+        let hex_value = |digit: u8| -> Option<u8> {
+            match digit {
+                b'0'..=b'9' => Some(digit - b'0'),
+                b'a'..=b'f' => Some(digit - b'a' + 10),
+                b'A'..=b'F' => Some(digit - b'A' + 10),
+                _ => None,
+            }
+        };
+        let (Some(high), Some(low)) = (hex_value(high), hex_value(low)) else {
+            log_dbg!(
+                "CFURLCreateStringByReplacingPercentEscapesUsingEncoding: {:?} has an \
+                 invalid percent escape at byte {}",
+                original,
+                i
+            );
+            return None;
+        };
+        let decoded = (high << 4) | low;
+        let should_leave = leave_escaped.is_some_and(|chars| chars.contains(decoded as char));
+        if should_leave {
+            out.push(b'%');
+            out.push(src[i + 1]);
+            out.push(src[i + 2]);
+        } else {
+            out.push(decoded);
+        }
+        i += 3;
     }
-
-    if original_string.is_null() {
-        return nil;
-    }
-
-    log!("TODO: CFURLCreateStringByReplacingPercentEscapes is stubbed to prevent crash");
-    msg![env; original_string copy]
+    Some(out)
 }
 
 fn CFURLCreateStringByReplacingPercentEscapesUsingEncoding(
@@ -949,24 +989,55 @@ fn CFURLCreateStringByReplacingPercentEscapesUsingEncoding(
         return nil;
     }
 
-    if encoding == kCFStringEncodingUTF8 {
-        return CFURLCreateStringByReplacingPercentEscapes(
-            env,
-            allocator,
-            original_string,
-            characters_to_leave_escaped,
-        );
+    if original_string.is_null() {
+        return nil;
     }
 
-    log!(
-        "TODO: Percent escape replacement with encoding {:#x}",
+    let original = to_rust_string(env, original_string);
+    let leave_escaped = if characters_to_leave_escaped.is_null() {
+        None
+    } else {
+        Some(to_rust_string(env, characters_to_leave_escaped).into_owned())
+    };
+
+    let Some(decoded) = decode_percent_escapes(&original, leave_escaped.as_deref()) else {
+        return nil;
+    };
+
+    if encoding == kCFStringEncodingUTF8 {
+        let Ok(decoded) = String::from_utf8(decoded) else {
+            log_dbg!(
+                "CFURLCreateStringByReplacingPercentEscapesUsingEncoding: decoded bytes are \
+                 not valid UTF-8, returning NULL"
+            );
+            return nil;
+        };
+        return from_rust_string(env, decoded);
+    }
+
+    // For the single-byte CFString encodings of the iPhone OS era (MacRoman,
+    // Windows Latin 1, ISO Latin 1) each decoded byte maps directly to the
+    // character it names in that encoding.
+    log_dbg!(
+        "CFURLCreateStringByReplacingPercentEscapesUsingEncoding: treating decoded bytes \
+         as single-byte encoding {:#x}",
         encoding
     );
-    CFURLCreateStringByReplacingPercentEscapes(
+    from_rust_string(env, decoded.into_iter().map(|byte| byte as char).collect())
+}
+
+fn CFURLCreateStringByReplacingPercentEscapes(
+    env: &mut Environment,
+    allocator: CFAllocatorRef,
+    original_string: CFStringRef,
+    characters_to_leave_escaped: CFStringRef,
+) -> CFStringRef {
+    CFURLCreateStringByReplacingPercentEscapesUsingEncoding(
         env,
         allocator,
         original_string,
         characters_to_leave_escaped,
+        kCFStringEncodingUTF8,
     )
 }
 

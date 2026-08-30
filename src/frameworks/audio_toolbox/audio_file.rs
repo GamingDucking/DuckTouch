@@ -12,8 +12,9 @@ use crate::audio::AudioDescription;
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::frameworks::carbon_core::{eofErr, paramErr, OSStatus};
 use crate::frameworks::core_audio_types::{
-    debug_fourcc, fourcc, kAudioFormatFlagIsBigEndian, kAudioFormatFlagIsFloat,
-    kAudioFormatFlagIsPacked, kAudioFormatFlagIsSignedInteger, kAudioFormatLinearPCM,
+    debug_fourcc, fourcc, kAudioFormatAppleIMA4, kAudioFormatFlagIsBigEndian,
+    kAudioFormatFlagIsFloat, kAudioFormatFlagIsPacked, kAudioFormatFlagIsSignedInteger,
+    kAudioFormatLinearPCM, kAudioFormatMPEG4AAC, AudioFormatID,
     AudioStreamBasicDescription,
 };
 use super::audio_converter::AudioStreamPacketDescription;
@@ -1555,27 +1556,130 @@ pub fn AudioFileRemoveUserData(
 // MARK: - Working with Global Information
 // =========================================================================
 
+// --- Audio File Global Info Properties (AudioFile.h) ---
+// https://developer.apple.com/documentation/audiotoolbox/audio_file_global_info_properties
+const kAudioFileGlobalInfo_ReadableTypes: AudioFilePropertyID = fourcc(b"afrf");
+const kAudioFileGlobalInfo_WritableTypes: AudioFilePropertyID = fourcc(b"afwf");
+const kAudioFileGlobalInfo_AvailableFormatIDs: AudioFilePropertyID = fourcc(b"fmid");
+
+const kAudioFileWaveType: AudioFileTypeID = fourcc(b"WAVE");
+
+/// File types this implementation of Audio File Services advertises to the
+/// guest. WAVE, AIFF and CAF are the container formats the open/parse path
+/// (hound, caf and Symphonia) recognises, matching what `AudioFileOpenURL()`
+/// can actually decode.
+const READABLE_FILE_TYPES: [AudioFileTypeID; 3] =
+    [kAudioFileWaveType, kAUdioFileAIFFType, kAudioFileCAFType];
+
+/// Format IDs that can be read from files of the given type. Per Apple's
+/// `AudioFile.h`, the specifier for `kAudioFileGlobalInfo_AvailableFormatIDs`
+/// is a pointer to an `AudioFileTypeID`.
+fn available_format_ids(file_type: AudioFileTypeID) -> &'static [AudioFormatID] {
+    match file_type {
+        kAudioFileCAFType => &[
+            kAudioFormatLinearPCM,
+            kAudioFormatAppleIMA4,
+            kAudioFormatMPEG4AAC,
+        ],
+        _ => &[kAudioFormatLinearPCM],
+    }
+}
+
+/// Returns the size in bytes of the data for a supported global info
+/// property, or `None` if the property is not implemented.
+fn global_info_size(
+    env: &mut Environment,
+    in_property_id: AudioFilePropertyID,
+    in_specifier: MutVoidPtr,
+) -> Option<u32> {
+    match in_property_id {
+        kAudioFileGlobalInfo_ReadableTypes | kAudioFileGlobalInfo_WritableTypes => Some(
+            (READABLE_FILE_TYPES.len() as u32) * guest_size_of::<AudioFileTypeID>(),
+        ),
+        kAudioFileGlobalInfo_AvailableFormatIDs => {
+            if in_specifier.is_null() {
+                return None;
+            }
+            let file_type = env.mem.read(in_specifier.cast::<AudioFileTypeID>());
+            Some(
+                (available_format_ids(file_type).len() as u32)
+                    * guest_size_of::<AudioFormatID>(),
+            )
+        }
+        _ => None,
+    }
+}
+
 pub fn AudioFileGetGlobalInfoSize(
-    _env: &mut Environment,
-    _in_property_id: AudioFilePropertyID,
+    env: &mut Environment,
+    in_property_id: AudioFilePropertyID,
     _in_specifier_size: u32,
-    _in_specifier: MutVoidPtr,
-    _out_data_size: MutPtr<u32>,
+    in_specifier: MutVoidPtr,
+    out_data_size: MutPtr<u32>,
 ) -> OSStatus {
-    log!("TODO: AudioFileGetGlobalInfoSize stubbed");
-    kAudioFileUnsupportedPropertyError
+    if out_data_size.is_null() {
+        return paramErr;
+    }
+    match global_info_size(env, in_property_id, in_specifier) {
+        Some(size) => {
+            env.mem.write(out_data_size, size);
+            kAudioFileSuccess
+        }
+        None => {
+            log_dbg!(
+                "AudioFileGetGlobalInfoSize: unimplemented global info property {}",
+                debug_fourcc(in_property_id)
+            );
+            kAudioFileUnsupportedPropertyError
+        }
+    }
 }
 
 pub fn AudioFileGetGlobalInfo(
-    _env: &mut Environment,
-    _in_property_id: AudioFilePropertyID,
+    env: &mut Environment,
+    in_property_id: AudioFilePropertyID,
     _in_specifier_size: u32,
-    _in_specifier: MutVoidPtr,
-    _io_data_size: MutPtr<u32>,
-    _out_property_data: MutVoidPtr,
+    in_specifier: MutVoidPtr,
+    io_data_size: MutPtr<u32>,
+    out_property_data: MutVoidPtr,
 ) -> OSStatus {
-    log!("TODO: AudioFileGetGlobalInfo stubbed");
-    kAudioFileUnsupportedPropertyError
+    if io_data_size.is_null() {
+        return paramErr;
+    }
+    let Some(required_size) = global_info_size(env, in_property_id, in_specifier) else {
+        log_dbg!(
+            "AudioFileGetGlobalInfo: unimplemented global info property {}",
+            debug_fourcc(in_property_id)
+        );
+        return kAudioFileUnsupportedPropertyError;
+    };
+    let provided_size = env.mem.read(io_data_size);
+    if provided_size < required_size {
+        return kAudioFileBadPropertySizeError;
+    }
+    env.mem.write(io_data_size, required_size);
+    if out_property_data.is_null() {
+        return kAudioFileSuccess;
+    }
+
+    let out = out_property_data.cast::<AudioFileTypeID>();
+    match in_property_id {
+        kAudioFileGlobalInfo_ReadableTypes | kAudioFileGlobalInfo_WritableTypes => {
+            for (i, file_type) in READABLE_FILE_TYPES.iter().enumerate() {
+                env.mem.write(out + i as GuestUSize, *file_type);
+            }
+        }
+        kAudioFileGlobalInfo_AvailableFormatIDs => {
+            let file_type = env.mem.read(in_specifier.cast::<AudioFileTypeID>());
+            let out = out.cast::<AudioFormatID>();
+            for (i, format_id) in available_format_ids(file_type).iter().enumerate() {
+                env.mem.write(out + i as GuestUSize, *format_id);
+            }
+        }
+        _ => unreachable!("global_info_size() only accepts known properties"),
+    }
+
+    kAudioFileSuccess
 }
 
 // =========================================================================
