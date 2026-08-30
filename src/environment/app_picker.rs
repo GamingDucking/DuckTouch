@@ -932,7 +932,7 @@ fn make_icon_grid(
     let icon_grid_width = (ICON_SIZE.width * num_cols_f) + icon_gap_x * (num_cols_f - 1.0);
     let icon_grid_origin = CGPoint {
         x: (app_frame.size.width - icon_grid_width) / 2.0,
-        y: 46.0,
+        y: 40.0,
     };
 
     let icon_tapped_sel = env.objc.lookup_selector("iconTapped:").unwrap();
