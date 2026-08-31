@@ -94,15 +94,14 @@ pub fn decode_symphonia_to_pcm(file: Cursor<Vec<u8>>) -> Result<SymphoniaDecoded
 
     // Create the decoder via `get_codecs().make_audio_decoder(...)`.
     let dec_opts = AudioDecoderOptions::default();
-    let mut decoder = match symphonia::default::get_codecs()
-        .make_audio_decoder(&audio_params, &dec_opts)
-    {
-        Ok(d) => d,
-        Err(e) => {
-            log!("Symphonia failed to create decoder: {:?}", e);
-            return Err(());
-        }
-    };
+    let mut decoder =
+        match symphonia::default::get_codecs().make_audio_decoder(&audio_params, &dec_opts) {
+            Ok(d) => d,
+            Err(e) => {
+                log!("Symphonia failed to create decoder: {:?}", e);
+                return Err(());
+            }
+        };
 
     let mut out_pcm = Vec::<u8>::new();
     // Reused scratch buffer for the interleaved bytes of each decoded packet.
@@ -129,31 +128,49 @@ pub fn decode_symphonia_to_pcm(file: Cursor<Vec<u8>>) -> Result<SymphoniaDecoded
             continue;
         }
 
-        let decoded = match decoder.decode(&packet) {
-            Ok(buf) => buf,
-            Err(SymphoniaError::DecodeError(e)) => {
+        // Symphonia has had panics on unusual-but-valid AAC streams (e.g. an
+        // out-of-bounds scalefactor band index in its section-data parser).
+        // Catch any such panic so a malformed file can't take down the whole
+        // emulator: the packet is dropped and decoding continues.
+        let decode_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            decoder.decode(&packet).map(|decoded| {
+                // Remember the signal spec from the first successfully decoded
+                // packet, then convert this packet's samples to interleaved
+                // little-endian i16 bytes. Everything must happen inside the
+                // closure because the decoded buffer borrows the decoder.
+                let spec = decoded.spec();
+                let spec_pair = (spec.rate(), spec.channels().count());
+                decoded.copy_bytes_to_vec_interleaved_as::<i16>(&mut packet_bytes);
+                spec_pair
+            })
+        }));
+
+        let (rate, channels) = match decode_result {
+            Ok(Ok(pair)) => {
+                out_pcm.extend_from_slice(&packet_bytes);
+                pair
+            }
+            Ok(Err(SymphoniaError::DecodeError(e))) => {
                 // Corrupt frame — skip it and keep going.
                 log!("Symphonia decode error (recoverable): {:?}", e);
                 continue;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 log!("Symphonia fatal decode error: {:?}", e);
+                break;
+            }
+            Err(_) => {
+                // The decoder's internal state can't be trusted after a panic,
+                // so there's no point in trying to decode further packets.
+                log!("Symphonia decoder panicked (skipping rest of stream)");
                 break;
             }
         };
 
-        // Remember the signal spec from the first successfully decoded packet.
-        let spec = decoded.spec();
         if out_rate.is_none() {
-            out_rate = Some(spec.rate());
-            out_channels = Some(spec.channels().count());
+            out_rate = Some(rate);
+            out_channels = Some(channels);
         }
-
-        // Convert this packet's samples to interleaved little-endian i16 bytes
-        // and append them to the output. `copy_bytes_to_vec_interleaved_as`
-        // resizes its destination, so we use a scratch buffer per packet.
-        decoded.copy_bytes_to_vec_interleaved_as::<i16>(&mut packet_bytes);
-        out_pcm.extend_from_slice(&packet_bytes);
     }
 
     let (sample_rate, channels) = match (out_rate, out_channels) {
