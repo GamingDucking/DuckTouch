@@ -21,7 +21,8 @@ use crate::abi::{impl_GuestRet_for_large_struct, GuestArg};
 use crate::frameworks::foundation::ns_string;
 use crate::libc::mach::host::physical_memory;
 use crate::mem::SafeRead;
-use crate::objc::{id, msg, msg_class, objc_classes, ClassExports};
+use crate::objc::{id, msg, msg_class, nil, objc_classes, release, retain, ClassExports};
+use std::collections::HashMap;
 use crate::Environment;
 use std::time::Instant;
 
@@ -65,6 +66,17 @@ impl GuestArg for NSOperatingSystemVersion {
 pub struct State {
     /// `NSProcessInfo*`
     process_info: Option<id>,
+    /// Outstanding activity assertions from
+    /// `-beginActivityWithOptions:reason:`, keyed by the token object that
+    /// was handed to the guest. Per Apple's documentation, the token is an
+    /// opaque object that must be passed back to `-endActivity:`.
+    active_activities: HashMap<id, ActivityInfo>,
+}
+
+/// Bookkeeping for one outstanding activity assertion.
+struct ActivityInfo {
+    options: u64,
+    reason: String,
 }
 
 fn assert_process_info_singleton(env: &mut Environment, this: id) {
@@ -270,21 +282,77 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: - Activity assertions (iOS 7+)
 // =========================================================================
 
-- (id)beginActivityWithOptions:(u64)_options reason:(id)_reason {
+- (id)beginActivityWithOptions:(u64)options reason:(id)reason {
     assert_process_info_singleton(env, this);
-    log!("TODO: [NSProcessInfo beginActivityWithOptions:reason:] — returning stub token");
-    this
+
+    // Per the NSProcessInfo documentation the return value is an opaque
+    // activity token that must be passed back to -endActivity:. Returning
+    // `this` (as the old stub did) is wrong: the app could then pass the
+    // process-info object itself back to -endActivity:, and two concurrent
+    // activities would be indistinguishable. Give out unique NSObject
+    // tokens instead, like -NSNotificationCenter's block-observation
+    // tokens, and remember them so -endActivity: can match them.
+    let token: id = msg_class![env; NSObject new];
+    retain(env, token);
+
+    let reason_str = if reason == nil {
+        String::new()
+    } else {
+        ns_string::to_rust_string(env, reason).into_owned()
+    };
+    log_dbg!(
+        "[NSProcessInfo beginActivityWithOptions:{:#x} reason:{:?}] -> token {:?}",
+        options,
+        reason_str,
+        token
+    );
+
+    let state = &mut env.framework_state.foundation.ns_process_info;
+    state
+        .active_activities
+        .insert(token, ActivityInfo { options, reason: reason_str });
+
+    token
 }
 
-- (())endActivity:(id)_activity {
+- (())endActivity:(id)activity {
     assert_process_info_singleton(env, this);
+    if activity == nil {
+        // Passing nil is a caller bug; Apple's documentation does not
+        // define the behaviour, so just ignore it.
+        return;
+    }
+    let state = &mut env.framework_state.foundation.ns_process_info;
+    match state.active_activities.remove(&activity) {
+        Some(info) => {
+            log_dbg!(
+                "[(NSProcessInfo*){:?} endActivity:{:?}] ended activity \"{}\" (options {:#x})",
+                this,
+                activity,
+                info.reason,
+                info.options
+            );
+            release(env, activity);
+        }
+        None => {
+            log!(
+                "Warning: [NSProcessInfo endActivity:{:?}] called with an unknown activity token; ignoring.",
+                activity
+            );
+        }
+    }
 }
 
-- (())performActivityWithOptions:(u64)_options
-                          reason:(id)_reason
+- (())performActivityWithOptions:(u64)options
+                          reason:(id)reason
                       usingBlock:(id)block {
     assert_process_info_singleton(env, this);
+    // Apple's contract: apply the activity for the duration of the block.
+    // (The `wait` behaviour only matters across threads, which HLE does not
+    // model — the block is always run synchronously here.)
+    let token: id = msg![env; this beginActivityWithOptions:options reason:reason];
     let _: () = msg![env; block invoke];
+    let _: () = msg![env; this endActivity:token];
 }
 
 // =========================================================================

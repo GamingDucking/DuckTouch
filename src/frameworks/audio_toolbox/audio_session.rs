@@ -11,6 +11,8 @@ use crate::dyld::{export_c_func, FunctionExports};
 use crate::frameworks::carbon_core::OSStatus;
 use crate::frameworks::core_audio_types::{debug_fourcc, fourcc};
 use crate::frameworks::core_foundation::cf_run_loop::{CFRunLoopMode, CFRunLoopRef};
+use crate::frameworks::foundation::ns_string;
+use crate::objc::id;
 use crate::mem::{guest_size_of, ConstVoidPtr, MutPtr, MutVoidPtr};
 use crate::Environment;
 
@@ -244,11 +246,13 @@ pub fn AudioSessionGetProperty(
                 session.preferred_hardware_io_buffer_duration,
             );
         }
-        kAudioSessionProperty_AudioInputAvailable => {
-            env.mem.write(out_data.cast::<u32>(), 0);
-        }
         kAudioSessionProperty_AudioRoute => {
-            env.mem.write(out_data.cast::<u32>(), 0);
+            // Per the Audio Session Services Reference this property is a
+            // read-only CFStringRef describing the current route, e.g.
+            // "SpeakerAndMicrophone" (the default iPhone route). Returning
+            // NULL made apps that parse the route string misbehave.
+            let route: id = ns_string::get_static_str(env, "SpeakerAndMicrophone");
+            env.mem.write(out_data.cast(), route.to_bits() as u32);
         }
         kAudioSessionProperty_OverrideCategoryMixWithOthers => {
             env.mem
@@ -333,6 +337,19 @@ pub fn AudioSessionSetProperty(
         kAudioSessionProperty_OverrideAudioRoute => {
             // Значение игнорируем (у нас один фиксированный маршрут), но не
             // жалуемся.
+        }
+        kAudioSessionProperty_AudioRoute
+        | kAudioSessionProperty_OtherAudioIsPlaying
+        | kAudioSessionProperty_AudioInputAvailable
+        | kAudioSessionProperty_CurrentHardwareSampleRate
+        | kAudioSessionProperty_CurrentHardwareIOBufferDuration
+        | kAudioSessionProperty_CurrentHardwareOutputVolume
+        | kAudioSessionProperty_CurrentHardwareInputNumberChannels
+        | kAudioSessionProperty_CurrentHardwareOutputNumberChannels => {
+            // These properties are read-only per Apple's documentation
+            // ("Audio Session Programming Guide": hardware state cannot be
+            // changed by the client). Accept the call with no error rather
+            // than logging a TODO every time an app probes the hardware.
         }
         kAudioSessionProperty_OverrideCategoryMixWithOthers => {
             session.mix_with_others = env.mem.read(in_data.cast::<u32>());
