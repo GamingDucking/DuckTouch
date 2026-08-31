@@ -517,10 +517,25 @@ fn fegetround(env: &mut Environment) -> i32 {
     env.libc_state.math.rounding_direction
 }
 fn fesetround(env: &mut Environment, round: i32) -> i32 {
-    assert!(round == FE_TONEAREST || round == FE_TOWARDZERO);
-    // TODO
-    env.libc_state.math.rounding_direction = round;
-    0 // Success
+    // Per the C standard (7.6.3.2 fesetround), the argument must be one of
+    // the implementation's supported rounding-direction macros; the four
+    // IEEE 754 modes below are all supported by our rint()/nearbyint().
+    if round == FE_TONEAREST
+        || round == FE_TOWARDZERO
+        || round == FE_UPWARD
+        || round == FE_DOWNWARD
+    {
+        env.libc_state.math.rounding_direction = round;
+        0 // Success
+    } else {
+        // An invalid mode argument is not a fatal error for the guest;
+        // reject it and leave the current rounding direction unchanged.
+        log!(
+            "Warning: fesetround({:#x}): invalid rounding direction; ignoring.",
+            round
+        );
+        1 // Non-zero: failure
+    }
 }
 
 // Remainder functions
@@ -537,7 +552,28 @@ fn fmodf(env: &mut Environment, arg1: f32, arg2: f32) -> f32 {
 }
 
 // Maximum, minimum and positive difference functions
-// TODO: implement fdim
+//
+// fdim(x, y) is the "positive difference" (C99 7.12.11): x - y when
+// x > y, +0.0 otherwise. NaN arguments propagate; the comparison is done
+// first so that (x - y).max(0.0) can't wrongly return NaN when x <= y.
+fn fdim(_env: &mut Environment, arg1: f64, arg2: f64) -> f64 {
+    if arg1.is_nan() || arg2.is_nan() {
+        f64::NAN
+    } else if arg1 > arg2 {
+        arg1 - arg2
+    } else {
+        0.0
+    }
+}
+fn fdimf(_env: &mut Environment, arg1: f32, arg2: f32) -> f32 {
+    if arg1.is_nan() || arg2.is_nan() {
+        f32::NAN
+    } else if arg1 > arg2 {
+        arg1 - arg2
+    } else {
+        0.0
+    }
+}
 fn fmax(_env: &mut Environment, arg1: f64, arg2: f64) -> f64 {
     arg1.max(arg2)
 }
@@ -583,33 +619,59 @@ fn _ZNSt6vectorIN8InputMgr7KeyDataESaIS1_EE14_M_fill_insertEN9__gnu_cxx17__norma
 }
 
 fn nearbyintf(env: &mut Environment, arg: f32) -> f32 {
-    // TODO: handle errno properly
+    // nearbyint() rounds using the current rounding mode but never raises
+    // the inexact exception; we do not model that exception anyway, so it
+    // behaves the same as rintf(). (C99 7.20.6.3)
     set_errno(env, 0);
-    arg.log10()
+    rintf(env, arg)
 }
 
 fn nearbyint(env: &mut Environment, arg: f64) -> f64 {
-    // TODO: handle errno properly
     set_errno(env, 0);
-    arg.log10()
+    rint(env, arg)
 }
 
-fn llroundf(env: &mut Environment, arg: f32) -> f32 {
-    // TODO: handle errno properly
+fn llroundf(env: &mut Environment, arg: f32) -> i64 {
+    // Per the C standard (C99 7.20.6.5), llround rounds its argument to the
+    // nearest integer, halfway cases away from zero, regardless of the
+    // current rounding mode. The result is saturated on overflow because a
+    // domain error would need FE_INVALID handling we do not model.
     set_errno(env, 0);
-    arg.log10()
+    llround_impl(arg as f64)
 }
 
-fn llround(env: &mut Environment, arg: f64) -> f64 {
-    // TODO: handle errno properly
+fn llround(env: &mut Environment, arg: f64) -> i64 {
     set_errno(env, 0);
-    arg.log10()
+    llround_impl(arg)
+}
+
+fn llround_impl(arg: f64) -> i64 {
+    if arg.is_nan() {
+        // Domain error; the standard leaves the returned value unspecified.
+        return 0;
+    }
+    // f64::round rounds halfway cases away from zero, which is exactly the
+    // llround rule. Clamp so huge inputs saturate instead of wrapping.
+    arg.round().clamp(i64::MIN as f64, i64::MAX as f64) as i64
 }
 
 fn rintf(env: &mut Environment, arg: f32) -> f32 {
     // TODO: handle errno properly
     set_errno(env, 0);
-    arg.log10()
+
+    match env.libc_state.math.rounding_direction {
+        FE_TONEAREST => arg.round_ties_even(),
+        FE_TOWARDZERO => arg.trunc(),
+        FE_UPWARD => arg.ceil(),
+        FE_DOWNWARD => arg.floor(),
+        other => {
+            log!(
+                "Warning: rint/nearbyint: unknown rounding mode {}; defaulting to round-to-nearest.",
+                other
+            );
+            arg.round_ties_even()
+        }
+    }
 }
 
 // Other
@@ -971,6 +1033,8 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(fmaxf(_, _)),
     export_c_func!(fmin(_, _)),
     export_c_func!(fminf(_, _)),
+    export_c_func!(fdim(_, _)),
+    export_c_func!(fdimf(_, _)),
     export_c_func!(_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6__initEPKcm(_, _)),
     export_c_func!(_ZNSt6vectorIN8InputMgr7KeyDataESaIS1_EE7reserveEm(_, _)),
     export_c_func!(_ZNSt6vectorIN8InputMgr9TouchDataESaIS1_EE7reserveEm(_, _)),
