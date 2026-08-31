@@ -14,12 +14,13 @@ use crate::libc::sysctl::SysInfoType::String;
 use crate::mem::{guest_size_of, ConstPtr, GuestUSize, MutPtr, MutVoidPtr, PAGE_SIZE};
 use crate::Environment;
 
-static SYSCTL_VALUES: [((i32, i32), &str, SysInfoType); 30] = [
+static SYSCTL_VALUES: [((i32, i32), &str, SysInfoType); 37] = [
     // Generic CPU, I/O
     ((6,1), "hw.machine" , String(b"iPhone2,1")), // overridden dynamically below
     ((6,2), "hw.model" , String(b"N88AP")),
     ((6,3), "hw.ncpu" , SysInfoType::Int32(1)),
     ((6,25), "hw.activecpu" , SysInfoType::Int32(1)), // Активные ядра
+    ((6,26), "hw.activecpu" , SysInfoType::Int32(1)), // HW_ACTIVECPU
     // Physical / logical CPU counters introduced in 10.5 / iOS 4 and
     // documented in `<sys/sysctl.h>`. iPhone 1/2G/3G are single-core, so
     // every counter reads back as 1 — matching what a real iOS 4 device
@@ -31,15 +32,21 @@ static SYSCTL_VALUES: [((i32, i32), &str, SysInfoType); 30] = [
     ((0,0), "hw.logicalcpu_max" , SysInfoType::Int32(1)),
     ((0,0), "hw.cputype" , SysInfoType::Int32(12)),
     ((0,0), "hw.cpusubtype" , SysInfoType::Int32(6)),
+    ((6,4), "hw.byteorder" , SysInfoType::Int32(1234)), // little-endian
+    ((6,12), "hw.machine_arch" , String(b"armv6")), // overridden dynamically below
+    ((6,13), "hw.vectorunit" , SysInfoType::Int32(1)), // VFP present
     ((6,15), "hw.cpufrequency" , SysInfoType::Int64(412000000)),
     ((6,16), "hw.cpufrequency_max", SysInfoType::Int64(412000000)),
     ((6,14), "hw.busfrequency" , SysInfoType::Int64(103000000)),
 
     // Честные параметры кэша для ARM1176JZF-S (iPhone 2G / 3G)
-    ((0,0), "hw.cachelinesize", SysInfoType::Int32(32)),
-    ((0,0), "hw.l1dcachesize", SysInfoType::Int32(16384)),
-    ((0,0), "hw.l2cachesize", SysInfoType::Int32(0)),
-    ((0,0), "hw.l3cachesize", SysInfoType::Int32(0)),
+    ((6,17), "hw.l1icachesize", SysInfoType::Int32(16384)),
+    ((6,18), "hw.l1dcachesize", SysInfoType::Int32(16384)),
+    ((6,19), "hw.l2icachesize", SysInfoType::Int32(0)),
+    ((6,20), "hw.l2cachesize", SysInfoType::Int32(0)),
+    ((6,21), "hw.l3icachesize", SysInfoType::Int32(0)),
+    ((6,22), "hw.l3cachesize", SysInfoType::Int32(0)),
+    ((6,23), "hw.tbfreq", SysInfoType::Int64(1000000000)),
 
     ((1, 14), "kern.osversion", String(b"10B141")),
     ((6,5), "hw.physmem" , SysInfoType::Int32(536870912)),
@@ -115,6 +122,23 @@ fn sysctl(
     }
 
     let (name0, name1) = (env.mem.read(name), env.mem.read(name + 1));
+
+    // hw.machine_arch (HW_MACHINE_ARCH) depends on the emulated device: the
+    // ARM1176-based models are armv6, the Cortex-A8+ models are armv7.
+    if name0 == 6 && name1 == 12 {
+        let arch: &'static [u8] = match env.window().device_family().machine_name() {
+            "iPhone1,1" | "iPhone1,2" | "iPod1,1" | "iPod2,1" => b"armv6",
+            _ => b"armv7",
+        };
+        return sysctl_generic(
+            env,
+            |_env| Some(("hw.machine_arch", SysInfoType::String(arch))),
+            oldp,
+            oldlenp,
+            newp,
+            newlen,
+        );
+    }
 
     // hw.machine depends on the emulated device family
     // В SYSCTL_VALUES hw.machine соответствует ключу (6, 1)
@@ -217,6 +241,14 @@ fn sysctlbyname(
             if name_str == "hw.machine" {
                 let machine: &'static str = env.window().device_family().machine_name();
                 return Some(("hw.machine", String(machine.as_bytes())));
+            }
+            if name_str == "hw.machine_arch" {
+                let machine: &'static str = env.window().device_family().machine_name();
+                let arch: &'static [u8] = match machine {
+                    "iPhone1,1" | "iPhone1,2" | "iPod1,1" | "iPod2,1" => b"armv6",
+                    _ => b"armv7",
+                };
+                return Some(("hw.machine_arch", SysInfoType::String(arch)));
             }
             if name_str == "machdep.cpu.vendor" {
                 return Some(("machdep.cpu.vendor", String(b"Apple")));
