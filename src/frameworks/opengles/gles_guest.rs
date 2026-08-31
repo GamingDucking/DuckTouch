@@ -84,12 +84,20 @@ where
         );
         return U::default();
     };
+    // Clear any sticky host-GL error before the call so that the post-call
+    // trace report only reflects errors raised by *this* dispatch, not
+    // leftovers from untraced internal code paths (EAGL present, context
+    // sync, etc.). Without this, one bad call makes every later traced
+    // call report the same code at the wrong line.
+    if trace {
+        unsafe { gles.GetError() };
+    }
     let res = f(gles.as_mut(), &mut env.mem);
     if trace {
         let err = unsafe { gles.GetError() };
         if err != 0 {
             log!(
-                "[--trace-gl-errors] glGetError() = {:#x} after host GLES call \
+                "[--trace-gl-errors] glGetError() = {:#x} raised by host GLES call \
                  dispatched from {}:{}",
                 err,
                 caller.file(),
@@ -137,7 +145,7 @@ where
         let err = unsafe { gles.GetError() };
         if err != 0 {
             log!(
-                "[--trace-gl-errors] glGetError() = {:#x} after host GLES call \
+                "[--trace-gl-errors] glGetError() = {:#x} raised by host GLES call \
                  dispatched from {}:{}",
                 err,
                 caller.file(),
