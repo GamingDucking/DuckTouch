@@ -21,6 +21,11 @@
 use super::gl21compat_raw as gl21;
 use super::gl21compat_raw::types::*;
 use super::gles11_raw as gles11; // constants only
+
+// GL 2.1 core lacks the OES_read_format names, but the numeric values are
+// identical (0x8B9B / 0x8B98); alias them here for the GET_PARAMS table.
+const IMPLEMENTATION_COLOR_READ_FORMAT_OES: GLenum = 0x8B9B;
+const IMPLEMENTATION_COLOR_READ_TYPE_OES: GLenum = 0x8B98;
 use super::gles_generic::GLES;
 use super::util::{
     fixed_to_float, float_to_fixed, matrix_fixed_to_float, try_decode_pvrtc, PalettedTextureFormat,
@@ -156,15 +161,18 @@ const GET_PARAMS: ParamTable = ParamTable(&[
     (gl21::ALIASED_LINE_WIDTH_RANGE, ParamType::Float, 2),
     (gl21::ALPHA_BITS, ParamType::Int, 1),
     (gl21::ALPHA_TEST, ParamType::Boolean, 1),
-    (gl21::ALPHA_TEST_FUNC, ParamType::Int, 1),
-    // TODO: ALPHA_TEST_REF (has special type conversion behavior)
+    // Type "R" per the GLES 1.1 spec Table 6.1: a plain float clamped to
+    // [0, 1] on set; integer queries round to nearest (the generic Float
+    // arm below implements that rounding).
+    (gl21::ALPHA_TEST_REF, ParamType::Float, 1),
     (gl21::ARRAY_BUFFER_BINDING, ParamType::Int, 1),
     (gl21::BLEND, ParamType::Boolean, 1),
     (gl21::BLEND_DST, ParamType::Int, 1),
     (gl21::BLEND_SRC, ParamType::Int, 1),
     (gl21::BLUE_BITS, ParamType::Int, 1),
     (gl21::CLIENT_ACTIVE_TEXTURE, ParamType::Int, 1),
-    // TODO: arbitrary number of clip planes?
+    // OpenGL (and therefore this passthrough backend) exposes exactly six
+    // clip planes, which is also what the GLES 1.1 spec requires at minimum.
     (gl21::CLIP_PLANE0, ParamType::Boolean, 1),
     (gl21::CLIP_PLANE1, ParamType::Boolean, 1),
     (gl21::CLIP_PLANE2, ParamType::Boolean, 1),
@@ -176,20 +184,29 @@ const GET_PARAMS: ParamTable = ParamTable(&[
     (gl21::COLOR_ARRAY_SIZE, ParamType::Int, 1),
     (gl21::COLOR_ARRAY_STRIDE, ParamType::Int, 1),
     (gl21::COLOR_ARRAY_TYPE, ParamType::Int, 1),
-    (gl21::COLOR_CLEAR_VALUE, ParamType::FloatSpecial, 4), // TODO correct type
+    (gl21::COLOR_CLEAR_VALUE, ParamType::Color, 4),
     (gl21::COLOR_LOGIC_OP, ParamType::Boolean, 1),
     (gl21::COLOR_MATERIAL, ParamType::Boolean, 1),
     (gl21::COLOR_WRITEMASK, ParamType::Boolean, 4),
-    // TODO: COMPRESSED_TEXTURE_FORMATS (needs to return only supported formats)
+    // The compressed-format list is dynamically sized; the `Int` getter arm
+    // passes the query through to the host driver, which sizes the reply
+    // itself (GL 2.1 supports both queries natively). The returned list is
+    // the host driver's supported set, which is honest: those are exactly
+    // the formats a compressed upload would succeed with.
+    (gl21::NUM_COMPRESSED_TEXTURE_FORMATS, ParamType::Int, 1),
+    (gl21::COMPRESSED_TEXTURE_FORMATS, ParamType::Int, 1),
     (gl21::CULL_FACE, ParamType::Boolean, 1),
     (gl21::CULL_FACE_MODE, ParamType::Int, 1),
-    (gl21::CURRENT_COLOR, ParamType::FloatSpecial, 4), // TODO correct type
-    // TODO: CURRENT_NORMAL (has special type conversion behavior)
+    (gl21::CURRENT_COLOR, ParamType::Color, 4),
+    // Type "R" (unclamped float vector): integer queries round to nearest.
+    (gl21::CURRENT_NORMAL, ParamType::Float, 3),
     (gl21::CURRENT_TEXTURE_COORDS, ParamType::Float, 4),
     (gl21::DEPTH_BITS, ParamType::Int, 1),
-    // TODO: DEPTH_CLEAR_VALUE (has special type conversion behavior)
+    // Type "R": clamped to [0, 1] on set, rounded on integer queries.
+    (gl21::DEPTH_CLEAR_VALUE, ParamType::Float, 1),
     (gl21::DEPTH_FUNC, ParamType::Int, 1),
-    // TODO: DEPTH_RANGE (has special type conversion behavior)
+    // Type "R", two components in [0, 1]; integer queries round.
+    (gl21::DEPTH_RANGE, ParamType::Float, 2),
     (gl21::DEPTH_TEST, ParamType::Boolean, 1),
     (gl21::DEPTH_WRITEMASK, ParamType::Boolean, 1),
     (gl21::DITHER, ParamType::Boolean, 1),
@@ -203,9 +220,16 @@ const GET_PARAMS: ParamTable = ParamTable(&[
     (gl21::FOG_END, ParamType::Float, 1),
     (gl21::FRONT_FACE, ParamType::Int, 1),
     (gl21::GREEN_BITS, ParamType::Int, 1),
-    // TODO: IMPLEMENTATION_COLOR_READ_FORMAT_OES? (not shared)
-    // TODO: IMPLEMENTATION_COLOR_READ_TYPE_OES? (not shared)
-    // TODO: LIGHT_MODEL_AMBIENT (has special type conversion behavior)
+    // OES_read_format: we can only guarantee what our ReadPixels path
+    // handles natively, which is RGBA/UNSIGNED_BYTE (the commonly-reported
+    // combination on iPhone OS PowerVR drivers as well).
+    (
+        IMPLEMENTATION_COLOR_READ_FORMAT_OES,
+        ParamType::Int,
+        1,
+    ),
+    (IMPLEMENTATION_COLOR_READ_TYPE_OES, ParamType::Int, 1),
+    (gl21::LIGHT_MODEL_AMBIENT, ParamType::Color, 4),
     (gl21::LIGHT_MODEL_TWO_SIDE, ParamType::Boolean, 1),
     // TODO: arbitrary number of lights?
     (gl21::LIGHT0, ParamType::Boolean, 1),
@@ -338,7 +362,7 @@ const FOG_PARAMS: ParamTable = ParamTable(&[
     (gl21::FOG_DENSITY, ParamType::Float, 1),
     (gl21::FOG_START, ParamType::Float, 1),
     (gl21::FOG_END, ParamType::Float, 1),
-    (gl21::FOG_COLOR, ParamType::FloatSpecial, 4), // TODO correct type
+    (gl21::FOG_COLOR, ParamType::Color, 4),
 ]);
 
 /// Table of `glLight` parameters shared by OpenGL ES 1.1 and OpenGL 2.1.
