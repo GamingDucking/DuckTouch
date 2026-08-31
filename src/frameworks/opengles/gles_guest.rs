@@ -1356,6 +1356,40 @@ unsafe fn guard_client_vertex_arrays(gles: &mut dyn GLES, mem: &Mem) -> Vec<GLui
     disabled
 }
 
+
+/// Valid primitive modes for GLES1/2 draw calls. A guest passing anything else
+/// would raise GL_INVALID_ENUM (0x500) on the host driver; we filter those
+/// draws out with a one-time warning instead of feeding the driver garbage.
+const VALID_DRAW_MODES: [GLenum; 7] = [
+    0x0000, // GL_POINTS
+    0x0001, // GL_LINES
+    0x0002, // GL_LINE_LOOP
+    0x0003, // GL_LINE_STRIP
+    0x0004, // GL_TRIANGLES
+    0x0005, // GL_TRIANGLE_STRIP
+    0x0006, // GL_TRIANGLE_FAN
+];
+
+fn draw_mode_is_valid(mode: GLenum) -> bool {
+    VALID_DRAW_MODES.contains(&mode)
+}
+
+/// Warn once per (call site, bad mode) about an invalid draw mode.
+fn warn_invalid_draw_mode(what: &str, mode: GLenum) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SEEN: AtomicBool = AtomicBool::new(false);
+    if !SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        log!(
+            "Warning: guest issued a draw call with invalid mode 0x{:x} ({}); \
+             skipping the draw instead of feeding the host driver an invalid \
+             enum (avoids GL_INVALID_ENUM spam and driver-side stalls)",
+            mode,
+            what
+        );
+    }
+}
+
+
 fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsizei) {
     {
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -1380,6 +1414,10 @@ fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsize
                 );
             }
         }
+    }
+    if !draw_mode_is_valid(mode) {
+        warn_invalid_draw_mode("glDrawArrays", mode);
+        return;
     }
     with_ctx_and_mem(env, |gles, mem| unsafe {
         let disabled_arrays = guard_client_vertex_arrays(gles, mem);
@@ -1437,6 +1475,10 @@ fn glDrawElements(
                 );
             }
         }
+    }
+    if !draw_mode_is_valid(mode) {
+        warn_invalid_draw_mode("glDrawElements", mode);
+        return;
     }
     with_ctx_and_mem(env, |gles, mem| unsafe {
         let disabled_arrays = guard_client_vertex_arrays(gles, mem);
