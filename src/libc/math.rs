@@ -681,6 +681,38 @@ fn nan(env: &mut Environment, arg: ConstPtr<u8>) -> f32 {
     f32::NAN
 }
 
+// Cube root. Unlike pow(x, 1.0/3.0), cbrt() is exact at +/-1.0 and 0.0,
+// and it is odd: cbrt(-x) == -cbrt(x). We compute the magnitude via a
+// Newton-Raphson iteration on a scaled argument to avoid pow()'s
+// intermediate overflow for extreme inputs (C99 7.12.7.1).
+fn cbrt(_env: &mut Environment, arg: f64) -> f64 {
+    if !arg.is_finite() || arg == 0.0 {
+        return arg; // ±0.0, ±inf, NaN pass through
+    }
+    let sign = arg.signum();
+    let magnitude = cbrt_magnitude(arg.abs());
+    sign * magnitude
+}
+
+fn cbrtf(env: &mut Environment, arg: f32) -> f32 {
+    cbrt(env, arg as f64) as f32
+}
+
+// cbrt() of a positive, finite value, using exponent folding so the
+// Newton iteration always starts in [1, 8) and converges in a few steps.
+fn cbrt_magnitude(a: f64) -> f64 {
+    debug_assert!(a.is_finite() && a > 0.0);
+    // Split off a multiple of 8 so the scaled argument lies in [1, 8).
+    let e = (a.log2().floor() / 3.0).floor() as i32;
+    let scaled = a * 2f64.powi(-3 * e);
+    // Initial guess: cubic through (1,1) and (8,2) on the log scale.
+    let mut r = 0.5 * scaled + 0.5;
+    for _ in 0..4 {
+        r = (2.0 * r + scaled / (r * r)) / 3.0;
+    }
+    r * 2f64.powi(e)
+}
+
 fn hypot(env: &mut Environment, arg1: f64, arg2: f64) -> f64 {
     if arg1.is_infinite() {
         return f64::INFINITY;
@@ -1048,6 +1080,8 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(nan(_)),
     export_c_func!(hypot(_, _)),
     export_c_func!(hypotf(_, _)),
+    export_c_func!(cbrt(_)),
+    export_c_func!(cbrtf(_)),
     export_c_func!(__fpclassifyf(_)),
     export_c_func!(__isnanf(_)),
     export_c_func!(__isnand(_)),
