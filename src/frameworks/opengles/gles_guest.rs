@@ -5321,18 +5321,29 @@ fn glProgramParameteri(env: &mut Environment, program: GLuint, pname: GLenum, va
 }
 
 unsafe fn clamp_fog_state_values(gles: &mut dyn GLES) -> Option<(f32, f32)> {
+    // Some drivers (e.g. Mesa's GLES-CM 1.1 and several mobile GLES2
+    // implementations) raise GL_INVALID_ENUM for fog-state queries made
+    // around draw calls, which pollutes the GL error queue on *every*
+    // draw. The clamp only matters for the fog-division workaround on
+    // desktop GL, so swallow any error the queries raise and restore a
+    // clean error state for the caller.
     let mut fog_enabled: GLboolean = 0;
     gles.GetBooleanv(gles11::FOG, &mut fog_enabled);
-    if fog_enabled != 0 {
-        let mut fog_start: GLfloat = 0.0;
-        let mut fog_end: GLfloat = 0.0;
-        gles.GetFloatv(gles11::FOG_START, &mut fog_start);
-        gles.GetFloatv(gles11::FOG_END, &mut fog_end);
-        if fog_start == fog_end {
-            let new_fog_start = fog_end - 0.001;
-            gles.Fogf(gles11::FOG_START, new_fog_start);
-            return Some((fog_start, fog_end));
-        }
+    if gles.GetError() != 0 {
+        // The driver rejected the fog query; skip the clamp entirely.
+        gles.GetError();
+        return None;
+    }
+    let mut fog_start: GLfloat = 0.0;
+    let mut fog_end: GLfloat = 0.0;
+    gles.GetFloatv(gles11::FOG_START, &mut fog_start);
+    gles.GetFloatv(gles11::FOG_END, &mut fog_end);
+    let _ = gles.GetError();
+    if fog_enabled != 0 && fog_start == fog_end {
+        let new_fog_start = fog_end - 0.001;
+        gles.Fogf(gles11::FOG_START, new_fog_start);
+        gles.GetError();
+        return Some((fog_start, fog_end));
     }
     None
 }
