@@ -349,19 +349,22 @@ fn exp2f(env: &mut Environment, arg: f32) -> f32 {
     set_errno(env, 0);
     arg.exp2()
 }
-fn ldexp(env: &mut Environment, arg: f64, n: i32) -> f64 {
-    // TODO: handle errno properly
-    set_errno(env, 0);
-    assert!(!arg.is_infinite()); // TODO
-
-    arg * 2f64.powf(n as _)
+fn ldexp(_env: &mut Environment, arg: f64, n: i32) -> f64 {
+    // ldexp(x, 0) must return x unchanged, including ±0.0, ±inf and NaN.
+    // For n == 0 the multiply below would still be exact, but skip it
+    // anyway so NaN payload/sign of zero are guaranteed preserved.
+    if n == 0 || !arg.is_finite() || arg == 0.0 {
+        arg
+    } else {
+        arg * 2f64.powi(n.clamp(-2000, 2000))
+    }
 }
-fn ldexpf(env: &mut Environment, arg: f32, n: i32) -> f32 {
-    // TODO: handle errno properly
-    set_errno(env, 0);
-    assert!(!arg.is_infinite()); // TODO
-
-    arg * 2f32.powf(n as _)
+fn ldexpf(_env: &mut Environment, arg: f32, n: i32) -> f32 {
+    if n == 0 || !arg.is_finite() || arg == 0.0 {
+        arg
+    } else {
+        arg * 2f32.powi(n.clamp(-2000, 2000))
+    }
 }
 fn frexpf(env: &mut Environment, arg: f32, exp: MutPtr<i32>) -> f32 {
     frexp(env, arg.into(), exp) as f32
@@ -676,8 +679,15 @@ fn rintf(env: &mut Environment, arg: f32) -> f32 {
 
 // Other
 fn nan(env: &mut Environment, arg: ConstPtr<u8>) -> f32 {
-    assert_eq!(env.mem.read(arg), b'\0');
-    // TODO
+    // C99 7.12.11: the sequence pointed to by `arg` is a taggponent —
+    // hexadecimal digits (case-insensitive, possibly with a leading '0x')
+    // forming the significand bits of the quiet NaN. Empty string means
+    // an unspecified taggponent. We don't model the bit pattern beyond
+    // returning a quiet NaN, but we must not panic on non-empty tags.
+    let tag = env.mem.cstr_at_utf8(arg).unwrap_or_default().to_owned();
+    if !tag.is_empty() {
+        log_dbg!("nan(\"{tag}\"): taggponent ignored, returning quiet NaN");
+    }
     f32::NAN
 }
 
