@@ -3475,6 +3475,18 @@ fn glVertexAttrib4f(
         gles.VertexAttrib4f(index, x, y, z, w)
     });
 }
+fn glVertexAttrib2fv(env: &mut Environment, index: GLuint, values: ConstPtr<GLfloat>) {
+    let value = env.mem.read(values);
+    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.VertexAttrib2fv(index, &value) });
+}
+fn glVertexAttrib3fv(env: &mut Environment, index: GLuint, values: ConstPtr<GLfloat>) {
+    let value = env.mem.read(values);
+    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.VertexAttrib3fv(index, &value) });
+}
+fn glVertexAttrib4fv(env: &mut Environment, index: GLuint, values: ConstPtr<GLfloat>) {
+    let value = env.mem.read(values);
+    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.VertexAttrib4fv(index, &value) });
+}
 fn glUniform1i(env: &mut Environment, location: GLint, v0: GLint) {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.Uniform1i(location, v0) });
 }
@@ -5558,8 +5570,11 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(glVertexAttrib1f(_, _)),
     export_c_func!(glVertexAttrib1fv(_, _)),
     export_c_func!(glVertexAttrib2f(_, _, _)),
+    export_c_func!(glVertexAttrib2fv(_, _)),
     export_c_func!(glVertexAttrib3f(_, _, _, _)),
+    export_c_func!(glVertexAttrib3fv(_, _)),
     export_c_func!(glVertexAttrib4f(_, _, _, _, _)),
+    export_c_func!(glVertexAttrib4fv(_, _)),
     export_c_func!(glUniform1i(_, _)),
     export_c_func!(glUniform2i(_, _, _)),
     export_c_func!(glUniform3i(_, _, _, _)),
