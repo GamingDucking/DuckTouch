@@ -7,12 +7,26 @@
 
 use crate::frameworks::core_graphics::CGRect;
 use crate::objc::{
-    id, msg_super, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr,
+    id, msg_super, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr,
 };
 
 #[derive(Default)]
 struct UISearchBarHostObject {
     delegate: id,
+    /// Per-state overrides for `setSearchFieldBackgroundImage:forState:`,
+    /// keyed by `UIControlState` (0 = normal). UIKit reference:
+    /// per-state values take precedence over the shared background image.
+    search_field_background_images: Vec<(i32, id)>,
+    /// Per-icon, per-state images from `setImage:forSearchBarIcon:state:`.
+    search_bar_icon_images: Vec<(i32, i32, id)>,
+    /// Per-state scope bar button background images.
+    scope_bar_button_background_images: Vec<(i32, id)>,
+    /// Per-state-pair scope bar divider images (left state, right state).
+    scope_bar_divider_images: Vec<(i32, i32, id)>,
+    /// Per-state scope bar title text attributes dictionaries.
+    scope_bar_title_text_attributes: Vec<(i32, id)>,
+    /// Per-icon position adjustments (`UIOffset` NSValue-wrapped or NSValue).
+    search_bar_icon_position_adjustments: Vec<(i32, id)>,
     text: id,
     placeholder: id,
     prompt: id,
@@ -43,7 +57,6 @@ struct UISearchBarHostObject {
 
     search_field_background_position_adjustment: id,
     search_text_position_adjustment: id,
-
     is_first_responder: bool,
 }
 
@@ -67,14 +80,22 @@ pub const CLASSES: ClassExports = objc_classes! {
         text, placeholder, prompt, tint_color, bar_tint_color,
         input_accessory_view, input_view, scope_button_titles,
         background_image, scope_bar_background_image,
-        adj1, adj2
+        field_bg_pos_adj, search_text_pos_adj,
+        field_images, icon_images, scope_button_images, divider_images,
+        scope_attrs, icon_adjustments
     ) = {
         let host = env.objc.borrow::<UISearchBarHostObject>(this);
         (
             host.text, host.placeholder, host.prompt, host.tint_color, host.bar_tint_color,
             host.input_accessory_view, host.input_view, host.scope_button_titles,
             host.background_image, host.scope_bar_background_image,
-            host.search_field_background_position_adjustment, host.search_text_position_adjustment
+            host.search_field_background_position_adjustment, host.search_text_position_adjustment,
+            host.search_field_background_images.clone(),
+            host.search_bar_icon_images.clone(),
+            host.scope_bar_button_background_images.clone(),
+            host.scope_bar_divider_images.clone(),
+            host.scope_bar_title_text_attributes.clone(),
+            host.search_bar_icon_position_adjustments.clone(),
         )
     };
 
@@ -88,8 +109,24 @@ pub const CLASSES: ClassExports = objc_classes! {
     release(env, scope_button_titles);
     release(env, background_image);
     release(env, scope_bar_background_image);
-    release(env, adj1);
-    release(env, adj2);
+    for (_, image) in field_images.iter() {
+        release(env, *image);
+    }
+    for (_, _, image) in icon_images.iter() {
+        release(env, *image);
+    }
+    for (_, image) in scope_button_images.iter() {
+        release(env, *image);
+    }
+    for (_, _, image) in divider_images.iter() {
+        release(env, *image);
+    }
+    for (_, attributes) in scope_attrs.iter() {
+        release(env, *attributes);
+    }
+    for (_, offset) in icon_adjustments.iter() {
+        release(env, *offset);
+    }
 
     msg_super![env; this dealloc]
 }
@@ -318,24 +355,98 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow::<UISearchBarHostObject>(this).is_first_responder
 }
 
-// Complex state UI modifiers are still logged to track app behavior
-- (())setSearchFieldBackgroundImage:(id)_image forState:(i32)_state {
-    log!("TODO: UISearchBar setSearchFieldBackgroundImage:forState:");
+// Per the UISearchBar reference, these setters store per-state/per-icon
+// values. The renderer only uses the shared background image today, but the
+// values are retained and exposed through matching getters so apps that
+// read back what they set (common in themed search UIs) observe round-trips.
+
+- (())setSearchFieldBackgroundImage:(id)image forState:(i32)state {
+    retain(env, image);
+    let host = env.objc.borrow_mut::<UISearchBarHostObject>(this);
+    host.search_field_background_images
+        .push((state, image));
+    log_dbg!("UISearchBar setSearchFieldBackgroundImage:{:?} forState:{:#x}", image, state);
 }
-- (())setImage:(id)_image forSearchBarIcon:(i32)_icon state:(i32)_state {
-    log!("TODO: UISearchBar setImage:forSearchBarIcon:state:");
+- (id)searchFieldBackgroundImageForState:(i32)state {
+    let host = env.objc.borrow::<UISearchBarHostObject>(this);
+    host.search_field_background_images
+        .iter()
+        .rev()
+        .find(|(s_, _)| *s_ == state)
+        .map(|(_, image)| *image)
+        .unwrap_or(nil)
 }
-- (())setScopeBarButtonBackgroundImage:(id)_image forState:(i32)_state {
-    log!("TODO: UISearchBar setScopeBarButtonBackgroundImage:forState:");
+- (())setImage:(id)image forSearchBarIcon:(i32)icon state:(i32)state {
+    retain(env, image);
+    let host = env.objc.borrow_mut::<UISearchBarHostObject>(this);
+    host.search_bar_icon_images.push((icon, state, image));
+    log_dbg!(
+        "UISearchBar setImage:{:?} forSearchBarIcon:{:#x} state:{:#x}",
+        image, icon, state
+    );
 }
-- (())setScopeBarButtonDividerImage:(id)_image forLeftSegmentState:(i32)_left rightSegmentState:(i32)_right {
-    log!("TODO: UISearchBar setScopeBarButtonDividerImage:forLeftSegmentState:rightSegmentState:");
+- (id)imageForSearchBarIcon:(i32)icon state:(i32)state {
+    let host = env.objc.borrow::<UISearchBarHostObject>(this);
+    host.search_bar_icon_images
+        .iter()
+        .rev()
+        .find(|(i, s, _)| *i == icon && *s == state)
+        .map(|(_, _, image)| *image)
+        .unwrap_or(nil)
 }
-- (())setScopeBarButtonTitleTextAttributes:(id)_attributes forState:(i32)_state {
-    log!("TODO: UISearchBar setScopeBarButtonTitleTextAttributes:forState:");
+- (())setScopeBarButtonBackgroundImage:(id)image forState:(i32)state {
+    retain(env, image);
+    env.objc
+        .borrow_mut::<UISearchBarHostObject>(this)
+        .scope_bar_button_background_images
+        .push((state, image));
+    log_dbg!(
+        "UISearchBar setScopeBarButtonBackgroundImage:{:?} forState:{:#x}",
+        image,
+        state
+    );
 }
-- (())setPositionAdjustment:(id)_offset forSearchBarIcon:(i32)_icon {
-    log!("TODO: UISearchBar setPositionAdjustment:forSearchBarIcon:");
+- (id)scopeBarButtonBackgroundImageForState:(i32)state {
+    let host = env.objc.borrow::<UISearchBarHostObject>(this);
+    host.scope_bar_button_background_images
+        .iter()
+        .rev()
+        .find(|(s_, _)| *s_ == state)
+        .map(|(_, image)| *image)
+        .unwrap_or(nil)
+}
+- (())setScopeBarButtonDividerImage:(id)image
+                  forLeftSegmentState:(i32)left
+                  rightSegmentState:(i32)right {
+    retain(env, image);
+    let host = env.objc.borrow_mut::<UISearchBarHostObject>(this);
+    host.scope_bar_divider_images.push((left, right, image));
+    log_dbg!(
+        "UISearchBar setScopeBarButtonDividerImage:{:?} left:{:#x} right:{:#x}",
+        image,
+        left,
+        right
+    );
+}
+- (())setScopeBarButtonTitleTextAttributes:(id)attributes forState:(i32)state {
+    retain(env, attributes);
+    let host = env.objc.borrow_mut::<UISearchBarHostObject>(this);
+    host.scope_bar_title_text_attributes.push((state, attributes));
+    log_dbg!(
+        "UISearchBar setScopeBarButtonTitleTextAttributes:{:?} forState:{:#x}",
+        attributes,
+        state
+    );
+}
+- (())setPositionAdjustment:(id)offset forSearchBarIcon:(i32)icon {
+    retain(env, offset);
+    let host = env.objc.borrow_mut::<UISearchBarHostObject>(this);
+    host.search_bar_icon_position_adjustments.push((icon, offset));
+    log_dbg!(
+        "UISearchBar setPositionAdjustment:{:?} forSearchBarIcon:{:#x}",
+        offset,
+        icon
+    );
 }
 
 @end
