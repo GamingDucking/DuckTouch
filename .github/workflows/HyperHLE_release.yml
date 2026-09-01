@@ -191,6 +191,8 @@ jobs:
       uses: actions/checkout@main
       with:
         submodules: recursive
+        fetch-depth: 0
+        fetch-tags: true
 
     - name: Cache Rust build artifacts
       uses: actions/cache@main
@@ -345,6 +347,7 @@ jobs:
         uses: actions/checkout@main
         with:
           fetch-depth: 0
+          fetch-tags: true
       - name: Check whether a HyperHLE release is due
         id: check
         env:
@@ -370,7 +373,6 @@ jobs:
           submodules: recursive
           fetch-depth: 0
           fetch-tags: true
-          fetch-depth: 0
       - name: Download macOS artifact
         uses: actions/download-artifact@main
         with:
