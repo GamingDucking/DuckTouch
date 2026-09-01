@@ -46,36 +46,37 @@ def getTouchHLEVersionCode() {
 }
 
 
+
 def hyperHLEKeystoreFile = System.getenv('HYPERHLE_KEYSTORE_FILE')
 def hyperHLEKeystoreB64 = System.getenv('HYPERHLE_KEYSTORE_B64')
 def hyperHLEKeystorePass = System.getenv('HYPERHLE_KEYSTORE_PASSWORD') ?: 'hyperhle'
 def hyperHLEKeyAlias = System.getenv('HYPERHLE_KEY_ALIAS') ?: 'hyperhle'
 
-signingConfigs {
-    release {
-        if (hyperHLEKeystoreB64 != null) {
-            def tmp = File.createTempFile('hyperhle', '.keystore')
-            tmp.bytes = new String(hyperHLEKeystoreB64).decodeBase64()
-            storeFile tmp
-        } else if (hyperHLEKeystoreFile != null) {
-            storeFile file(hyperHLEKeystoreFile)
-        } else {
-            // Stable fallback keystore committed to the repo, so that APK
-            // updates install over previous builds (same signing key).
-            storeFile file('../keystore/release.keystore')
-        }
-        storePassword hyperHLEKeystorePass
-        keyAlias hyperHLEKeyAlias
-        keyPassword hyperHLEKeystorePass
-    }
-    debug {
-        storeFile file('../debug.keystore')
-    }
-}
 
 android {
     ndkVersion "25.2.9519653"
     compileSdkVersion 35
+    signingConfigs {
+        release {
+            if (hyperHLEKeystoreB64 != null) {
+                def tmp = File.createTempFile('hyperhle', '.keystore')
+                tmp.bytes = new String(hyperHLEKeystoreB64).decodeBase64()
+                storeFile tmp
+            } else if (hyperHLEKeystoreFile != null) {
+                storeFile file(hyperHLEKeystoreFile)
+            } else {
+                // Stable fallback keystore committed to the repo, so that APK
+                // updates install over previous builds (same signing key).
+                storeFile file('../keystore/release.keystore')
+            }
+            storePassword hyperHLEKeystorePass
+            keyAlias hyperHLEKeyAlias
+            keyPassword hyperHLEKeystorePass
+        }
+        debug {
+            storeFile file('../debug.keystore')
+        }
+    }
     defaultConfig {
         def branding = getTouchHLEBranding()
         applicationId 'org.touchhle.android'
