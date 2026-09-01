@@ -32,6 +32,23 @@ static def join(String prefix, String separator, String branding) {
     }
 }
 
+
+def getTouchHLEVersionCode() {
+    // Base the code on the crate version (e.g. 0.2.3 -> 0_02_03 -> 203),
+    // then add the build number so CI builds always outrank local ones.
+    def base = getTouchHLEVersionName().trim().split(' ')[0] // e.g. "0.2.3"
+    def parts = base.tokenize('.')
+    int code = 0
+    for (int i = 0; i < 3; i++) {
+        code = code * 100 + (i < parts.size() ? (parts[i] as int) : 0)
+    }
+    def buildNum = System.getenv('GITHUB_RUN_NUMBER')
+    if (buildNum != null) {
+        code = Math.max(code, 1000) + (buildNum as int)
+    }
+    return code
+}
+
 android {
     ndkVersion "25.2.9519653"
     compileSdkVersion 35
@@ -45,7 +62,11 @@ android {
                 icon: join('@drawable/icon', '_', branding.toLowerCase())
         ]
         buildConfigField 'int', 'APP_ICON', join('R.drawable.icon', '_', branding.toLowerCase())
-        versionName join(getTouchHLEVersionName(), ' ', branding)
+
+        // Explicit versionCode/versionName so every CI build outranks the
+        // previously installed APK (Android refuses updates otherwise).
+        versionCode getTouchHLEVersionCode()
+        versionName getTouchHLEVersionName()
 
         minSdkVersion 21 // first version with AArch64
         targetSdkVersion 35
