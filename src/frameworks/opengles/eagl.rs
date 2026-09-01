@@ -76,6 +76,23 @@ const kEAGLRenderingAPIOpenGLES3: EAGLRenderingAPI = 3;
 /// route through the real native ES 2.0 backend instead of falling through
 /// to the GLES 1.1-only stubs in `gles_generic`.
 fn effective_eagl_api(requested: EAGLRenderingAPI, prefer_gles2_context: bool) -> EAGLRenderingAPI {
+    // Hardcoded driver pin: TOUCHHLE_FORCE_EAGL_API forces the reported/
+    // effective EAGL rendering API (1, 2 or 3) regardless of what the guest
+    // app requested. This pins the GPU driver surface the app sees, mirroring
+    // TOUCHHLE_FORCE_GLES1 on the context-creation side.
+    if let Ok(forced) = std::env::var("TOUCHHLE_FORCE_EAGL_API") {
+        let forced = forced.trim();
+        if let Ok(v) = forced.parse::<EAGLRenderingAPI>() {
+            if (1..=3).contains(&v) && v != requested {
+                log!(
+                    "EAGL: TOUCHHLE_FORCE_EAGL_API active, overriding requested API {} with {}",
+                    requested,
+                    v
+                );
+                return v;
+            }
+        }
+    }
     if prefer_gles2_context && requested == kEAGLRenderingAPIOpenGLES1 {
         log!(
             "EAGL: --prefer-gles2-context active, upgrading initWithAPI:{} \
