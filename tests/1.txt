@@ -1,0 +1,344 @@
+App bundle info:
+- Display name: Turbo Dismount
+- Version: 1.2.7
+- Identifier: com.secretexit.trdismount
+- Internal name (canonical): trdismount.app
+- Minimum OS version: 7.0
+- Required device capabilities: armv7
+- Device family: iPhone, iPad
+
+No options found for this app in touchHLE_default_options.txt
+No options found for this app in /storage/emulated/0/Android/data/org.touchhle.android.unofficial/files/touchHLE_options.txt
+
+touchHLE::environment: App needs non-portrait user interface orientation "UIInterfaceOrientationLandscapeRight", applying device orientation LandscapeLeft.
+touchHLE::environment: iPhone3GS device family is chosen.
+touchHLE::bundle: Using launch image: LaunchImage@2x.png
+touchHLE::window: Accelerometer detected: lsm6dsv LSM6DSV Accelerometer Non-wakeup.
+touchHLE::gles: Creating an OpenGL ES 1.1 context:
+touchHLE::gles: Trying: Native OpenGL ES 1.1
+touchHLE::gles: => Success!
+touchHLE::gles::gles1_native: GLES1Native: GL_IMG_texture_compression_pvrtc NOT advertised by host driver (PVRTC textures will be software-decoded to RGBA before upload on this driver)
+touchHLE::window: Driver info: OpenGL ES-CM 1.1 / Qualcomm / Adreno (TM) 750
+touchHLE::window: GPU backend: Qualcomm Adreno native OpenGL ES driver. This driver is strict and can render some early iPhone OS games as a black screen; enabling ANGLE (developer options 'ANGLE Preferences', or Android 15+ system ANGLE) is recommended. The Adreno rendering workarounds (--fix-texture-min-filter) are auto-enabled to mitigate this.
+touchHLE::mach_o: Loading armv7 slice for "trdismount"
+touchHLE::mach_o: Loading armv7 slice for "libz.1.dylib"
+touchHLE::mach_o: Loading armv7 slice for "libiconv.2.dylib"
+touchHLE::mach_o: Loading armv7 slice for "libsqlite3.dylib"
+touchHLE::mach_o: Loading armv7 slice for "libstdc++.6.dylib"
+touchHLE::objc::classes: Note: substituting fake class for FBLikeButtonPopWAV to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBLikeButtonBackgroundPNG to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBLikeButtonBackgroundSelectedPNG to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBLikeButtonIconPNG to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBLikeButtonIconSelectedPNG to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBLoginViewButtonPNG to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBLoginViewButtonPressedPNG to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBPlacePickerViewGenericPlacePNG to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBProfilePictureViewBlankProfilePortraitPNG to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBProfilePictureViewBlankProfileSquarePNG to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBDialogClosePNG to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBFriendPickerViewDefaultPNG to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBViewImpressionTracker to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBPlacePickerCacheDescriptor to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBRequestHandlerFactory to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBProfilePictureView to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBRequestConnection to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBLikeDialogParams to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBFrictionlessRequestSettings to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBAudioResourceLoader to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBDynamicFrameworkLoader to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBCacheIndex to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBCacheEntityInfo to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBSessionManualTokenCachingStrategy to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBRequestMetadata to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBDialog to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBSessionAppEventsState to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBGraphObjectPagingLoader to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBTooltipView to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBLikeActionControllerCache to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBLikeActionController to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBCacheDescriptor to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBGraphObjectTableDataSource to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBRequestBody to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBSystemAccountStoreAdapter to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBFriendPickerViewController to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBFetchedAppSettings to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBUtility to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBInsights to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBFriendPickerCacheDescriptor to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBAppLinkData to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBGraphObject to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBGraphObjectArray to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBLikeControl to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBSessionUtility to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBLikeBoxView to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBDialogsParams to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBNativeDialogs to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBImageResourceLoader to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBRequestConnectionRetryManagerAlertViewHelper to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBRequestConnectionRetryManager to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBDialogs to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBAppBridgeTypeToJSONConverter to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBGraphObjectTableSelection to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBWebDialogInternalDelegate to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBWebDialogs to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBDialogsData to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBOpenGraphActionShareDialogParams to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBOpenGraphActionParams to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBDataDiskCache to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBTask to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBLikeButton to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBGraphObjectTableCell to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBFrictionlessRecipientCache to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBAppBridgeScheme to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBCrypto to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBSessionTokenCachingStrategyNoOpInstance to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBSessionTokenCachingStrategy to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBLoginDialog to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBPlacePickerViewController to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBLogger to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBAppCall to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBAccessTokenData to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBShareDialogParams to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBLinkShareParams to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBUserSettingsViewController to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBViewController to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBSessionAuthLogger to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBLoginTooltipView to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBSettings to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBShareDialogPhotoParams to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBPhotoParams to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBSession to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBURLConnection to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBTestSession to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBSessionLoginStrategyParams to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBSessionSystemLoginStategy to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBLikeBoxBorderView to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBRequest to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBSessionAppSwitchingLoginStategy to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBErrorUtility to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBTaskCompletionSource to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBAppLinkResolver to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBLoginView to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBShadowLabel to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBSessionFacebookAppWebLoginStategy to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBSessionSafariLoginStategy to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBAppEvents to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBAppBridge to improve compatibility
+touchHLE::objc::classes: Note: substituting fake class for FBSessionInlineWebViewLoginStategy to improve compatibility
+touchHLE::dyld: Patched 11 libstdc++ std::__throw_* helpers to return instead of throwing (avoids host-process abort when guest C++ code hits soft failures like std::string(NULL)).
+touchHLE::dyld: Patched libstdc++ std::string _S_construct in libstdc++.6.dylib so std::string((char*)NULL) yields an empty string instead of looping/corrupting (b 0xe7d8 -> 0xe7d3).
+CPU emulation begins now.
+touchHLE::frameworks::foundation::ns_locale: The app requested your preferred languages. ["ru"] will be reported based on your system language preferences.
+touchHLE::frameworks::foundation::ns_run_loop: Adding timer 0x3647f460 to run loop 0x3647f470 with mode "kCFRunLoopDefaultMode"
+touchHLE::objc::messages: Class "ACAccountStore" (0x364739f0) is unimplemented. Call to class method "alloc".
+touchHLE::environment: Found sorted order ["libsqlite3.dylib", "libstdc++.6.dylib", "libiconv.2.dylib", "libz.1.dylib", "trdismount"]
+touchHLE::frameworks::foundation::ns_exception: NSSetUncaughtExceptionHandler: registered handler at 0x88add8
+touchHLE::libc::posix_io: lseek(1, 0x0, 1) => -1
+trdismount[0] -> registered mono modules 0x11af670
+
+touchHLE::frameworks::uikit::ui_view_controller: [(UIViewController*)0x366a6680 viewWillAppear:false]
+touchHLE::frameworks::uikit::ui_view_controller: [(UIViewController*)0x366a6680 viewDidAppear:false]
+touchHLE::frameworks::uikit::ui_view_controller: [(UIViewController*)0x366a6680 viewWillAppear:false]
+touchHLE::frameworks::uikit::ui_view_controller: [(UIViewController*)0x366a6680 viewDidAppear:false]
+touchHLE::frameworks::foundation::ns_bundle: NSBundle resource lookup: 0x366a67a0 missing, Unity Data fallback 0x366a67e0 exists=false
+touchHLE::frameworks::foundation::ns_bundle: NSBundle resource lookup: 0x366a6820 missing, Unity Data fallback 0x366a6840 exists=false
+touchHLE::frameworks::foundation::ns_bundle: NSBundle resource lookup: 0x366a6880 missing, Unity Data fallback 0x366a68a0 exists=false
+touchHLE::frameworks::foundation::ns_bundle: NSBundle resource lookup: 0x366a68e0 missing, Unity Data fallback 0x366a6900 exists=false
+touchHLE::frameworks::foundation::ns_bundle: NSBundle resource lookup: 0x366a6940 missing, Unity Data fallback 0x366a6960 exists=false
+touchHLE::frameworks::foundation::ns_bundle: NSBundle resource lookup: 0x366a69a0 missing, Unity Data fallback 0x366a69c0 exists=false
+trdismount[0] Mono path[0] = '/var/mobile/Applications/00000000-0000-0000-0000-000000000000/trdismount.app/Data/Managed'
+
+trdismount[0] Mono config path = '/var/mobile/Applications/00000000-0000-0000-0000-000000000000/trdismount.app/Data/Managed'
+
+touchHLE::libc::pthread::thread: First pthread_create (app spawned a worker thread via raw pthread) [this log will only be shown once]
+touchHLE::frameworks::uikit::ui_view_controller: +[UIViewController attemptRotationToDeviceOrientation]: no live rotation system; treating as a no-op.
+touchHLE::frameworks::uikit::ui_view_controller: +[UIViewController attemptRotationToDeviceOrientation]: no live rotation system; treating as a no-op.
+touchHLE::frameworks::uikit::ui_view_controller: +[UIViewController attemptRotationToDeviceOrientation]: no live rotation system; treating as a no-op.
+touchHLE::frameworks::uikit::ui_view_controller: +[UIViewController attemptRotationToDeviceOrientation]: no live rotation system; treating as a no-op.
+trdismount[0] TransactionObserver added
+touchHLE::frameworks::store_kit::sk_payment_queue: SKPaymentQueue defaultQueue: singleton created
+trdismount[0] do we suport downloads: YES
+touchHLE::frameworks::foundation::ns_run_loop: Adding timer 0x366a6540 to run loop 0x3647f470 with mode "kCFRunLoopDefaultMode"
+touchHLE::objc::messages: Call to faked class "FBSession" (0x12fe7a0) class method "activeSession". Behaving as if message was sent to nil.
+touchHLE::frameworks::foundation::ns_timer: First NSTimer fired (run loop is delivering scheduled events) [this log will only be shown once]
+trdismount[0] Requesting Resolution: 320x480
+
+touchHLE::gles: Creating an OpenGL ES 2.0 context:
+touchHLE::gles: Trying: Native OpenGL ES 2.0
+touchHLE::gles: => Success!
+touchHLE::frameworks::opengles::eagl: Driver info: OpenGL ES 3.2 V@0762.41 (GIT@f6b5df5188, I29aebc4401, 1758283784) (Date:09/19/25) / Qualcomm / Adreno (TM) 750
+touchHLE::frameworks::opengles::eagl: fix_texture_min_filter: ON (after every level-0 texture upload, GL_TEXTURE_MIN_FILTER will be forced to GL_LINEAR if the guest never set it). This avoids flat-black/white-textured geometry on strict drivers (Mali, Adreno) for iOS games that don't ship mipmaps. Disable with --no-fix-texture-min-filter if a game genuinely needs mipmap minification.
+trdismount[0] Renderer: PowerVR SGX 535
+
+trdismount[0] Vendor:   Imagination Technologies
+
+trdismount[0] Version:  OpenGL ES 2.0 IMGSGX535-63.27
+
+trdismount[0] GL_APPLE_texture_max_level GL_EXT_debug_label GL_EXT_discard_framebuffer GL_EXT_occlusion_query_boolean GL_EXT_texture_filter_anisotropic GL_EXT_texture_lod_bias GL_IMG_read_format GL_IMG_texture_compression_pvrtc GL_IMG_texture_format_BGRA8888 GL_OES_depth24 GL_OES_depth_texture GL_OES_packed_depth_stencil GL_OES_rgb8_rgba8 GL_OES_standard_derivatives GL_OES_texture_float GL_OES_texture_half_float GL_OES_vertex_array_object GL_OES_vertex_half_float 
+
+touchHLE::frameworks::opengles::gles_guest: First glTexParameteri(target=0xde1, pname=0x2800, param=0x2600) [this log will only be shown once]
+touchHLE::frameworks::opengles::gles_guest: First glTexImage2D(8x8, internalformat=0x1907, format=0x1907, type=0x8363) (app uploading texture data) [this log will only be shown once]
+touchHLE::frameworks::opengles::gles_guest: First fix_texture_min_filter override: forcing GL_TEXTURE_MIN_FILTER=GL_LINEAR after glTexImage2D(level=0) [this log will only be shown once]
+trdismount[0] Creating OpenGLES2.0 graphics device
+
+touchHLE::frameworks::opengles::eagl: [EAGLContext renderbufferStorage:0x8d41 fromDrawable:0x366a6210]
+touchHLE::frameworks::opengles::gles_guest: First glViewport(0, 0, 320, 480) [this log will only be shown once]
+trdismount[0] Initialize engine version: 4.5.4f1 (e036f44c54c9)
+
+touchHLE::frameworks::opengles::gles_guest: First fix_texture_min_filter override: substituting guest's glTexParameter(GL_TEXTURE_MIN_FILTER, 0x2701) with 0x2601 (mipmap modes leave the texture incomplete on strict ES 1.1 drivers like Mali r32p1, which then samples them as black) [this log will only be shown once]
+trdismount[0] Default GameObject BitMask: UI already registered
+ 
+(Filename:  Line: 168)
+
+
+trdismount[0] Begin MonoManager ReloadAssembly
+
+trdismount[0] Platform assembly: /var/mobile/Applications/00000000-0000-0000-0000-000000000000/trdismount.app/Data/Managed/UnityEngine.dll (this message is harmless)
+
+trdismount[0] Loading /var/mobile/Applications/00000000-0000-0000-0000-000000000000/trdismount.app/Data/Managed/UnityEngine.dll into Unity Child Domain
+
+trdismount[0] Platform assembly: /var/mobile/Applications/00000000-0000-0000-0000-000000000000/trdismount.app/Data/Managed/System.dll (this message is harmless)
+
+trdismount[0] Platform assembly: /var/mobile/Applications/00000000-0000-0000-0000-000000000000/trdismount.app/Data/Managed/Assembly-CSharp-firstpass.dll (this message is harmless)
+
+trdismount[0] Loading /var/mobile/Applications/00000000-0000-0000-0000-000000000000/trdismount.app/Data/Managed/Assembly-CSharp-firstpass.dll into Unity Child Domain
+
+trdismount[0] Platform assembly: /var/mobile/Applications/00000000-0000-0000-0000-000000000000/trdismount.app/Data/Managed/P31RestKit.dll (this message is harmless)
+
+trdismount[0] Platform assembly: /var/mobile/Applications/00000000-0000-0000-0000-000000000000/trdismount.app/Data/Managed/System.Core.dll (this message is harmless)
+
+trdismount[0] Platform assembly: /var/mobile/Applications/00000000-0000-0000-0000-000000000000/trdismount.app/Data/Managed/Assembly-CSharp.dll (this message is harmless)
+
+trdismount[0] Loading /var/mobile/Applications/00000000-0000-0000-0000-000000000000/trdismount.app/Data/Managed/Assembly-CSharp.dll into Unity Child Domain
+
+trdismount[0] Platform assembly: /var/mobile/Applications/00000000-0000-0000-0000-000000000000/trdismount.app/Data/Managed/Ionic.Zip.dll (this message is harmless)
+
+trdismount[0] Platform assembly: /var/mobile/Applications/00000000-0000-0000-0000-000000000000/trdismount.app/Data/Managed/Assembly-UnityScript-firstpass.dll (this message is harmless)
+
+trdismount[0] Loading /var/mobile/Applications/00000000-0000-0000-0000-000000000000/trdismount.app/Data/Managed/Assembly-UnityScript-firstpass.dll into Unity Child Domain
+
+trdismount[0] Platform assembly: /var/mobile/Applications/00000000-0000-0000-0000-000000000000/trdismount.app/Data/Managed/Boo.Lang.dll (this message is harmless)
+
+trdismount[0] Platform assembly: /var/mobile/Applications/00000000-0000-0000-0000-000000000000/trdismount.app/Data/Managed/Assembly-UnityScript.dll (this message is harmless)
+
+trdismount[0] Loading /var/mobile/Applications/00000000-0000-0000-0000-000000000000/trdismount.app/Data/Managed/Assembly-UnityScript.dll into Unity Child Domain
+
+trdismount[0] Platform assembly: /var/mobile/Applications/00000000-0000-0000-0000-000000000000/trdismount.app/Data/Managed/UnityScript.Lang.dll (this message is harmless)
+
+trdismount[0] Platform assembly: /var/mobile/Applications/00000000-0000-0000-0000-000000000000/trdismount.app/Data/Managed/Ionic.Zip.dll (this message is harmless)
+
+trdismount[0] Loading /var/mobile/Applications/00000000-0000-0000-0000-000000000000/trdismount.app/Data/Managed/Ionic.Zip.dll into Unity Child Domain
+
+trdismount[0] Platform assembly: /var/mobile/Applications/00000000-0000-0000-0000-000000000000/trdismount.app/Data/Managed/P31RestKit.dll (this message is harmless)
+
+trdismount[0] Loading /var/mobile/Applications/00000000-0000-0000-0000-000000000000/trdismount.app/Data/Managed/P31RestKit.dll into Unity Child Domain
+
+trdismount[0] Platform assembly: /var/mobile/Applications/00000000-0000-0000-0000-000000000000/trdismount.app/Data/Managed/Vectrosity.dll (this message is harmless)
+
+trdismount[0] Loading /var/mobile/Applications/00000000-0000-0000-0000-000000000000/trdismount.app/Data/Managed/Vectrosity.dll into Unity Child Domain
+
+trdismount[0] - Completed reload, in  0.103 seconds
+
+touchHLE::frameworks::opengles::gles_guest: Warning: glGetError() returned 0x500 (subsequent repeats of the same code are silenced; rerun with --trace-gl-errors to identify the originating GL call)
+touchHLE::frameworks::opengles::eagl: [EAGLContext renderbufferStorage:0x8d41 fromDrawable:(null)]
+touchHLE::frameworks::opengles::eagl: [EAGLContext renderbufferStorage:0x8d41 fromDrawable:0x366a6210]
+touchHLE::frameworks::opengles::eagl: [EAGLContext presentRenderbuffer:] first call (app reached first frame) [this log will only be shown once]
+touchHLE::frameworks::opengles::gles_guest: First glCompressedTexImage2D(512x512, internalformat=0x8c00, image_size=131072) (app uploading PVRTC/compressed texture) [this log will only be shown once]
+trdismount[0] [#217] +[Everyplay initWithDelegate:andParentViewController:] initializing
+trdismount[0] [#825] +[Everyplay setClientId:clientSecret:redirectURI:] (null)
+touchHLE::frameworks::foundation::ns_run_loop: Adding timer 0x365d82f0 to run loop 0x3647f470 with mode "kCFRunLoopDefaultMode"
+touchHLE::frameworks::uikit::ui_view_controller: [(UIViewController*)0x366a65a0 viewWillAppear:false]
+touchHLE::frameworks::uikit::ui_view_controller: [(UIViewController*)0x366a65a0 viewDidAppear:false]
+touchHLE::frameworks::uikit::ui_view_controller: [(UIViewController*)0x366a65a0 viewWillAppear:false]
+touchHLE::frameworks::uikit::ui_view_controller: [(UIViewController*)0x366a65a0 viewDidAppear:false]
+touchHLE::frameworks::opengles::gles_guest: First glScissor(0, 0, 480, 320) [this log will only be shown once]
+touchHLE::frameworks::opengles::gles_guest: First glClearColor(0, 0, 0, 1) [this log will only be shown once]
+touchHLE::frameworks::opengles::gles_guest: First glClear(mask=0x4500) [this log will only be shown once]
+touchHLE::frameworks::opengles::gles_guest: First glDrawElements(mode=0x4, count=6, type=0x1403) (app submitting first indexed draw) [this log will only be shown once]
+touchHLE::frameworks::core_animation::ca_display_link: [CADisplayLink displayLinkWithTarget:0x366a6030 selector:repaintDisplayLink] => 0x365e9450
+touchHLE::frameworks::core_animation::ca_display_link: [(CADisplayLink*)0x365e9450 setFrameInterval:2]
+touchHLE::frameworks::core_animation::ca_display_link: [(CADisplayLink*)0x365e9450 addToRunLoop:0x3647f470 forMode:0x36478f90]
+touchHLE::frameworks::foundation::ns_run_loop: Adding timer 0x365e92a0 to run loop 0x3647f470 with mode "kCFRunLoopCommonModes"
+touchHLE::frameworks::foundation::ns_run_loop: Removing timer 0x366a6540 from run loop 0x3647f470
+touchHLE::frameworks::audio_toolbox::audio_unit: render_audio_unit: entering callback for the first time [this log will only be shown once]
+touchHLE::frameworks::foundation::ns_run_loop: Removing timer 0x365d82f0 from run loop 0x3647f470
+touchHLE::frameworks::opengles::eagl: [EAGLContext presentRenderbuffer:] frame 10 reached (render loop is alive)
+touchHLE::frameworks::opengles::eagl: [EAGLContext presentRenderbuffer:] frame 60 reached (render loop is alive)
+trdismount[0] WARNING: Shader 
+trdismount[0] Unsupported: 'Hidden/CameraMotionBlurDX11' - Pass '' shader state not supported
+
+trdismount[0] WARNING: Shader 
+trdismount[0] Unsupported: 'Hidden/CameraMotionBlurDX11' - Setting to default shader.
+
+trdismount[0] UnloadTime: 21.451824 ms
+
+touchHLE::frameworks::core_animation::ca_display_link: [(CADisplayLink*)0x365e9450 setFrameInterval:2]
+trdismount[0] iPhoneGeneration: iPhone3GS
+ 
+(Filename: /Applications/buildAgent/work/d63dfc6385190b60/artifacts/iPhonePlayer-armv7Generated/UnityEngineDebug.cpp Line: 49)
+
+
+trdismount[0] Everyplay not supported
+ 
+(Filename: /Applications/buildAgent/work/d63dfc6385190b60/artifacts/iPhonePlayer-armv7Generated/UnityEngineDebug.cpp Line: 49)
+
+
+touchHLE::frameworks::foundation::ns_run_loop: Adding timer 0x30e409c0 to run loop 0x3647f470 with mode "kCFRunLoopDefaultMode"
+trdismount[0] ADCOLONY 2.2.4 [info] AdColony library version: 2.2.4 32-bit production
+touchHLE::mem: touchHLE::mem: NULL-PAGE READ at 0x00000000 (size: 0x1) from bytes_at (likely nil ObjC object field access — returning zero) (unique sites logged: 1/64)
+touchHLE::libc::sysctl: sysctl(): unknown parameter [4, 17], returning -1
+touchHLE::libc::sysctl: sysctl(): unknown parameter [4, 17], returning -1
+trdismount[0] Error: sysctl mgmtInfoBase failure
+touchHLE::frameworks::foundation::ns_locale: The app requested your current locale. ["RU"] will be reported based on your system region settings.
+touchHLE::frameworks::foundation::ns_locale: The app requested your preferred languages. ["ru"] will be reported based on your system language preferences.
+touchHLE::frameworks::game_kit::gk_local_player: GKLocalPlayer localPlayer: singleton created
+touchHLE::frameworks::foundation::ns_run_loop: Adding timer 0x30ec3c80 to run loop 0x3647f470 with mode "kCFRunLoopDefaultMode"
+trdismount[0] Unloading 7 Unused Serialized files (Serialized files now loaded: 0 / Dirty serialized files: 0)
+
+trdismount[0] 
+Unloading 4 unused Assets to reduce memory usage. Loaded Objects now: 6186.
+
+trdismount[0] Total: 37.283073 ms (FindLiveObjects: 2.602135 ms CreateObjectMapping: 2.951979 ms MarkObjects: 28.916822 ms  DeleteObjects: 1.790521 ms)
+
+
+touchHLE::frameworks::foundation::ns_run_loop: Adding timer 0x30409e50 to run loop 0x3647f470 with mode "kCFRunLoopDefaultMode"
+trdismount[0] leaderboardSwitchButtonLabel Global
+ 
+(Filename: /Applications/buildAgent/work/d63dfc6385190b60/artifacts/iPhonePlayer-armv7Generated/UnityEngineDebug.cpp Line: 49)
+
+
+touchHLE::objc::messages: Warning: receiver 0x30ec0b00 has nil isa! Ignoring message "release". (This usually means the object was already freed — use-after-free in guest code.) [1/8]
+touchHLE::frameworks::foundation::ns_run_loop: Removing timer 0x30e409c0 from run loop 0x3647f470
+touchHLE::frameworks::foundation::ns_run_loop: Removing timer 0x30ec3c80 from run loop 0x3647f470
+touchHLE::frameworks::foundation::ns_run_loop: Removing timer 0x30409e50 from run loop 0x3647f470
+touchHLE::frameworks::foundation::ns_string: Warning: lossy conversion requested for 'plugin=featured_resources&payload=%7B%22resource%22:%22prime31_socialnetworking%22,%22version%22:%221.0.0%22,%22appid%22:%22182473845211109%22%7D'
+touchHLE::frameworks::foundation::ns_url_connection: NSURLConnection sendSynchronousRequest: stub called (returning empty data + error)
+touchHLE::frameworks::foundation::ns_run_loop: Removing timer 0x3647f460 from run loop 0x3647f470
+trdismount[0] WWW error: The network connection was lost. (touchHLE: networking not supported)
+ 
+(Filename: /Applications/buildAgent/work/d63dfc6385190b60/artifacts/iPhonePlayer-armv7Generated/UnityEngineDebug.cpp Line: 49)
+
+
+touchHLE::frameworks::foundation::ns_run_loop: Adding timer 0x34fc13b0 to run loop 0x3647f470 with mode "kCFRunLoopDefaultMode"
+touchHLE::frameworks::foundation::ns_run_loop: Removing timer 0x34fc13b0 from run loop 0x3647f470
+trdismount[0] WWW error: The network connection was lost. (touchHLE: networking not supported)
+ 
+(Filename: /Applications/buildAgent/work/d63dfc6385190b60/artifacts/iPhonePlayer-armv7Generated/UnityEngineDebug.cpp Line: 49)
+
+
+touchHLE::frameworks::foundation::ns_run_loop: Adding timer 0x34f8eff0 to run loop 0x3647f470 with mode "kCFRunLoopDefaultMode"
+touchHLE::frameworks::foundation::ns_run_loop: Removing timer 0x34f8eff0 from run loop 0x3647f470
+trdismount[0] WWW error: The network connection was lost. (touchHLE: networking not supported)
+ 
+(Filename: /Applications/buildAgent/work/d63dfc6385190b60/artifacts/iPhonePlayer-armv7Generated/UnityEngineDebug.cpp Line: 49)
+
+
+touchHLE::frameworks::foundation::ns_run_loop: Adding timer 0x34f84ff0 to run loop 0x3647f470 with mode "kCFRunLoopDefaultMode"
+touchHLE::frameworks::foundation::ns_run_loop: Removing timer 0x34f84ff0 from run loop 0x3647f470
+trdismount[0] WWW error: The network connection was lost. (touchHLE: networking not supported)
+ 
+(Filename: /Applications/buildAgent/work/d63dfc6385190b60/artifacts/iPhonePlayer-armv7Generated/UnityEngineDebug.cpp Line: 49)
+
+
+touchHLE::window: Received app-will-resign-active event.
+touchHLE::window: Received app-did-enter-background event.
