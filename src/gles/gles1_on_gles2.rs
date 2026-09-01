@@ -1725,6 +1725,11 @@ impl GLES for GLES1OnGLES2<'_> {
     }
     unsafe fn GetVertexAttribiv(&mut self, index: GLuint, pname: GLenum, params: *mut GLint) {
         gl::GetVertexAttribiv(index, pname, params);
+        // Bounds probing on invalid attrib indices sets GL_INVALID_OPERATION
+        // and pollutes the shared error queue (shows up later as spurious
+        // 0x500 traces from unrelated calls). Swallow probe errors here; the
+        // guard treats a failed query conservatively via the params value.
+        let _ = gl::GetError();
     }
     unsafe fn GetVertexAttribfv(&mut self, index: GLuint, pname: GLenum, params: *mut GLfloat) {
         gl::GetVertexAttribfv(index, pname, params);
