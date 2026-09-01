@@ -398,10 +398,22 @@ pub fn create_gles1_ctx_no_parent_stack(
 ) -> Box<dyn GLESContext> {
     assert!(window.on_main_stack());
     log!("Creating an OpenGL ES 1.1 context:");
-    let list = if let Some(ref preference) = options.gles1_implementation {
-        std::slice::from_ref(preference)
-    } else {
-        GLESImplementation::GLES1_IMPLEMENTATIONS
+    // Hardcoded GPU/backend pin: TOUCHHLE_FORCE_GLES1 overrides everything
+    // (CLI flag, host capability probing) so the exact backend is used even
+    // when probing would pick a different one.
+    let forced = std::env::var("TOUCHHLE_FORCE_GLES1")
+        .ok()
+        .and_then(|name| GLESImplementation::from_short_name(&name).ok());
+    let forced_list: [GLESImplementation; 1] = match forced {
+        Some(impl_) => [impl_],
+        None => [GLESImplementation::GLES1OnGL2],
+    };
+    let list: &[GLESImplementation] = match forced {
+        Some(_) => &forced_list[..],
+        None => match options.gles1_implementation {
+            Some(ref preference) => std::slice::from_ref(preference),
+            None => GLESImplementation::GLES1_IMPLEMENTATIONS,
+        },
     };
     let mut gles1_ctx = None;
     for implementation in list {

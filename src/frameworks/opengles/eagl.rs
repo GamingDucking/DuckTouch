@@ -76,6 +76,23 @@ const kEAGLRenderingAPIOpenGLES3: EAGLRenderingAPI = 3;
 /// route through the real native ES 2.0 backend instead of falling through
 /// to the GLES 1.1-only stubs in `gles_generic`.
 fn effective_eagl_api(requested: EAGLRenderingAPI, prefer_gles2_context: bool) -> EAGLRenderingAPI {
+    // Hardcoded driver pin: TOUCHHLE_FORCE_EAGL_API forces the reported/
+    // effective EAGL rendering API (1, 2 or 3) regardless of what the guest
+    // app requested. This pins the GPU driver surface the app sees, mirroring
+    // TOUCHHLE_FORCE_GLES1 on the context-creation side.
+    if let Ok(forced) = std::env::var("TOUCHHLE_FORCE_EAGL_API") {
+        let forced = forced.trim();
+        if let Ok(v) = forced.parse::<EAGLRenderingAPI>() {
+            if (1..=3).contains(&v) && v != requested {
+                log!(
+                    "EAGL: TOUCHHLE_FORCE_EAGL_API active, overriding requested API {} with {}",
+                    requested,
+                    v
+                );
+                return v;
+            }
+        }
+    }
     if prefer_gles2_context && requested == kEAGLRenderingAPIOpenGLES1 {
         log!(
             "EAGL: --prefer-gles2-context active, upgrading initWithAPI:{} \
@@ -986,18 +1003,31 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, mut pixel_buffer: Vec<u8>) -> (
     // state changes we make.
     let old_framebuffer: GLuint = get_int(gles, gles11::FRAMEBUFFER_BINDING_OES) as _;
 
-    let use_bound_framebuffer = old_framebuffer != 0;
-    let mut src_framebuffer = 0;
-    if !use_bound_framebuffer {
-        gles.GenFramebuffersOES(1, &mut src_framebuffer);
-        gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, src_framebuffer);
-        gles.FramebufferRenderbufferOES(
-            gles11::FRAMEBUFFER_OES,
-            gles11::COLOR_ATTACHMENT0_OES,
-            gles11::RENDERBUFFER_OES,
-            renderbuffer,
-        );
-    }
+    // Hardcoded GPU-driver safe path: ALWAYS attach the renderbuffer being
+    // presented to a dedicated FBO and read from that, regardless of what
+    // FRAMEBUFFER_BINDING the guest left behind.
+    //
+    // The old logic trusted `GL_FRAMEBUFFER_BINDING_OES != 0` as "the app's
+    // FBO has this renderbuffer attached". That's not guaranteed: apps
+    // (and some of our own fallback paths) can leave a *different* FBO
+    // bound at present time, or an FBO whose attachment points at a
+    // different renderbuffer. On desktop GL the read then returns stale or
+    // black pixels => black screen on many GLES1/GLES2 games, while the
+    // same games are fine on PCs running touchHLE upstream (where the
+    // read happens to hit the right attachment). iOS guarantees that
+    // presentRenderbuffer displays the *renderbuffer's own* storage, so
+    // mirror that by always re-attaching the renderbuffer to our
+    // presentation FBO before reading.
+    let mut src_framebuffer: GLuint = 0;
+    gles.GenFramebuffersOES(1, &mut src_framebuffer);
+    gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, src_framebuffer);
+    gles.FramebufferRenderbufferOES(
+        gles11::FRAMEBUFFER_OES,
+        gles11::COLOR_ATTACHMENT0_OES,
+        gles11::RENDERBUFFER_OES,
+        renderbuffer,
+    );
+    let use_bound_framebuffer = false;
 
     // On tile-based GPUs (Mali, Adreno, PowerVR) the per-tile color buffer
     // isn't guaranteed to be resolved to the renderbuffer's main memory

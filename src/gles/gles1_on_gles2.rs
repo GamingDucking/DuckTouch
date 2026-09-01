@@ -140,7 +140,7 @@ struct TranslatorState {
     texture_rgb_scale: [GLfloat; MAX_TEXTURE_UNITS],
     texture_alpha_scale: [GLfloat; MAX_TEXTURE_UNITS],
     fixed_buffers: [Vec<GLfloat>; 3],
-    client_array_vbos: [GLuint; 7],
+    client_array_vbos: [GLuint; 10],
     client_element_vbo: GLuint,
     array_buffer_binding: GLuint,
     element_array_buffer_binding: GLuint,
@@ -220,7 +220,7 @@ impl TranslatorState {
             texture_rgb_scale: [1.0; MAX_TEXTURE_UNITS],
             texture_alpha_scale: [1.0; MAX_TEXTURE_UNITS],
             fixed_buffers: std::array::from_fn(|_| Vec::new()),
-            client_array_vbos: [0; 7],
+            client_array_vbos: [0; 10],
             client_element_vbo: 0,
             array_buffer_binding: 0,
             element_array_buffer_binding: 0,
@@ -1725,6 +1725,11 @@ impl GLES for GLES1OnGLES2<'_> {
     }
     unsafe fn GetVertexAttribiv(&mut self, index: GLuint, pname: GLenum, params: *mut GLint) {
         gl::GetVertexAttribiv(index, pname, params);
+        // Bounds probing on invalid attrib indices sets GL_INVALID_OPERATION
+        // and pollutes the shared error queue (shows up later as spurious
+        // 0x500 traces from unrelated calls). Swallow probe errors here; the
+        // guard treats a failed query conservatively via the params value.
+        let _ = gl::GetError();
     }
     unsafe fn GetVertexAttribfv(&mut self, index: GLuint, pname: GLenum, params: *mut GLfloat) {
         gl::GetVertexAttribfv(index, pname, params);
