@@ -58,11 +58,11 @@ android {
     compileSdkVersion 35
     signingConfigs {
         release {
-            if (hyperHLEKeystoreB64 != null) {
+            if (hyperHLEKeystoreB64 != null && !hyperHLEKeystoreB64.trim().isEmpty()) {
                 def tmp = File.createTempFile('hyperhle', '.keystore')
-                tmp.bytes = new String(hyperHLEKeystoreB64).decodeBase64()
+                tmp.bytes = hyperHLEKeystoreB64.decodeBase64()
                 storeFile tmp
-            } else if (hyperHLEKeystoreFile != null) {
+            } else if (hyperHLEKeystoreFile != null && !hyperHLEKeystoreFile.trim().isEmpty()) {
                 storeFile file(hyperHLEKeystoreFile)
             } else {
                 // Stable fallback keystore committed to the repo, so that APK

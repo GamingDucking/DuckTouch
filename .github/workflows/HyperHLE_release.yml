@@ -280,7 +280,6 @@ jobs:
     - name: Build for Android  
       run: cd android && ../gradle/gradle-8.11.1/bin/gradle assembleRelease && mv app/build/outputs/apk/release/app-release.apk ../touchHLE.apk  
       env:  
-        HYPERHLE_KEYSTORE_B64: ${{ secrets.HYPERHLE_KEYSTORE_B64 }}
         HYPERHLE_KEYSTORE_PASSWORD: hyperhle
         HYPERHLE_KEY_ALIAS: hyperhle
         ANDROID_NDK_ROOT: '/usr/local/lib/android/sdk/ndk/25.2.9519653'  
