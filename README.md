@@ -1,13 +1,37 @@
-# HyperHLE
+# HyperHLE-Fork
 
-**HyperHLE** is an independent fork of the touchHLE project. To avoid any confusion with the upstream repository, please review the key characteristics and context of this fork below.
+**HyperHLE-Fork** (user-facing name: **HyperHLE**) is an independent, AI-assisted fork of the [touchHLE](https://github.com/hikari_no_yume/touchHLE) project — a high-level emulator (HLE) for early iPhone OS apps. This fork focuses on faster iteration, better mobile support, and broader app compatibility.
 
 ---
 
-## Key Features
-* **Clean Codebase:** Developed completely independently without using or copying any code from touchHLE's GerritHub.
+## About This Fork
+* **Clean Codebase:** Developed independently without copying code from touchHLE's GerritHub.
 * **AI-Assisted Development:** This fork utilizes AI tools and assistance to accelerate development and implement features.
-* **Completely Independent:** HyperHLE is a standalone project. It is **not** supported, endorsed, or maintained by the original touchHLE developers.
+* **Completely Independent:** HyperHLE-Fork is a standalone project. It is **not** supported, endorsed, or maintained by the original touchHLE developers.
+* **Installable Over Old Versions:** Android builds use an auto-incrementing `versionCode` (derived from git tags/history), so new APKs can be installed directly over previously installed builds without uninstalling first.
+* **CI Releases:** Every push to `trunk` runs the [Build HyperHLE workflow](.github/workflows/HyperHLE_release.yml) and produces artifacts for Windows, macOS, Linux and Android; tagged builds can be published as GitHub releases.
+
+---
+
+## Key Improvements Over Upstream
+* Automatic, always-installable Android builds (fixed versioning & signing).
+* GPU/GLES compatibility work: shader translation fixes, texture format handling, EAGL/Core Animation composition fixes against black screens.
+* Additional implemented iPhone OS framework APIs to get more real apps running.
+
+---
+
+## Building
+
+```sh
+cargo run --release -- path/to/app.app
+```
+
+For Android, see `android/` and the workflow (`.github/workflows/HyperHLE_release.yml`) for the exact build steps used in CI.
+
+## Documentation
+
+* `docs/` — architecture notes and supported feature matrix.
+* `CHANGELOG.md` — notable changes from release to release.
 
 ---
 
