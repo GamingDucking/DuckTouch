@@ -16,6 +16,13 @@ use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
 use std::sync::OnceLock;
 
+/// Hardcoded GPU identity strings matching the iPhone (2007) PowerVR MBX
+/// driver. The guest must never see the host desktop GPU, because games
+/// branch on these strings to pick render paths.
+static POWERVR_VENDOR: &[u8] = b"Imagination Technologies\0";
+static POWERVR_RENDERER: &[u8] = b"PowerVR MBXLite with VGPLite\0";
+static POWERVR_VERSION: &[u8] = b"OpenGL ES-CM 1.1 (76)\0";
+
 fn c_string_from_gl(pointer: *const GLubyte) -> String {
     if pointer.is_null() {
         return String::new();
@@ -269,6 +276,15 @@ impl GLES for GLES1Native<'_> {
     }
 
     unsafe fn GetString(&mut self, name: GLenum) -> *const GLubyte {
+        // Hardcoded GPU identity: report the iPhone (2007) PowerVR MBX stack
+        // instead of the host desktop GPU so guest drivers games that key
+        // behavior off renderer strings always take the well-tested path.
+        match name {
+            gles11::VENDOR => return POWERVR_VENDOR.as_ptr() as *const GLubyte,
+            gles11::RENDERER => return POWERVR_RENDERER.as_ptr() as *const GLubyte,
+            gles11::VERSION => return POWERVR_VERSION.as_ptr() as *const GLubyte,
+            _ => {}
+        }
         if name != gles11::EXTENSIONS {
             return gles11::GetString(name);
         }
