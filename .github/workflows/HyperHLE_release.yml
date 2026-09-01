@@ -29,6 +29,8 @@ jobs:
         uses: actions/checkout@main
         with:
           submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
           
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@master
@@ -117,6 +119,8 @@ jobs:
         uses: actions/checkout@main
         with:
           submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Install Linux build dependencies
         # SDL2 and openal-soft are built from source (the `static` feature uses
@@ -364,6 +368,8 @@ jobs:
         uses: actions/checkout@main
         with:
           submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
           fetch-depth: 0
       - name: Download macOS artifact
         uses: actions/download-artifact@main
