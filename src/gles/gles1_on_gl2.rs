@@ -2483,14 +2483,6 @@ impl GLES for GLES1OnGL2<'_> {
         };
         assert!(border == 0);
         assert!(
-            format == gl21::ALPHA
-                || format == gl21::RGB
-                || format == gl21::RGBA
-                || format == gl21::LUMINANCE
-                || format == gl21::LUMINANCE_ALPHA
-                || format == gl21::BGRA
-        );
-        assert!(
             type_ == gl21::UNSIGNED_BYTE
                 || type_ == gl21::UNSIGNED_SHORT_5_6_5
                 || type_ == gl21::UNSIGNED_SHORT_4_4_4_4
@@ -2522,14 +2514,6 @@ impl GLES for GLES1OnGL2<'_> {
     ) {
         assert!(target == gl21::TEXTURE_2D);
         assert!(level >= 0);
-        assert!(
-            format == gl21::ALPHA
-                || format == gl21::RGB
-                || format == gl21::RGBA
-                || format == gl21::LUMINANCE
-                || format == gl21::LUMINANCE_ALPHA
-                || format == gl21::BGRA
-        );
         assert!(
             type_ == gl21::UNSIGNED_BYTE
                 || type_ == gl21::UNSIGNED_SHORT_5_6_5
