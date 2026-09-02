@@ -48,20 +48,14 @@ pub fn CFEqual(env: &mut Environment, object1: CFTypeRef, object2: CFTypeRef) ->
     if object1 == object2 {
         return true;
     }
-    // ИСПРАВЛЕНИЕ: Если только один из них NULL — они точно не равны.
-    // Это спасет от краша при вызове [object class] ниже.
+    // CORRECTION: If even one of them is NULL, they are definitely not equal.
+    // This will prevent a crash when calling [object class] below.
     if object1.is_null() || object2.is_null() {
         return false;
     }
 
-    // TODO: other classes
-    let str_class: Class = msg_class![env; NSString class];
-    let object1_class: Class = msg![env; object1 class];
-    assert!(msg![env; object1_class isKindOfClass:str_class]);
-    let object2_class: Class = msg![env; object2 class];
-    assert!(msg![env; object2_class isKindOfClass:str_class]);
-    // TODO: use isEqual: once it is fixed
-    msg![env; object1 isEqualToString:object2]
+    // In a Toll-Free Bridged environment, CFEqual essentially dispatches to [obj1 isEqual:obj2].
+    msg![env; object1 isEqual:object2] != 0
 }
 
 pub fn CFHash(env: &mut Environment, object: CFTypeRef) -> CFHashCode {
