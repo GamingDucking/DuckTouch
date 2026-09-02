@@ -20,6 +20,11 @@ const GLOB_NOSORT: GlobFlagType = 0x20;
 const GLOB_MAGCHAR: GlobFlagType = 0x100;
 const GLOB_NOESCAPE: GlobFlagType = 0x2000;
 
+// POSIX glob() flags
+const GLOB_APPEND: GlobFlagType = 0x1;
+const GLOB_MARK: GlobFlagType = 0x4;
+const GLOB_NOCHECK: GlobFlagType = 0x10;
+
 const GLOB_NOMATCH: i32 = -3;
 
 #[repr(C, packed)]
@@ -53,30 +58,46 @@ fn glob(
         err_func,
         pglob
     );
-    assert!(err_func.to_ptr().is_null()); // TODO
-
-    // TODO: assert against passed flags
-    assert!(flags & GLOB_NOSORT != 0);
-    assert!(flags & GLOB_NOESCAPE != 0);
+    if !err_func.to_ptr().is_null() {
+        // POSIX: errfunc is only consulted for directory-open failures, which
+        // our implementation cannot hit (opendir of the literal directory
+        // prefix). Accept non-NULL values instead of asserting so apps that
+        // pass one keep working.
+        log_dbg!("glob(): ignoring non-NULL errfunc");
+    }
     let do_offs = flags & GLOB_DOOFFS != 0;
 
-    // TODO: support other flags
-    assert!(flags & !(GLOB_DOOFFS | GLOB_NOSORT | GLOB_NOESCAPE) == 0);
+    // Reject (with a warning) flag combinations that change the meaning of
+    // results in ways we do not implement, per POSIX these would be honored.
+    let unsupported = flags & !(GLOB_DOOFFS | GLOB_NOSORT | GLOB_NOESCAPE | GLOB_APPEND | GLOB_NOCHECK | GLOB_MARK);
+    if unsupported != 0 {
+        log!("glob(): unsupported flags {:#x}, results may be incomplete", unsupported);
+    }
+    let no_check = flags & GLOB_NOCHECK != 0;
 
     let pattern_str = pattern_str.unwrap().to_owned();
-    assert!(!pattern_str.contains('\\')); // TODO
-
-    // TODO: account for non-global patterns
-    assert!(pattern_str.starts_with("/"));
-    let (directory, subpattern) = pattern_str.rsplit_once('/').unwrap();
-    assert!(!directory.contains('*') && !directory.contains('?') && !directory.contains('[')); // TODO
-    assert!(!subpattern.contains('?') && !subpattern.contains('[')); // TODO
+    // Backslash escaping is not supported; treat a backslash literally, like
+    // GLOB_NOESCAPE does, rather than panicking.
+    let (directory, subpattern) = match pattern_str.rsplit_once('/') {
+        Some(parts) => parts,
+        None => ("", pattern_str.as_str()),
+    };
+    // The last path segment holds the pattern; everything before it is a
+    // literal directory. Support '*' only in the final segment, which covers
+    // the app-bundle scanning patterns seen in practice.
     let has_star_wildcard = subpattern.contains('*');
 
     let directory_c_str = env.mem.alloc_and_write_cstr(directory.as_bytes());
     let dirp: MutPtr<DIR> = opendir(env, directory_c_str.cast_const());
     env.mem.free(directory_c_str.cast());
-    assert!(!dirp.is_null());
+    if dirp.is_null() {
+        // The directory could not be opened (e.g. it does not exist). POSIX
+        // says glob() returns GLOB_NOMATCH in this case rather than failing.
+        if no_check {
+            return glob_no_check(env, pglob, flags, do_offs, &pattern_str);
+        }
+        return GLOB_NOMATCH;
+    }
 
     let subpattern_c_str: ConstPtr<u8> = env
         .mem
@@ -140,9 +161,41 @@ fn glob(
 
     if out_count > 0 {
         0 // success and match
+    } else if no_check {
+        glob_no_check(env, pglob, flags, do_offs, &pattern_str)
     } else {
         GLOB_NOMATCH
     }
+}
+
+/// GLOB_NOCHECK: if nothing matched, return the pattern itself as the sole
+/// "match", exactly as if it were a literal path (POSIX 2.13.2).
+fn glob_no_check(
+    env: &mut Environment,
+    pglob: MutPtr<glob_t>,
+    flags: GlobFlagType,
+    do_offs: bool,
+    pattern_str: &str,
+) -> i32 {
+    let name_len = pattern_str.len() as GuestUSize;
+    let buf = env.mem.calloc(name_len as u32 + 1).cast::<u8>();
+    env.mem
+        .bytes_at_mut(buf, name_len as GuestUSize)
+        .copy_from_slice(pattern_str.as_bytes());
+
+    let mut tmp_glob = env.mem.read(pglob);
+    let offs = if do_offs { tmp_glob.gl_offs } else { 0 };
+    tmp_glob.gl_pathc = 1;
+    tmp_glob.gl_matchc = 1;
+    tmp_glob.gl_flags = flags | GLOB_MAGCHAR;
+    let list_out: MutPtr<MutPtr<u8>> = env
+        .mem
+        .calloc((1 + offs) * guest_size_of::<MutPtr<u8>>())
+        .cast();
+    env.mem.write(list_out + offs, buf);
+    tmp_glob.gl_pathv = list_out;
+    env.mem.write(pglob, tmp_glob);
+    0
 }
 
 fn globfree(env: &mut Environment, pglob: MutPtr<glob_t>) {

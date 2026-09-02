@@ -369,12 +369,16 @@ Other options:
         still override this. Apps that legitimately upload mipmaps
         should NOT enable this flag.
 
-        On Android, HyperHLE now auto-enables this workaround when it
-        detects it is running on Qualcomm Adreno's native OpenGL ES
-        driver (and you have not set it explicitly). If the host is
-        using Google's ANGLE backend instead (recommended: Android 15+
-        system ANGLE, or developer options "ANGLE Preferences"), the
-        workaround is left off because ANGLE does not have this quirk.
+        On Android builds this workaround is enabled by default, because
+        Android hosts essentially always run Mali / Adreno / similar
+        strict drivers. On desktop hosts it stays off so pixel output is
+        unchanged for the common case.
+
+    --no-fix-texture-min-filter
+        Explicitly disable the fix_texture_min_filter workaround described
+        above. Useful on Android (where it is on by default) for the rare
+        iOS title that legitimately relies on mipmap minification and
+        would visibly lose quality under the forced GL_LINEAR.
 
     --zero-stack-after-guest-to-host-call=<bytes>
         After a guest-to-host call returns, zero out the given number of

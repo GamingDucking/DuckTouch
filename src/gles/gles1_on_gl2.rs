@@ -2136,7 +2136,10 @@ impl GLES for GLES1OnGL2<'_> {
             gl21::TexCoordPointer(size, gl21::FLOAT, stride, pointer)
         } else {
             // TODO: byte
-            assert!(type_ == gl21::SHORT || type_ == gl21::FLOAT);
+            assert!(
+                type_ == gl21::BYTE || type_ == gl21::UNSIGNED_BYTE || type_ == gl21::SHORT 
+                || type_ == gl21::INT || type_ == gl21::FLOAT || type_ == gl21::DOUBLE
+            );
             self.state.fixed_point_texture_units.remove(&active_texture);
             if self.state.fixed_point_texture_units.is_empty() {
                 self.state.pointer_is_fixed_point[2] = false;
@@ -2158,7 +2161,10 @@ impl GLES for GLES1OnGL2<'_> {
             gl21::VertexPointer(size, gl21::FLOAT, stride, pointer)
         } else {
             // TODO: byte
-            assert!(type_ == gl21::SHORT || type_ == gl21::FLOAT);
+            assert!(
+                type_ == gl21::BYTE || type_ == gl21::UNSIGNED_BYTE || type_ == gl21::SHORT 
+                || type_ == gl21::INT || type_ == gl21::FLOAT || type_ == gl21::DOUBLE
+            );
             self.state.pointer_is_fixed_point[3] = false;
             gl21::VertexPointer(size, type_, stride, pointer)
         }
@@ -2190,6 +2196,10 @@ impl GLES for GLES1OnGL2<'_> {
         pointer: *const GLvoid,
     ) {
         // GL_OES_matrix_palette: per-vertex blend weights for CPU skinning.
+        assert!(
+            type_ == gl21::BYTE || type_ == gl21::UNSIGNED_BYTE || type_ == gl21::SHORT 
+            || type_ == gl21::INT || type_ == gl21::FLOAT || type_ == gl21::DOUBLE
+        );
         let mut buffer_binding: GLint = 0;
         gl21::GetIntegerv(gl21::ARRAY_BUFFER_BINDING, &mut buffer_binding);
         self.state.palette_weight_state.size = size;
@@ -2471,22 +2481,7 @@ impl GLES for GLES1OnGL2<'_> {
         } else {
             internalformat
         };
-        assert!(
-            internalformat as GLenum == gl21::ALPHA
-                || internalformat as GLenum == gl21::RGB
-                || internalformat as GLenum == gl21::RGBA
-                || internalformat as GLenum == gl21::LUMINANCE
-                || internalformat as GLenum == gl21::LUMINANCE_ALPHA
-        );
         assert!(border == 0);
-        assert!(
-            format == gl21::ALPHA
-                || format == gl21::RGB
-                || format == gl21::RGBA
-                || format == gl21::LUMINANCE
-                || format == gl21::LUMINANCE_ALPHA
-                || format == gl21::BGRA
-        );
         assert!(
             type_ == gl21::UNSIGNED_BYTE
                 || type_ == gl21::UNSIGNED_SHORT_5_6_5

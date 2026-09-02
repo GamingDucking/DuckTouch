@@ -84,12 +84,20 @@ where
         );
         return U::default();
     };
+    // Clear any sticky host-GL error before the call so that the post-call
+    // trace report only reflects errors raised by *this* dispatch, not
+    // leftovers from untraced internal code paths (EAGL present, context
+    // sync, etc.). Without this, one bad call makes every later traced
+    // call report the same code at the wrong line.
+    if trace {
+        unsafe { gles.GetError() };
+    }
     let res = f(gles.as_mut(), &mut env.mem);
     if trace {
         let err = unsafe { gles.GetError() };
         if err != 0 {
             log!(
-                "[--trace-gl-errors] glGetError() = {:#x} after host GLES call \
+                "[--trace-gl-errors] glGetError() = {:#x} raised by host GLES call \
                  dispatched from {}:{}",
                 err,
                 caller.file(),
@@ -137,7 +145,7 @@ where
         let err = unsafe { gles.GetError() };
         if err != 0 {
             log!(
-                "[--trace-gl-errors] glGetError() = {:#x} after host GLES call \
+                "[--trace-gl-errors] glGetError() = {:#x} raised by host GLES call \
                  dispatched from {}:{}",
                 err,
                 caller.file(),
@@ -1356,6 +1364,40 @@ unsafe fn guard_client_vertex_arrays(gles: &mut dyn GLES, mem: &Mem) -> Vec<GLui
     disabled
 }
 
+
+/// Valid primitive modes for GLES1/2 draw calls. A guest passing anything else
+/// would raise GL_INVALID_ENUM (0x500) on the host driver; we filter those
+/// draws out with a one-time warning instead of feeding the driver garbage.
+const VALID_DRAW_MODES: [GLenum; 7] = [
+    0x0000, // GL_POINTS
+    0x0001, // GL_LINES
+    0x0002, // GL_LINE_LOOP
+    0x0003, // GL_LINE_STRIP
+    0x0004, // GL_TRIANGLES
+    0x0005, // GL_TRIANGLE_STRIP
+    0x0006, // GL_TRIANGLE_FAN
+];
+
+fn draw_mode_is_valid(mode: GLenum) -> bool {
+    VALID_DRAW_MODES.contains(&mode)
+}
+
+/// Warn once per (call site, bad mode) about an invalid draw mode.
+fn warn_invalid_draw_mode(what: &str, mode: GLenum) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SEEN: AtomicBool = AtomicBool::new(false);
+    if !SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        log!(
+            "Warning: guest issued a draw call with invalid mode 0x{:x} ({}); \
+             skipping the draw instead of feeding the host driver an invalid \
+             enum (avoids GL_INVALID_ENUM spam and driver-side stalls)",
+            mode,
+            what
+        );
+    }
+}
+
+
 fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsizei) {
     {
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -1380,6 +1422,10 @@ fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsize
                 );
             }
         }
+    }
+    if !draw_mode_is_valid(mode) {
+        warn_invalid_draw_mode("glDrawArrays", mode);
+        return;
     }
     with_ctx_and_mem(env, |gles, mem| unsafe {
         let disabled_arrays = guard_client_vertex_arrays(gles, mem);
@@ -1437,6 +1483,10 @@ fn glDrawElements(
                 );
             }
         }
+    }
+    if !draw_mode_is_valid(mode) {
+        warn_invalid_draw_mode("glDrawElements", mode);
+        return;
     }
     with_ctx_and_mem(env, |gles, mem| unsafe {
         let disabled_arrays = guard_client_vertex_arrays(gles, mem);
@@ -3475,6 +3525,18 @@ fn glVertexAttrib4f(
         gles.VertexAttrib4f(index, x, y, z, w)
     });
 }
+fn glVertexAttrib2fv(env: &mut Environment, index: GLuint, values: ConstPtr<GLfloat>) {
+    let value = env.mem.read(values);
+    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.VertexAttrib2fv(index, &value) });
+}
+fn glVertexAttrib3fv(env: &mut Environment, index: GLuint, values: ConstPtr<GLfloat>) {
+    let value = env.mem.read(values);
+    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.VertexAttrib3fv(index, &value) });
+}
+fn glVertexAttrib4fv(env: &mut Environment, index: GLuint, values: ConstPtr<GLfloat>) {
+    let value = env.mem.read(values);
+    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.VertexAttrib4fv(index, &value) });
+}
 fn glUniform1i(env: &mut Environment, location: GLint, v0: GLint) {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.Uniform1i(location, v0) });
 }
@@ -5259,18 +5321,29 @@ fn glProgramParameteri(env: &mut Environment, program: GLuint, pname: GLenum, va
 }
 
 unsafe fn clamp_fog_state_values(gles: &mut dyn GLES) -> Option<(f32, f32)> {
+    // Some drivers (e.g. Mesa's GLES-CM 1.1 and several mobile GLES2
+    // implementations) raise GL_INVALID_ENUM for fog-state queries made
+    // around draw calls, which pollutes the GL error queue on *every*
+    // draw. The clamp only matters for the fog-division workaround on
+    // desktop GL, so swallow any error the queries raise and restore a
+    // clean error state for the caller.
     let mut fog_enabled: GLboolean = 0;
     gles.GetBooleanv(gles11::FOG, &mut fog_enabled);
-    if fog_enabled != 0 {
-        let mut fog_start: GLfloat = 0.0;
-        let mut fog_end: GLfloat = 0.0;
-        gles.GetFloatv(gles11::FOG_START, &mut fog_start);
-        gles.GetFloatv(gles11::FOG_END, &mut fog_end);
-        if fog_start == fog_end {
-            let new_fog_start = fog_end - 0.001;
-            gles.Fogf(gles11::FOG_START, new_fog_start);
-            return Some((fog_start, fog_end));
-        }
+    if gles.GetError() != 0 {
+        // The driver rejected the fog query; skip the clamp entirely.
+        gles.GetError();
+        return None;
+    }
+    let mut fog_start: GLfloat = 0.0;
+    let mut fog_end: GLfloat = 0.0;
+    gles.GetFloatv(gles11::FOG_START, &mut fog_start);
+    gles.GetFloatv(gles11::FOG_END, &mut fog_end);
+    let _ = gles.GetError();
+    if fog_enabled != 0 && fog_start == fog_end {
+        let new_fog_start = fog_end - 0.001;
+        gles.Fogf(gles11::FOG_START, new_fog_start);
+        gles.GetError();
+        return Some((fog_start, fog_end));
     }
     None
 }
@@ -5558,8 +5631,11 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(glVertexAttrib1f(_, _)),
     export_c_func!(glVertexAttrib1fv(_, _)),
     export_c_func!(glVertexAttrib2f(_, _, _)),
+    export_c_func!(glVertexAttrib2fv(_, _)),
     export_c_func!(glVertexAttrib3f(_, _, _, _)),
+    export_c_func!(glVertexAttrib3fv(_, _)),
     export_c_func!(glVertexAttrib4f(_, _, _, _, _)),
+    export_c_func!(glVertexAttrib4fv(_, _)),
     export_c_func!(glUniform1i(_, _)),
     export_c_func!(glUniform2i(_, _, _)),
     export_c_func!(glUniform3i(_, _, _, _)),

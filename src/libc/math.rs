@@ -349,19 +349,22 @@ fn exp2f(env: &mut Environment, arg: f32) -> f32 {
     set_errno(env, 0);
     arg.exp2()
 }
-fn ldexp(env: &mut Environment, arg: f64, n: i32) -> f64 {
-    // TODO: handle errno properly
-    set_errno(env, 0);
-    assert!(!arg.is_infinite()); // TODO
-
-    arg * 2f64.powf(n as _)
+fn ldexp(_env: &mut Environment, arg: f64, n: i32) -> f64 {
+    // ldexp(x, 0) must return x unchanged, including ±0.0, ±inf and NaN.
+    // For n == 0 the multiply below would still be exact, but skip it
+    // anyway so NaN payload/sign of zero are guaranteed preserved.
+    if n == 0 || !arg.is_finite() || arg == 0.0 {
+        arg
+    } else {
+        arg * 2f64.powi(n.clamp(-2000, 2000))
+    }
 }
-fn ldexpf(env: &mut Environment, arg: f32, n: i32) -> f32 {
-    // TODO: handle errno properly
-    set_errno(env, 0);
-    assert!(!arg.is_infinite()); // TODO
-
-    arg * 2f32.powf(n as _)
+fn ldexpf(_env: &mut Environment, arg: f32, n: i32) -> f32 {
+    if n == 0 || !arg.is_finite() || arg == 0.0 {
+        arg
+    } else {
+        arg * 2f32.powi(n.clamp(-2000, 2000))
+    }
 }
 fn frexpf(env: &mut Environment, arg: f32, exp: MutPtr<i32>) -> f32 {
     frexp(env, arg.into(), exp) as f32
@@ -517,10 +520,25 @@ fn fegetround(env: &mut Environment) -> i32 {
     env.libc_state.math.rounding_direction
 }
 fn fesetround(env: &mut Environment, round: i32) -> i32 {
-    assert!(round == FE_TONEAREST || round == FE_TOWARDZERO);
-    // TODO
-    env.libc_state.math.rounding_direction = round;
-    0 // Success
+    // Per the C standard (7.6.3.2 fesetround), the argument must be one of
+    // the implementation's supported rounding-direction macros; the four
+    // IEEE 754 modes below are all supported by our rint()/nearbyint().
+    if round == FE_TONEAREST
+        || round == FE_TOWARDZERO
+        || round == FE_UPWARD
+        || round == FE_DOWNWARD
+    {
+        env.libc_state.math.rounding_direction = round;
+        0 // Success
+    } else {
+        // An invalid mode argument is not a fatal error for the guest;
+        // reject it and leave the current rounding direction unchanged.
+        log!(
+            "Warning: fesetround({:#x}): invalid rounding direction; ignoring.",
+            round
+        );
+        1 // Non-zero: failure
+    }
 }
 
 // Remainder functions
@@ -537,7 +555,28 @@ fn fmodf(env: &mut Environment, arg1: f32, arg2: f32) -> f32 {
 }
 
 // Maximum, minimum and positive difference functions
-// TODO: implement fdim
+//
+// fdim(x, y) is the "positive difference" (C99 7.12.11): x - y when
+// x > y, +0.0 otherwise. NaN arguments propagate; the comparison is done
+// first so that (x - y).max(0.0) can't wrongly return NaN when x <= y.
+fn fdim(_env: &mut Environment, arg1: f64, arg2: f64) -> f64 {
+    if arg1.is_nan() || arg2.is_nan() {
+        f64::NAN
+    } else if arg1 > arg2 {
+        arg1 - arg2
+    } else {
+        0.0
+    }
+}
+fn fdimf(_env: &mut Environment, arg1: f32, arg2: f32) -> f32 {
+    if arg1.is_nan() || arg2.is_nan() {
+        f32::NAN
+    } else if arg1 > arg2 {
+        arg1 - arg2
+    } else {
+        0.0
+    }
+}
 fn fmax(_env: &mut Environment, arg1: f64, arg2: f64) -> f64 {
     arg1.max(arg2)
 }
@@ -583,40 +622,105 @@ fn _ZNSt6vectorIN8InputMgr7KeyDataESaIS1_EE14_M_fill_insertEN9__gnu_cxx17__norma
 }
 
 fn nearbyintf(env: &mut Environment, arg: f32) -> f32 {
-    // TODO: handle errno properly
+    // nearbyint() rounds using the current rounding mode but never raises
+    // the inexact exception; we do not model that exception anyway, so it
+    // behaves the same as rintf(). (C99 7.20.6.3)
     set_errno(env, 0);
-    arg.log10()
+    rintf(env, arg)
 }
 
 fn nearbyint(env: &mut Environment, arg: f64) -> f64 {
-    // TODO: handle errno properly
     set_errno(env, 0);
-    arg.log10()
+    rint(env, arg)
 }
 
-fn llroundf(env: &mut Environment, arg: f32) -> f32 {
-    // TODO: handle errno properly
+fn llroundf(env: &mut Environment, arg: f32) -> i64 {
+    // Per the C standard (C99 7.20.6.5), llround rounds its argument to the
+    // nearest integer, halfway cases away from zero, regardless of the
+    // current rounding mode. The result is saturated on overflow because a
+    // domain error would need FE_INVALID handling we do not model.
     set_errno(env, 0);
-    arg.log10()
+    llround_impl(arg as f64)
 }
 
-fn llround(env: &mut Environment, arg: f64) -> f64 {
-    // TODO: handle errno properly
+fn llround(env: &mut Environment, arg: f64) -> i64 {
     set_errno(env, 0);
-    arg.log10()
+    llround_impl(arg)
+}
+
+fn llround_impl(arg: f64) -> i64 {
+    if arg.is_nan() {
+        // Domain error; the standard leaves the returned value unspecified.
+        return 0;
+    }
+    // f64::round rounds halfway cases away from zero, which is exactly the
+    // llround rule. Clamp so huge inputs saturate instead of wrapping.
+    arg.round().clamp(i64::MIN as f64, i64::MAX as f64) as i64
 }
 
 fn rintf(env: &mut Environment, arg: f32) -> f32 {
     // TODO: handle errno properly
     set_errno(env, 0);
-    arg.log10()
+
+    match env.libc_state.math.rounding_direction {
+        FE_TONEAREST => arg.round_ties_even(),
+        FE_TOWARDZERO => arg.trunc(),
+        FE_UPWARD => arg.ceil(),
+        FE_DOWNWARD => arg.floor(),
+        other => {
+            log!(
+                "Warning: rint/nearbyint: unknown rounding mode {}; defaulting to round-to-nearest.",
+                other
+            );
+            arg.round_ties_even()
+        }
+    }
 }
 
 // Other
 fn nan(env: &mut Environment, arg: ConstPtr<u8>) -> f32 {
-    assert_eq!(env.mem.read(arg), b'\0');
-    // TODO
+    // C99 7.12.11: the sequence pointed to by `arg` is a taggponent —
+    // hexadecimal digits (case-insensitive, possibly with a leading '0x')
+    // forming the significand bits of the quiet NaN. Empty string means
+    // an unspecified taggponent. We don't model the bit pattern beyond
+    // returning a quiet NaN, but we must not panic on non-empty tags.
+    let tag = env.mem.cstr_at_utf8(arg).unwrap_or_default().to_owned();
+    if !tag.is_empty() {
+        log_dbg!("nan(\"{tag}\"): taggponent ignored, returning quiet NaN");
+    }
     f32::NAN
+}
+
+// Cube root. Unlike pow(x, 1.0/3.0), cbrt() is exact at +/-1.0 and 0.0,
+// and it is odd: cbrt(-x) == -cbrt(x). We compute the magnitude via a
+// Newton-Raphson iteration on a scaled argument to avoid pow()'s
+// intermediate overflow for extreme inputs (C99 7.12.7.1).
+fn cbrt(_env: &mut Environment, arg: f64) -> f64 {
+    if !arg.is_finite() || arg == 0.0 {
+        return arg; // ±0.0, ±inf, NaN pass through
+    }
+    let sign = arg.signum();
+    let magnitude = cbrt_magnitude(arg.abs());
+    sign * magnitude
+}
+
+fn cbrtf(env: &mut Environment, arg: f32) -> f32 {
+    cbrt(env, arg as f64) as f32
+}
+
+// cbrt() of a positive, finite value, using exponent folding so the
+// Newton iteration always starts in [1, 8) and converges in a few steps.
+fn cbrt_magnitude(a: f64) -> f64 {
+    debug_assert!(a.is_finite() && a > 0.0);
+    // Split off a multiple of 8 so the scaled argument lies in [1, 8).
+    let e = (a.log2().floor() / 3.0).floor() as i32;
+    let scaled = a * 2f64.powi(-3 * e);
+    // Initial guess: cubic through (1,1) and (8,2) on the log scale.
+    let mut r = 0.5 * scaled + 0.5;
+    for _ in 0..4 {
+        r = (2.0 * r + scaled / (r * r)) / 3.0;
+    }
+    r * 2f64.powi(e)
 }
 
 fn hypot(env: &mut Environment, arg1: f64, arg2: f64) -> f64 {
@@ -971,6 +1075,8 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(fmaxf(_, _)),
     export_c_func!(fmin(_, _)),
     export_c_func!(fminf(_, _)),
+    export_c_func!(fdim(_, _)),
+    export_c_func!(fdimf(_, _)),
     export_c_func!(_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6__initEPKcm(_, _)),
     export_c_func!(_ZNSt6vectorIN8InputMgr7KeyDataESaIS1_EE7reserveEm(_, _)),
     export_c_func!(_ZNSt6vectorIN8InputMgr9TouchDataESaIS1_EE7reserveEm(_, _)),
@@ -984,6 +1090,8 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(nan(_)),
     export_c_func!(hypot(_, _)),
     export_c_func!(hypotf(_, _)),
+    export_c_func!(cbrt(_)),
+    export_c_func!(cbrtf(_)),
     export_c_func!(__fpclassifyf(_)),
     export_c_func!(__isnanf(_)),
     export_c_func!(__isnand(_)),

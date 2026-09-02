@@ -51,6 +51,13 @@ pub enum ParamType {
     Float,
     /// `GLint`
     Int,
+    /// Normalized floating-point color components (RGBA in [0, 1]).
+    ///
+    /// Per the GLES 1.1 spec (Table 6.1, type "C"), color state is clamped
+    /// to [0, 1] on set; when queried with an integer getter the components
+    /// are scaled to the full integer range (see [ParamTable::get_type_info]
+    /// users), unlike plain `Float` state which is rounded to nearest.
+    Color,
     /// Placeholder type for things like colors which are floating-point
     /// but don't have the usual conversion behavior to/from integers etc.
     /// [ParamTable] will accept it for floating-point inputs only.
@@ -125,7 +132,7 @@ impl ParamTable {
         // On the other hand, fixed-to-float/float-to-fixed conversion is always
         // the same even for the weird float-ish values.
         match type_ {
-            ParamType::Float | ParamType::FloatSpecial => setf(fixed_to_float(param)),
+            ParamType::Float | ParamType::Color | ParamType::FloatSpecial => setf(fixed_to_float(param)),
             _ => seti(param),
         }
     }
@@ -150,7 +157,7 @@ impl ParamTable {
         match type_ {
             // Fixed-to-float/float-to-fixed conversion is always the same even
             // for the weird float-ish values.
-            ParamType::Float | ParamType::FloatSpecial => {
+            ParamType::Float | ParamType::Color | ParamType::FloatSpecial => {
                 let mut params_float = [0.0; 16]; // probably the max?
                 let params_float = &mut params_float[..usize::from(count)];
                 for (i, param_float) in params_float.iter_mut().enumerate() {

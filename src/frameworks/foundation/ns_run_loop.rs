@@ -346,20 +346,6 @@ pub fn run_run_loop(
     single_iteration: bool,
     unix_time_limit: Option<f64>,
 ) {
-    if single_iteration {
-        log_dbg!(
-            "Entering run loop {:?} (single iteration), limit {:?}",
-            run_loop,
-            unix_time_limit
-        );
-    } else {
-        log_dbg!(
-            "Entering run loop {:?} (indefinitely), limit {:?}",
-            run_loop,
-            unix_time_limit
-        );
-    }
-
     // Temporary vectors used to track things without needing a reference to the
     // environment or to lock the object. Re-used each iteration for efficiency.
     let mut timers_tmp = Vec::new();
@@ -373,14 +359,6 @@ pub fn run_run_loop(
     }
 
     let is_main_run_loop = env.current_thread == 0;
-
-    if is_main_run_loop {
-        // Important breadcrumb for diagnosing "app freezes after splash"
-        // reports: this only fires once, when the main run loop actually
-        // starts iterating, which means UIApplicationMain has finished
-        // applicationDidFinishLaunching: + applicationDidBecomeActive:.
-        log_once!("Main NSRunLoop reached its first iteration (app finished launching)");
-    }
 
     loop {
         let mut sleep_until = None;

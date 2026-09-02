@@ -162,107 +162,43 @@ fn access(env: &mut Environment, path: ConstPtr<u8>, mode: i32) -> i32 {
     };
     let guest_path = GuestPath::new(&resolved_binding);
     let (exists, read, write, execute) = env.fs.access(guest_path);
-    // TODO: support ORing
-    match mode {
-        F_OK => {
-            if exists {
-                0
-            } else {
-                set_errno(env, ENOENT);
-                -1
-            }
+    // POSIX access() takes a bitmask: modes can be ORed together
+    // (e.g. R_OK | W_OK). Check every requested bit; all must pass.
+    if mode == F_OK {
+        if exists {
+            0
+        } else {
+            set_errno(env, ENOENT);
+            -1
         }
-        X_OK => {
-            if execute {
-                0
-            } else {
-                set_errno(env, EACCES);
-                -1
-            }
-        }
-        W_OK => {
-            if write {
-                0
-            } else {
-                set_errno(env, EROFS);
-                -1
-            }
-        }
-        R_OK => {
-            if read {
-                0
-            } else {
-                // TODO: is it the correct error?
-                set_errno(env, EACCES);
-                -1
-            }
-        }
-        B_OK => {
-            if read {
-                0
-            } else {
-                // TODO: is it the correct error?
-                set_errno(env, EACCES);
-                -1
-            }
-        }
-        T_OK => {
-            if read {
-                0
-            } else {
-                // TODO: is it the correct error?
-                set_errno(env, EACCES);
-                -1
-            }
-        }
-        P_OK => {
-            if read {
-                0
-            } else {
-                // TODO: is it the correct error?
-                set_errno(env, EACCES);
-                -1
-            }
-        }
-        A_OK => {
-            if read {
-                0
-            } else {
-                // TODO: is it the correct error?
-                set_errno(env, EACCES);
-                -1
-            }
-        }
-        C_OK => {
-            if read {
-                0
-            } else {
-                // TODO: is it the correct error?
-                set_errno(env, EACCES);
-                -1
-            }
-        }
-        D_OK => {
-            if read {
-                0
-            } else {
-                // TODO: is it the correct error?
-                set_errno(env, EACCES);
-                -1
-            }
-        }
-        _ => {
-            // Real access() returns -1 with EINVAL for unknown modes. Match
-            // that instead of crashing the host on a malformed guest call.
+    } else {
+        if mode & !D_OK != mode || mode == 0 {
+            // Unknown mode bits: real access() returns -1 with EINVAL.
             log!(
                 "Warning: access(): unknown mode {:#x}; returning EINVAL.",
                 mode
             );
             set_errno(env, EINVAL);
             -1
+        } else {
+            let mut result = 0;
+            if mode & R_OK != 0 && !read {
+                set_errno(env, EACCES);
+                result = -1;
+            }
+            if result == 0 && mode & W_OK != 0 && !write {
+                set_errno(env, EACCES);
+                result = -1;
+            }
+            if result == 0 && mode & X_OK != 0 && !execute {
+                set_errno(env, EACCES);
+                result = -1;
+            }
+            result
         }
     }
 }
+
 
 fn fork(env: &mut Environment) -> i32 {
     // fork() is not supported in touchHLE — iOS does not support forking

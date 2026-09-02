@@ -480,9 +480,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     () = msg![env; this presentModalViewController:moviePlayerViewController animated:false];
 }
 
+// Apple's documentation: "Dismisses a movie player view controller using
+// the standard movie player transition."
+// https://developer.apple.com/documentation/uikit/uiviewcontroller/1619163-dismissmovieplayerviewcontroller
 - (())dismissMoviePlayerViewControllerAnimated {
-    log!("TODO: [(UIViewController*){:?} dismissMoviePlayerViewControllerAnimated]", this);
-    // TODO
+    () = msg![env; this dismissModalViewControllerAnimated:true];
 }
 
 - (bool)shouldAutorotateToInterfaceOrientation:(UIInterfaceOrientation)interface_orientation {

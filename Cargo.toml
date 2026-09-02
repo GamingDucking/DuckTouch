@@ -108,3 +108,10 @@ gl_generator = { workspace = true }
 opt-level = 3
 codegen-units = 1
 lto = "thin"
+
+# Patched copy of symphonia-codec-aac 0.6.0: its AAC section-data parser can
+# index out of bounds (len 64, index 64) on unusual but valid streams and
+# panic, taking down the whole emulator. The vendored copy under
+# vendor/symphonia-codec-aac turns that into a recoverable decode error.
+[patch.crates-io]
+symphonia-codec-aac = { path = "vendor/symphonia-codec-aac" }

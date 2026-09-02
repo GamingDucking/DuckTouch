@@ -1990,13 +1990,34 @@ impl Environment {
                 }
 
                 if count >= BYPASS_LIMIT {
-                    panic!(
-                        "UndefinedInstruction at {:#x} looped {} times with \
-                         LR={:#x}; giving up to avoid hanging. This usually \
-                         means a framework stub returned bogus data that the \
-                         guest keeps re-trapping on.",
-                        pc, count, lr
-                    );
+                    // The same (PC, LR) pair has trapped BYPASS_LIMIT times.
+                    // Faking a return to LR clearly does not help — the caller
+                    // keeps re-entering the faulting site (usually a framework
+                    // stub that returned bogus data the guest re-calls into).
+                    // Rather than killing the whole emulator, degrade
+                    // gracefully: skip past the faulting instruction (treat
+                    // the UDF as a no-op) so execution continues in the
+                    // caller's body, and reset the counters so a later,
+                    // different loop still gets a fresh budget. A genuine
+                    // infinite hang is still bounded by LR_BYPASS_LIMIT
+                    // above and by the per-batch forward-progress reset in
+                    // `handle_cpu_state`.
+                    if count == BYPASS_LIMIT || count % (BYPASS_LIMIT * 4) == 0 {
+                        log_no_panic!(
+                            "Warning: UndefinedInstruction at {:#x} looped {} \
+                             times with LR={:#x}. Faking returns is not making \
+                             progress, so skipping the faulting instruction \
+                             instead. This usually means a framework stub \
+                             returned data the guest keeps re-trapping on.",
+                            pc, count, lr
+                        );
+                    }
+                    self.cpu.regs_mut()[cpu::Cpu::PC] = pc.wrapping_add(instruction_len);
+                    self.udf_bypass_last = None;
+                    self.udf_bypass_count = 0;
+                    self.udf_bypass_last_lr = None;
+                    self.udf_bypass_lr_count = 0;
+                    return;
                 }
 
                 // Pathological self-loop: when LR (with Thumb bit cleared)
