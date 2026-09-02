@@ -2481,13 +2481,6 @@ impl GLES for GLES1OnGL2<'_> {
         } else {
             internalformat
         };
-        assert!(
-            internalformat as GLenum == gl21::ALPHA
-                || internalformat as GLenum == gl21::RGB
-                || internalformat as GLenum == gl21::RGBA
-                || internalformat as GLenum == gl21::LUMINANCE
-                || internalformat as GLenum == gl21::LUMINANCE_ALPHA
-        );
         assert!(border == 0);
         assert!(
             format == gl21::ALPHA
