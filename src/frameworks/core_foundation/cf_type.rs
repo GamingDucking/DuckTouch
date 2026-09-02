@@ -55,7 +55,8 @@ pub fn CFEqual(env: &mut Environment, object1: CFTypeRef, object2: CFTypeRef) ->
     }
 
     // In a Toll-Free Bridged environment, CFEqual essentially dispatches to [obj1 isEqual:obj2].
-    msg![env; object1 isEqual:object2] != 0
+    let result: i8 = msg![env; object1 isEqual:object2];
+    result != 0
 }
 
 pub fn CFHash(env: &mut Environment, object: CFTypeRef) -> CFHashCode {
