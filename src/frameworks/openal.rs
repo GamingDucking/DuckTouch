@@ -109,10 +109,10 @@ macro_rules! try_get_context {
             .map(|ctx| ctx.make_current(&mut $env.openal_manager))
         else {
             log_dbg!(
-                "Попытка получить контекст, но текущий активный контекст {:?} недействителен, пропускаем!",
+                "Attempting to retrieve the context, but the current active context {:?} is invalid; skipping it!",
                 State::get($env).current_ctx
             );
-            // TODO: установить ошибку
+            // TODO: Identify the error
             return;
         };
     };
@@ -124,10 +124,10 @@ macro_rules! try_get_context {
             .map(|ctx| ctx.make_current(&mut $env.openal_manager))
         else {
             log_dbg!(
-                "Попытка получить контекст, но текущий активный контекст {:?} недействителен, пропускаем!",
+                "Attempting to retrieve the context, but the current active context {:?} is invalid; skipping it!",
                 State::get($env).current_ctx
             );
-            // TODO: установить ошибку
+            // TODO: Identify the error
             return $rval;
         };
     };
@@ -576,7 +576,7 @@ fn alcGetProcAddress(
     }
 }
 
-// TODO: больше функций
+// TODO: More features
 
 // === al.h ===
 
@@ -1208,11 +1208,11 @@ fn alSpeedOfSound(env: &mut Environment, value: ALfloat) {
     unsafe { context.SpeedOfSound(value) };
 }
 
-// TODO: больше функций
+// TODO: More features
 
-// Примечание: По некоторым причинам Wolf3d регистрирует много функций OpenAL,
-// но фактически использует лишь несколько. Чтобы обойти это, мы просто
-// предоставляем заглушки.
+// Note: For some reason, Wolf3d registers many OpenAL functions,
+// but actually uses only a few. To work around this, we simply
+// provide placeholders.
 
 // The following functions used to `todo!()` (i.e. panic) — that is wrong
 // behaviour for emulator-facing APIs. Per OpenAL 1.1 spec, querying with an
