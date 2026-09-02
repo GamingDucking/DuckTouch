@@ -29,8 +29,6 @@ jobs:
         uses: actions/checkout@main
         with:
           submodules: recursive
-          fetch-depth: 0
-          fetch-tags: true
           
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@master
@@ -119,8 +117,6 @@ jobs:
         uses: actions/checkout@main
         with:
           submodules: recursive
-          fetch-depth: 0
-          fetch-tags: true
 
       - name: Install Linux build dependencies
         # SDL2 and openal-soft are built from source (the `static` feature uses
@@ -191,8 +187,6 @@ jobs:
       uses: actions/checkout@main
       with:
         submodules: recursive
-        fetch-depth: 0
-        fetch-tags: true
 
     - name: Cache Rust build artifacts
       uses: actions/cache@main
@@ -280,9 +274,6 @@ jobs:
     - name: Build for Android  
       run: cd android && ../gradle/gradle-8.11.1/bin/gradle assembleRelease && mv app/build/outputs/apk/release/app-release.apk ../touchHLE.apk  
       env:  
-        HYPERHLE_KEYSTORE_B64: ${{ secrets.HYPERHLE_KEYSTORE_B64 }}
-        HYPERHLE_KEYSTORE_PASSWORD: ${{ secrets.HYPERHLE_KEYSTORE_PASSWORD }}
-        HYPERHLE_KEY_ALIAS: ${{ secrets.HYPERHLE_KEY_ALIAS }}
         ANDROID_NDK_ROOT: '/usr/local/lib/android/sdk/ndk/25.2.9519653'  
         CMAKE: ${{ github.workspace }}/vendor/cmake/bin/cmake  
 
@@ -350,7 +341,6 @@ jobs:
         uses: actions/checkout@main
         with:
           fetch-depth: 0
-          fetch-tags: true
       - name: Check whether a HyperHLE release is due
         id: check
         env:
@@ -375,7 +365,6 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
-          fetch-tags: true
       - name: Download macOS artifact
         uses: actions/download-artifact@main
         with:

@@ -32,50 +32,9 @@ static def join(String prefix, String separator, String branding) {
     }
 }
 
-
-def getTouchHLEVersionCode() {
-    def base = getTouchHLEVersionName().trim().replaceFirst('^v', '').split(' ')[0]
-    def parts = base.tokenize('.')
-    int code = 0
-    for (int i = 0; i < 3; i++) {
-        def part = i < parts.size() ? parts[i].replaceAll('[^0-9].*', '') : '0'
-        code = code * 100 + (part.isEmpty() ? 0 : part as int)
-    }
-    def runNumber = System.getenv('GITHUB_RUN_NUMBER')
-    return runNumber == null ? code : Math.max(code, 1000) + (runNumber as int)
-}
-
-
-
-def hyperHLEKeystoreFile = System.getenv('HYPERHLE_KEYSTORE_FILE')
-def hyperHLEKeystoreB64 = System.getenv('HYPERHLE_KEYSTORE_B64')
-def hyperHLEKeystorePass = System.getenv('HYPERHLE_KEYSTORE_PASSWORD') ?: 'hyperhle'
-def hyperHLEKeyAlias = System.getenv('HYPERHLE_KEY_ALIAS') ?: 'hyperhle'
-def hyperHLEHasReleaseKey = (hyperHLEKeystoreB64 != null && !hyperHLEKeystoreB64.trim().isEmpty()) || (hyperHLEKeystoreFile != null && !hyperHLEKeystoreFile.trim().isEmpty()) || file('../keystore/release.keystore').exists()
-
-
 android {
     ndkVersion "25.2.9519653"
     compileSdkVersion 35
-    signingConfigs {
-        release {
-            if (hyperHLEKeystoreB64 != null && !hyperHLEKeystoreB64.trim().isEmpty()) {
-                def tmp = File.createTempFile('hyperhle', '.keystore')
-                tmp.bytes = hyperHLEKeystoreB64.decodeBase64()
-                storeFile tmp
-            } else if (hyperHLEKeystoreFile != null && !hyperHLEKeystoreFile.trim().isEmpty()) {
-                storeFile file(hyperHLEKeystoreFile)
-            }
-            if (hyperHLEHasReleaseKey) {
-                storePassword hyperHLEKeystorePass
-                keyAlias hyperHLEKeyAlias
-                keyPassword hyperHLEKeystorePass
-            }
-        }
-        debug {
-            storeFile file('../debug.keystore')
-        }
-    }
     defaultConfig {
         def branding = getTouchHLEBranding()
         applicationId 'org.touchhle.android'
@@ -86,8 +45,6 @@ android {
                 icon: join('@drawable/icon', '_', branding.toLowerCase())
         ]
         buildConfigField 'int', 'APP_ICON', join('R.drawable.icon', '_', branding.toLowerCase())
-
-        versionCode getTouchHLEVersionCode()
         versionName join(getTouchHLEVersionName(), ' ', branding)
 
         minSdkVersion 21 // first version with AArch64
@@ -117,11 +74,7 @@ android {
     }
     buildTypes {
         release {
-            if (hyperHLEHasReleaseKey) {
-                signingConfig signingConfigs.release
-            } else {
-                signingConfig signingConfigs.debug
-            }
+            signingConfig signingConfigs.debug
             minifyEnabled false
             debuggable true // allow use of ADB to manage files, etc
         }
