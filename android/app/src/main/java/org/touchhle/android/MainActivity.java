@@ -45,8 +45,6 @@ public class MainActivity extends SDLActivity {
     // Message ID sent from the Rust WebView bridge (see android_web_view.rs)
     // to notify the emulated app that a page finished loading in a real
     // WebView overlay. Payload packs (overlay id, action) into one long.
-    private static final int MSG_WEB_OVERLAY = 0x8001;
-    private static final int WEB_OVERLAY_ACTION_LOAD_FINISHED = 1;
 
     // Request code for the system file picker started by this activity.
     private static final int REQUEST_ADD_IPA = 1;
@@ -116,19 +114,9 @@ public class MainActivity extends SDLActivity {
             wv.setWebViewClient(new android.webkit.WebViewClient() {
                 @Override
                 public void onPageFinished(android.webkit.WebView view, String u) {
-                    // Find this overlay's id and notify Rust (via SDL
-                    // onUnhandledMessage) that the page finished loading so
-                    // webViewDidFinishLoad: fires in the emulated app.
-                    for (java.util.Map.Entry<Integer, android.webkit.WebView> e
-                            : webOverlays.entrySet()) {
-                        if (e.getValue() == view) {
-                            long payload = ((long) e.getKey().intValue() << 32)
-                                    | (long) WEB_OVERLAY_ACTION_LOAD_FINISHED;
-                            SDLActivity.onNativeSendMessage(
-                                    "web_overlay_notify", payload);
-                            break;
-                        }
-                    }
+                    // The emulated side already fires webViewDidFinishLoad:
+                    // on a short timer after the load starts, so nothing
+                    // needs to be sent back into native code here.
                 }
             });
             // Transparent background so the emulated app shows through before
@@ -356,21 +344,9 @@ public class MainActivity extends SDLActivity {
             });
             return true;
         }
-        if (message == MSG_WEB_OVERLAY) {
-            // data is a long: high 32 bits = overlay id, low 32 = action
-            // (1 = page load finished).
-            final long payload = ((Long) data).longValue();
-            final int id = (int) (payload >> 32);
-            final int action = (int) (payload & 0xFFFFFFFFL);
-            runOnUiThread(new Runnable() {
-                public void run() {
-                    if (action == WEB_OVERLAY_ACTION_LOAD_FINISHED) {
-                        notifyWebOverlayLoadFinished(id);
-                    }
-                }
-            });
-            return true;
-        }
+        // MSG_WEB_OVERLAY (0x8001) is reserved: native code notifies the
+        // emulated app about page loads itself (via NSTimer), so there is
+        // nothing to handle here yet.
         return super.onUnhandledMessage(message, data);
     }
 
