@@ -315,13 +315,15 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (bool)openURL:(id)url { // NSURL
     let ns_string = msg![env; url absoluteString];
     let url_string = ns_string::to_rust_string(env, ns_string);
+    // Hand the URL to the host (on Android this opens the system browser
+    // via MainActivity.openExternalUrl and the emulator keeps running —
+    // exiting the process here killed the app before the intent could
+    // dispatch, so links never opened).
     if let Err(e) = crate::window::open_url(env, &url_string) {
-        echo!("App opened URL {:?} unsuccessfully ({}), exiting.", url_string, e);
+        echo!("App opened URL {:?} unsuccessfully ({}).", url_string, e);
     } else {
-        echo!("App opened URL {:?}, exiting.", url_string);
+        echo!("App opened URL {:?}.", url_string);
     }
-
-    exit(env);
     true
 }
 

@@ -67,7 +67,7 @@ fn CFDictionaryCreate(
     dict
 }
 
-fn CFDictionaryCreateMutable(
+pub(crate) fn CFDictionaryCreateMutable(
     env: &mut Environment,
     allocator: CFAllocatorRef,
     capacity: CFIndex,
@@ -228,13 +228,13 @@ fn CFDictionaryContainsValue(
     false
 }
 
-fn CFDictionaryGetCount(env: &mut Environment, dict: CFDictionaryRef) -> CFIndex {
+pub(crate) fn CFDictionaryGetCount(env: &mut Environment, dict: CFDictionaryRef) -> CFIndex {
     let count: NSUInteger = msg![env; dict count];
     log_dbg!("CFDictionaryGetCount -> {}", count);
     count.try_into().unwrap()
 }
 
-fn CFDictionaryGetKeysAndValues(
+pub(crate) fn CFDictionaryGetKeysAndValues(
     env: &mut Environment,
     dict: CFDictionaryRef,
     keys: ConstPtr<MutVoidPtr>,

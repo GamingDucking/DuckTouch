@@ -398,6 +398,24 @@ mod imp {
             .and_then(|jni| jni.find_main_activity_class())
             .is_some()
     }
+
+    /// Open a URL in the system browser (or whichever app owns the scheme).
+    /// Returns true if the intent was launched successfully.
+    pub fn open_url_external(url: &str) -> bool {
+        let Some(jni) = Jni::attach() else {
+            return false;
+        };
+        jni.with_class(|jni, class| {
+            let method =
+                jni.get_static_method(class, "openExternalUrl", "(Ljava/lang/String;)I")?;
+            let url_j = jni.new_jstring(url);
+            let args = [JValue { l: url_j }];
+            let ret = jni.call_static_int(class, method, &args);
+            jni.delete_local_ref(url_j);
+            Some(ret == 0)
+        })
+        .unwrap_or(false)
+    }
 }
 
 #[cfg(not(target_os = "android"))]
@@ -424,6 +442,9 @@ mod imp {
     }
     pub fn stop_loading(_id: OverlayId) {}
     pub fn native_webview_available() -> bool {
+        false
+    }
+    pub fn open_url_external(_url: &str) -> bool {
         false
     }
 }

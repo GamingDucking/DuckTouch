@@ -46,10 +46,14 @@
 
 use crate::abi::{CallFromHost, GuestFunction};
 use crate::dyld::{export_c_func, FunctionExports};
+use crate::frameworks::core_foundation::cf_allocator::kCFAllocatorDefault;
 use crate::frameworks::core_foundation::cf_data::{CFDataCreate, CFDataGetBytePtr, CFDataGetLength};
+use crate::frameworks::core_foundation::cf_dictionary::{
+    CFDictionaryCreateMutable, CFDictionaryGetCount, CFDictionaryGetKeysAndValues,
+};
+use crate::frameworks::core_foundation::cf_type::{CFRelease, CFRetain, CFTypeRef};
 use crate::frameworks::core_foundation::cf_run_loop::CFRunLoopGetMain;
 use crate::frameworks::core_foundation::cf_string::kCFStringEncodingUTF8;
-use crate::frameworks::core_foundation::cf_type::{CFRelease, CFRetain, CFTypeRef};
 use crate::frameworks::foundation::ns_string;
 use crate::mem::{ConstPtr, ConstVoidPtr, GuestISize, MutPtr, MutVoidPtr, Ptr, SafeRead};
 use crate::objc::{msg, msg_class, nil, objc_classes, release, ClassExports, HostObject, NSZonePtr, id};
@@ -628,6 +632,116 @@ fn cf_data_from_vec(env: &mut Environment, bytes: Vec<u8>) -> CFTypeRef {
     );
     env.mem.free(tmp.cast());
     data
+}
+
+// MARK: - CFNetService (TXT record helpers)
+
+/// `CFDataRef CFNetServiceCreateTXTDataWithDictionary(CFAllocatorRef alloc,
+/// CFDictionaryRef keyValuePairs)`
+///
+/// Flattens a dictionary into DNS-SD TXT record format: each entry becomes
+/// `len(0..=255) "key=value"` (bare `"key"` for empty/absent values).
+/// Keys must be CFStrings; values may be CFData (used verbatim) or CFString
+/// (flattened to its UTF-8 bytes), per the documented contract.
+fn CFNetServiceCreateTXTDataWithDictionary(
+    env: &mut Environment,
+    _alloc: CFTypeRef,
+    dict: CFTypeRef,
+) -> CFTypeRef {
+    if dict == nil {
+        return nil;
+    }
+    let count = CFDictionaryGetCount(env, dict.cast());
+    if count <= 0 {
+        return cf_data_from_vec(env, Vec::new());
+    }
+    let keys_ptr: MutPtr<MutVoidPtr> = env
+        .mem
+        .alloc(((count as usize) * std::mem::size_of::<MutVoidPtr>()) as crate::mem::GuestUSize)
+        .cast();
+    let vals_ptr: MutPtr<MutVoidPtr> = env
+        .mem
+        .alloc(((count as usize) * std::mem::size_of::<MutVoidPtr>()) as crate::mem::GuestUSize)
+        .cast();
+    CFDictionaryGetKeysAndValues(env, dict.cast(), keys_ptr.cast_const(), vals_ptr.cast_const());
+
+    let mut out: Vec<u8> = Vec::new();
+    for i in 0..count as u32 {
+        let key_id: id = env.mem.read(keys_ptr + i).cast();
+        let val_id: id = env.mem.read(vals_ptr + i).cast();
+        if key_id == nil {
+            continue;
+        }
+        let key = ns_string::to_rust_string(env, key_id).into_owned();
+        let mut value_bytes: Option<Vec<u8>> = None;
+        if val_id != nil {
+            // CFData value → verbatim; CFString value → UTF-8 bytes.
+            let data_class = env.objc.try_get_known_class("NSData", &mut env.mem);
+            let is_data: bool = if let Some(dc) = data_class {
+                let res: bool = msg![env; val_id isKindOfClass:dc];
+                res
+            } else {
+                false
+            };
+            if is_data {
+                let len = CFDataGetLength(env, val_id.cast());
+                if len > 0 {
+                    let ptr = CFDataGetBytePtr(env, val_id.cast());
+                    value_bytes = Some(env.mem.bytes_at(ptr.cast(), len as u32).to_vec());
+                }
+            } else {
+                value_bytes = Some(
+                    ns_string::to_rust_string(env, val_id)
+                        .into_owned()
+                        .into_bytes(),
+                );
+            }
+        }
+        let entry = match value_bytes {
+            Some(v) if v.is_empty() => key.into_bytes(),
+            Some(v) => {
+                let mut e = key.into_bytes();
+                e.push(b'=');
+                e.extend_from_slice(&v);
+                e
+            }
+            None => key.into_bytes(),
+        };
+        // DNS-SD: each string is length-prefixed, max 255 bytes.
+        let entry = &entry[..entry.len().min(255)];
+        out.push(entry.len() as u8);
+        out.extend_from_slice(entry);
+    }
+    env.mem.free(keys_ptr.cast());
+    env.mem.free(vals_ptr.cast());
+    cf_data_from_vec(env, out)
+}
+
+/// `bool CFNetServiceSetTXTData(CFNetServiceRef service, CFDataRef txtRecord)`
+///
+/// Stores the TXT record bytes on the service. They are answered in mDNS
+/// TXT queries and picked up by the monitor, mirroring registration.
+fn CFNetServiceSetTXTData(
+    env: &mut Environment,
+    service: CFNetServiceRef,
+    txt: CFTypeRef,
+) -> bool {
+    if service == nil {
+        return false;
+    }
+    let bytes = if txt != nil && !txt.is_null() {
+        let len = CFDataGetLength(env, txt.cast());
+        if len > 0 {
+            let ptr = CFDataGetBytePtr(env, txt.cast());
+            Some(env.mem.bytes_at(ptr.cast(), len as u32).to_vec())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    env.objc.borrow_mut::<CFNetServiceHostObject>(service).txt = bytes;
+    true
 }
 
 // MARK: - CFNetService
@@ -1598,6 +1712,8 @@ fn CFNetServiceBrowserSearchForDomains(
 
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CFNetServiceCreate(_, _, _, _, _)),
+    export_c_func!(CFNetServiceCreateTXTDataWithDictionary(_, _)),
+    export_c_func!(CFNetServiceSetTXTData(_, _)),
     export_c_func!(CFNetServiceRetain(_)),
     export_c_func!(CFNetServiceRelease(_)),
     export_c_func!(CFNetServiceGetDomain(_)),

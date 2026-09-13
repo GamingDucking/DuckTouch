@@ -2386,6 +2386,17 @@ impl Window {
 }
 
 pub fn open_url(env: &mut Environment, url: &str) -> Result<(), String> {
+    // On Android prefer our own JNI path to the system browser: SDL's
+    // SDL_OpenURL goes through SDLActivity.openURL, which works, but doing
+    // it directly keeps the intent flags predictable and avoids issues when
+    // the app process is paused on return. Non-Android platforms keep using
+    // SDL_OpenURL (desktop shell handlers).
+    #[cfg(target_os = "android")]
+    {
+        if crate::android_web_view::open_url_external(url) {
+            return Ok(());
+        }
+    }
     env.on_parent_stack_in_coroutine(|_, _| sdl2::url::open_url(url).map_err(|e| e.to_string()))
 }
 

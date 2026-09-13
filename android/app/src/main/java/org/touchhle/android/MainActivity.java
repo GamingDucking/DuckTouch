@@ -11,6 +11,7 @@ package org.touchhle.android;
 import android.app.Activity;
 import android.content.ContentResolver;
 import android.content.Intent;
+import android.net.wifi.WifiManager;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Bundle;
@@ -31,9 +32,21 @@ import java.io.InputStream;
 public class MainActivity extends SDLActivity {
     private static final String TAG = "touchHLE";
 
+    // Keeps Wi-Fi multicast packets flowing while the app runs. Without this
+    // the Android Wi-Fi driver filters mDNS (224.0.0.251:5353), breaking
+    // Bonjour/CFNetService local multiplayer discovery. Held for the process
+    // lifetime; released when the activity is destroyed.
+    private static android.net.wifi.WifiManager.MulticastLock multicastLock;
+
     // Message ID sent from the Rust app picker (see window.rs) to open the
     // .ipa file picker. Must match window.rs ADD_IPA_COMMAND.
     private static final int MSG_ADD_IPA = 0x8000;
+
+    // Message ID sent from the Rust WebView bridge (see android_web_view.rs)
+    // to notify the emulated app that a page finished loading in a real
+    // WebView overlay. Payload packs (overlay id, action) into one long.
+    private static final int MSG_WEB_OVERLAY = 0x8001;
+    private static final int WEB_OVERLAY_ACTION_LOAD_FINISHED = 1;
 
     // Request code for the system file picker started by this activity.
     private static final int REQUEST_ADD_IPA = 1;
@@ -48,6 +61,28 @@ public class MainActivity extends SDLActivity {
     private static final java.util.HashMap<Integer, android.webkit.WebView> webOverlays =
             new java.util.HashMap<Integer, android.webkit.WebView>();
     private static int nextWebOverlayId = 1;
+
+    // Open a URL in the system browser (or the app that owns the scheme,
+    // e.g. a mailto: handler). Called from Rust via JNI (see
+    // src/android_web_view.rs) when the emulated app opens a URL link
+    // (UIApplication openURL: / OpenAL-style URL launching).
+    public static int openExternalUrl(final String url) {
+        android.app.Activity act = mSingleton;
+        if (act == null || url == null || url.isEmpty()) {
+            return -1;
+        }
+        try {
+            android.content.Intent i = new android.content.Intent(
+                    android.content.Intent.ACTION_VIEW);
+            i.setData(android.net.Uri.parse(url));
+            i.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+            act.startActivity(i);
+        } catch (Throwable t) {
+            Log.e(TAG, "openExternalUrl failed for " + url, t);
+            return -1;
+        }
+        return 0;
+    }
 
     // Create a new overlay WebView loading `url` (may be empty to create it
     // blank). x/y/w/h are in window pixels; w or h <= 0 means "match the
@@ -78,7 +113,24 @@ public class MainActivity extends SDLActivity {
             ws.setSupportZoom(true);
             ws.setMediaPlaybackRequiresUserGesture(false);
             wv.setWebChromeClient(new android.webkit.WebChromeClient());
-            wv.setWebViewClient(new android.webkit.WebViewClient());
+            wv.setWebViewClient(new android.webkit.WebViewClient() {
+                @Override
+                public void onPageFinished(android.webkit.WebView view, String u) {
+                    // Find this overlay's id and notify Rust (via SDL
+                    // onUnhandledMessage) that the page finished loading so
+                    // webViewDidFinishLoad: fires in the emulated app.
+                    for (java.util.Map.Entry<Integer, android.webkit.WebView> e
+                            : webOverlays.entrySet()) {
+                        if (e.getValue() == view) {
+                            long payload = ((long) e.getKey().intValue() << 32)
+                                    | (long) WEB_OVERLAY_ACTION_LOAD_FINISHED;
+                            SDLActivity.onNativeSendMessage(
+                                    "web_overlay_notify", payload);
+                            break;
+                        }
+                    }
+                }
+            });
             // Transparent background so the emulated app shows through before
             // the page paints.
             wv.setBackgroundColor(android.graphics.Color.TRANSPARENT);
@@ -300,6 +352,21 @@ public class MainActivity extends SDLActivity {
             runOnUiThread(new Runnable() {
                 public void run() {
                     openIpaPicker();
+                }
+            });
+            return true;
+        }
+        if (message == MSG_WEB_OVERLAY) {
+            // data is a long: high 32 bits = overlay id, low 32 = action
+            // (1 = page load finished).
+            final long payload = ((Long) data).longValue();
+            final int id = (int) (payload >> 32);
+            final int action = (int) (payload & 0xFFFFFFFFL);
+            runOnUiThread(new Runnable() {
+                public void run() {
+                    if (action == WEB_OVERLAY_ACTION_LOAD_FINISHED) {
+                        notifyWebOverlayLoadFinished(id);
+                    }
                 }
             });
             return true;
