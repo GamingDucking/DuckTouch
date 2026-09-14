@@ -20,6 +20,7 @@
 //! See [crate::mach_o] for resources.
 
 mod dylib_list;
+mod swift_runtime;
 
 use crate::abi::{CallFromGuest, GuestFunction};
 use crate::bundle;
@@ -401,6 +402,12 @@ pub struct Dyld {
     thread_exit_routine: Option<GuestFunction>,
     constants_to_link_later: Vec<(MutPtr<ConstVoidPtr>, &'static HostConstant)>,
     non_lazy_host_functions: HashMap<&'static str, GuestFunction>,
+    /// Cache of Swift runtime function trampolines (see `swift_runtime`).
+    swift_fn_cache: HashMap<String, GuestFunction>,
+    /// Interned `&'static str` copies of Swift symbol names.
+    swift_fn_names: HashMap<String, &'static str>,
+    /// Stable data slots for Swift metadata symbols.
+    swift_data_slots: HashMap<String, u32>,
 }
 
 impl Dyld {
@@ -431,6 +438,9 @@ impl Dyld {
             thread_exit_routine: None,
             constants_to_link_later: Vec::new(),
             non_lazy_host_functions: HashMap::new(),
+            swift_fn_cache: HashMap::new(),
+            swift_fn_names: HashMap::new(),
+            swift_data_slots: HashMap::new(),
         }
     }
 
@@ -1061,6 +1071,13 @@ impl Dyld {
                 p.cast().cast_const()
             } else if let Some(stub) = self.cxxabi_intercept(mem, name) {
                 Ptr::<std::ffi::c_void, false>::from_bits(stub.to_ptr().to_bits())
+            } else if let Some(link) = self.swift_intercept(mem, name) {
+                match link {
+                    swift_runtime::SwiftLink::Function(f) => {
+                        Ptr::<std::ffi::c_void, false>::from_bits(f.to_ptr().to_bits())
+                    }
+                    swift_runtime::SwiftLink::Data(slot) => slot,
+                }
             } else if let Some(&external_addr) = bins
                 .iter()
                 .flat_map(|other_bin| other_bin.exported_symbols.get(name))
@@ -1377,6 +1394,22 @@ impl Dyld {
             // C++ RTTI type_info objects for fundamental types (double,
             // float, int, long, unsigned int, short, char, void, bool,
             // const char*, char*, void*, const void*). Without these the
+            // Swift runtime symbols (`__swift_retain`, `__T0SSN` type
+            // metadata, `__T0*Ma` accessors, …). Swift binaries (e.g. Alto's
+            // Adventure) reference these from `__nl_symbol_ptr`; leaving them
+            // NULL kills the app during Swift initialization.
+            if let Some(link) = self.swift_intercept(mem, symbol) {
+                let target = match link {
+                    swift_runtime::SwiftLink::Function(f) => f.to_ptr(),
+                    swift_runtime::SwiftLink::Data(slot) => {
+                        crate::mem::Ptr::from_bits(slot.to_bits())
+                    }
+                };
+                mem.write(ptr_ptr, target.cast());
+                log_dbg!("Linked Swift runtime symbol {} at {:#x}", symbol, target.to_bits());
+                continue;
+            }
+
             // referenced type_info object has a NULL vptr; the first call
             // through it (dynamic_cast / exception type matching / the
             // `typeid(...)` comparison libstdc++ does for `const char*`)

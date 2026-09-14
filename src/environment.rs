@@ -575,6 +575,11 @@ impl Environment {
             } else if !crate::dyld::DYLIB_LIST
                 .iter()
                 .any(|d| d.path == dylib || d.aliases.contains(&dylib.as_str()))
+                // The Swift runtime dylibs are provided host-side by
+                // `dyld::swift_runtime` (all `__swift_*` entry points, type
+                // metadata slots and `__swift_FORCE_LOAD_$_*` autolink
+                // shims), so listing them here would be pure noise.
+                && !dylib.rsplit('/').next().unwrap_or(&dylib).starts_with("libswift")
             {
                 log!(
                     "Warning: app binary depends on unimplemented or missing dylib \"{}\"",
