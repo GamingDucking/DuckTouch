@@ -12,9 +12,9 @@
 //! `MainActivity` — see `android/app/src/main/java/org/touchhle/android/`.
 //!
 //! The MainActivity class reference and the method IDs of every bridge method
-//! are resolved once at startup by [`populate_jni_cache`], which must run on
-//! the real SDLThread stack: guest code later calls this bridge from a
-//! coroutine stack, where `FindClass` cannot reach the app class loader.
+//! are resolved once at startup by `populate_jni_cache`, on the real
+//! SDLThread stack (guest code later calls this bridge from a coroutine
+//! stack, where JNI lookups are not reliable).
 //!
 //! On other platforms every function here is a harmless no-op; the desktop
 //! build renders webviews with the headless-Chromium snapshot bridge in
@@ -35,6 +35,11 @@ mod imp {
         // Exported by libSDL2.so on Android (SDL_system.h). Returns the
         // JNIEnv* for the calling thread, attaching it to the JVM if needed.
         fn SDL_AndroidGetJNIEnv() -> *mut c_void;
+        // Exported by libSDL2.so on Android (SDL_system.h). Returns the
+        // current Activity instance as a jobject (a local reference). SDL
+        // resolves it through a class reference cached at startup, so this
+        // needs no FindClass/class-loader lookup on our side.
+        fn SDL_AndroidGetActivity() -> *mut c_void;
     }
 
     /// JNI function-table slot indices: the position of each function
@@ -50,6 +55,7 @@ mod imp {
         pub const EXCEPTION_CLEAR: usize = 17;
         pub const NEW_GLOBAL_REF: usize = 21;
         pub const DELETE_LOCAL_REF: usize = 23;
+        pub const GET_OBJECT_CLASS: usize = 31;
         pub const GET_STATIC_METHOD_ID: usize = 113;
         pub const CALL_STATIC_OBJECT_METHOD_A: usize = 116;
         pub const CALL_STATIC_BOOLEAN_METHOD_A: usize = 119;
@@ -151,6 +157,41 @@ mod imp {
             let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
                 self.slot(slots::NEW_GLOBAL_REF);
             unsafe { f(self.env, obj) }
+        }
+
+        fn get_object_class(&self, obj: *mut c_void) -> *mut c_void {
+            if obj.is_null() {
+                return std::ptr::null_mut();
+            }
+            let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+                self.slot(slots::GET_OBJECT_CLASS);
+            unsafe { f(self.env, obj) }
+        }
+
+        /// Get the MainActivity class as a global reference. The preferred
+        /// route takes the runtime class of the live Activity instance
+        /// (SDL_AndroidGetActivity + GetObjectClass), which involves no
+        /// FindClass and therefore no class-loader resolution. FindClass is
+        /// only a fallback: it resolves the class against the calling Java
+        /// frame's class loader, which is not reliable from the native
+        /// frames touchHLE runs in.
+        fn main_activity_global_class(&self) -> Option<*mut c_void> {
+            let mut local = std::ptr::null_mut();
+            let activity = unsafe { SDL_AndroidGetActivity() };
+            if !activity.is_null() {
+                local = self.get_object_class(activity);
+                self.delete_local_ref(activity);
+            }
+            if local.is_null() {
+                local = self.find_main_activity_class()?;
+            }
+            let global = self.new_global_ref(local);
+            self.delete_local_ref(local);
+            if global.is_null() {
+                None
+            } else {
+                Some(global)
+            }
         }
 
         fn new_jstring(&self, s: &str) -> *mut c_void {
@@ -333,60 +374,58 @@ mod imp {
 
     /// Resolve the MainActivity class and all bridge method IDs once, on
     /// the real SDLThread stack, before guest emulation begins. This must
-    /// not be called from guest code: guest code runs on a coroutine stack,
-    /// where ART's `FindClass` cannot see the app class loader (it resolves
-    /// classes against the class loader of the calling Java frame, which is
-    /// only correct on the real stack below `nativeRunMain`). If any lookup
-    /// fails, the cache stays empty and the bridge stays disabled, and the
-    /// WebView falls back to the desktop Chromium snapshot path.
+    /// not be called from guest code, which runs on a coroutine stack where
+    /// JNI is unreliable. If any step fails, the failure is logged, the
+    /// cache stays empty and the WebView falls back to the desktop
+    /// Chromium snapshot path.
     pub fn populate_jni_cache() {
-        fn resolve(jni: &Jni) -> Option<JniCache> {
-            let local = jni.find_main_activity_class()?;
-            let class = jni.new_global_ref(local);
-            jni.delete_local_ref(local);
-            if class.is_null() {
-                return None;
+        fn method(jni: &Jni, class: *mut c_void, name: &str, sig: &str) -> Option<*mut c_void> {
+            let mid = jni.get_static_method(class, name, sig);
+            if mid.is_none() {
+                log!("GetStaticMethodID({}) failed; native WebView disabled", name);
             }
+            mid
+        }
+        fn resolve(jni: &Jni) -> Option<JniCache> {
+            let class = match jni.main_activity_global_class() {
+                Some(class) => class,
+                None => {
+                    log!("MainActivity class not found; native WebView disabled");
+                    return None;
+                }
+            };
             Some(JniCache {
                 class,
-                show: jni.get_static_method(
-                    class,
-                    "showWebOverlay",
-                    "(Ljava/lang/String;IIII)I",
-                )?,
-                navigate: jni.get_static_method(
-                    class,
-                    "navigateWebOverlay",
-                    "(ILjava/lang/String;)V",
-                )?,
-                load_data: jni.get_static_method(
+                show: method(jni, class, "showWebOverlay", "(Ljava/lang/String;IIII)I")?,
+                navigate: method(jni, class, "navigateWebOverlay", "(ILjava/lang/String;)V")?,
+                load_data: method(
+                    jni,
                     class,
                     "loadDataWebOverlay",
                     "(ILjava/lang/String;Ljava/lang/String;)V",
                 )?,
-                set_bounds: jni.get_static_method(class, "setWebOverlayBounds", "(IIIII)V")?,
-                hide: jni.get_static_method(class, "hideWebOverlay", "(I)V")?,
-                go_back: jni.get_static_method(class, "goBackWebOverlay", "(I)V")?,
-                go_forward: jni.get_static_method(class, "goForwardWebOverlay", "(I)V")?,
-                can_go_back: jni.get_static_method(class, "canGoBackWebOverlay", "(I)Z")?,
-                can_go_forward: jni.get_static_method(class, "canGoForwardWebOverlay", "(I)Z")?,
-                eval_js: jni.get_static_method(
+                set_bounds: method(jni, class, "setWebOverlayBounds", "(IIIII)V")?,
+                hide: method(jni, class, "hideWebOverlay", "(I)V")?,
+                go_back: method(jni, class, "goBackWebOverlay", "(I)V")?,
+                go_forward: method(jni, class, "goForwardWebOverlay", "(I)V")?,
+                can_go_back: method(jni, class, "canGoBackWebOverlay", "(I)Z")?,
+                can_go_forward: method(jni, class, "canGoForwardWebOverlay", "(I)Z")?,
+                eval_js: method(
+                    jni,
                     class,
                     "evalJsWebOverlay",
                     "(ILjava/lang/String;)Ljava/lang/String;",
                 )?,
-                stop_loading: jni.get_static_method(class, "stopLoadingWebOverlay", "(I)V")?,
-                open_url: jni.get_static_method(
-                    class,
-                    "openExternalUrl",
-                    "(Ljava/lang/String;)I",
-                )?,
+                stop_loading: method(jni, class, "stopLoadingWebOverlay", "(I)V")?,
+                open_url: method(jni, class, "openExternalUrl", "(Ljava/lang/String;)I")?,
             })
         }
         let Some(jni) = Jni::attach() else {
+            log!("No JNIEnv from SDL; native WebView disabled");
             return;
         };
         if let Some(cache) = resolve(&jni) {
+            log!("Native WebView bridge ready");
             let _ = CACHE.set(cache);
         }
     }
