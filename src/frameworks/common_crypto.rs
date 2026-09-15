@@ -982,19 +982,169 @@ fn CCCrypt(
     kCCSuccess
 }
 
+// CCPBKDFAlgorithm
+const kCCPBKDF2: u32 = 2;
+
+// CCPseudoRandomAlgorithm
+const kCCPRFHmacAlgSHA1: u32 = 1;
+const kCCPRFHmacAlgSHA224: u32 = 2;
+const kCCPRFHmacAlgSHA256: u32 = 3;
+const kCCPRFHmacAlgSHA384: u32 = 4;
+const kCCPRFHmacAlgSHA512: u32 = 5;
+
+/// HMAC over the whole message, generic over the digest (RFC 2104).
+fn hmac_generic<D>(key: &[u8], message: &[u8]) -> Vec<u8>
+where
+    D: Sha2Digest + digest::core_api::BlockSizeUser,
+{
+    use digest::typenum::Unsigned;
+    let block_size = <<D as digest::core_api::BlockSizeUser>::BlockSize as Unsigned>::USIZE;
+    let mut key_block = vec![0u8; block_size];
+    if key.len() > block_size {
+        let hashed = D::digest(key);
+        key_block[..hashed.len()].copy_from_slice(&hashed);
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = D::new();
+    inner.update(key_block.iter().map(|b| b ^ 0x36).collect::<Vec<u8>>());
+    inner.update(message);
+    let inner_hash = inner.finalize();
+    let mut outer = D::new();
+    outer.update(key_block.iter().map(|b| b ^ 0x5c).collect::<Vec<u8>>());
+    outer.update(inner_hash);
+    outer.finalize().to_vec()
+}
+
+/// PBKDF2 (RFC 8018 §5.2) with an arbitrary HMAC pseudo-random function.
+fn pbkdf2(
+    prf: fn(&[u8], &[u8]) -> Vec<u8>,
+    password: &[u8],
+    salt: &[u8],
+    rounds: u32,
+    derived_len: usize,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(derived_len);
+    let mut block_index: u32 = 1;
+    while out.len() < derived_len {
+        let mut salt_block = salt.to_vec();
+        salt_block.extend_from_slice(&block_index.to_be_bytes());
+        let mut u = prf(password, &salt_block);
+        let mut t = u.clone();
+        for _ in 1..rounds {
+            u = prf(password, &u);
+            for (t_byte, u_byte) in t.iter_mut().zip(u.iter()) {
+                *t_byte ^= u_byte;
+            }
+        }
+        let remaining = derived_len - out.len();
+        out.extend_from_slice(&t[..remaining.min(t.len())]);
+        block_index = block_index.wrapping_add(1);
+    }
+    out
+}
+
+/// `int CCKeyDerivationPBKDF(CCPBKDFAlgorithm algorithm, const char *password,
+/// size_t passwordLen, const uint8_t *salt, size_t saltLen,
+/// CCPseudoRandomAlgorithm prf, uint rounds, uint8_t *derivedKey,
+/// size_t derivedKeyLen)`
 #[allow(non_snake_case)]
 fn CCKeyDerivationPBKDF(
-    _env: &mut Environment,
-    _algorithm: u32,
-    _password: ConstVoidPtr,
-    _password_len: GuestUSize,
-    _salt: ConstVoidPtr,
-    _salt_len: GuestUSize,
-    _prf: u32,
-    _rounds: u32,
+    env: &mut Environment,
+    algorithm: u32,
+    password: ConstVoidPtr,
+    password_len: GuestUSize,
+    salt: ConstVoidPtr,
+    salt_len: GuestUSize,
+    prf: u32,
+    rounds: u32,
+    derived_key: MutVoidPtr,
+    derived_key_len: GuestUSize,
 ) -> i32 {
-    log!("TODO: CCKeyDerivationPBKDF");
+    if algorithm != kCCPBKDF2 {
+        log!("CCKeyDerivationPBKDF: unsupported algorithm {}", algorithm);
+        return kCCParamError;
+    }
+    if derived_key.is_null() || derived_key_len == 0 || rounds == 0 {
+        return kCCParamError;
+    }
+    let prf_fn: fn(&[u8], &[u8]) -> Vec<u8> = match prf {
+        kCCPRFHmacAlgSHA1 => hmac_generic::<Sha1>,
+        kCCPRFHmacAlgSHA224 => hmac_generic::<Sha224>,
+        kCCPRFHmacAlgSHA256 => hmac_generic::<Sha256>,
+        kCCPRFHmacAlgSHA384 => hmac_generic::<Sha384>,
+        kCCPRFHmacAlgSHA512 => hmac_generic::<Sha512>,
+        _ => {
+            log!("CCKeyDerivationPBKDF: unsupported PRF {}", prf);
+            return kCCParamError;
+        }
+    };
+
+    let password_bytes = read_guest_bytes(env, password, password_len);
+    let salt_bytes = read_guest_bytes(env, salt, salt_len);
+
+    log_dbg!(
+        "CCKeyDerivationPBKDF(prf={}, passwordLen={}, saltLen={}, rounds={}, derivedKeyLen={})",
+        prf,
+        password_len,
+        salt_len,
+        rounds,
+        derived_key_len
+    );
+
+    let derived = pbkdf2(
+        prf_fn,
+        &password_bytes,
+        &salt_bytes,
+        rounds,
+        derived_key_len as usize,
+    );
+    write_digest(env, derived_key, &derived);
     kCCSuccess
+}
+
+#[cfg(test)]
+mod pbkdf2_tests {
+    use super::*;
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    // Test vectors from RFC 6070 (PBKDF2-HMAC-SHA1).
+    #[test]
+    fn rfc6070_sha1() {
+        let prf: fn(&[u8], &[u8]) -> Vec<u8> = hmac_generic::<Sha1>;
+        assert_eq!(
+            hex(&pbkdf2(prf, b"password", b"salt", 1, 20)),
+            "0c60c80f961f0e71f3a9b524af6012062fe037a6"
+        );
+        assert_eq!(
+            hex(&pbkdf2(prf, b"password", b"salt", 4096, 20)),
+            "4b007901b765489abead49d926f721d065a429c1"
+        );
+        assert_eq!(
+            hex(&pbkdf2(
+                prf,
+                b"passwordPASSWORDpassword",
+                b"saltSALTsaltSALTsaltSALTsaltSALTsalt",
+                4096,
+                25
+            )),
+            "3d2eec4fe41c849b80c8d83662c0e44a8b291a964cf2f07038"
+        );
+    }
+
+    // Test vector from RFC 7914 §11 (PBKDF2-HMAC-SHA256).
+    #[test]
+    fn rfc7914_sha256() {
+        let prf: fn(&[u8], &[u8]) -> Vec<u8> = hmac_generic::<Sha256>;
+        assert_eq!(
+            hex(&pbkdf2(prf, b"passwd", b"salt", 1, 64)),
+            "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc\
+             49ca9cccf179b645991664b39d77ef317c71b845b1e30bd509112041d3a19783"
+        );
+    }
 }
 
 // One-shot MD5 hash (host-side, no guest memory)
@@ -2127,7 +2277,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CCCryptorGetOutputLength(_, _, _)),
     export_c_func!(CCCryptorReset(_, _)),
     export_c_func!(CCCryptorRelease(_)),
-    export_c_func!(CCKeyDerivationPBKDF(_, _, _, _, _, _, _)),
+    export_c_func!(CCKeyDerivationPBKDF(_, _, _, _, _, _, _, _, _)),
     export_c_func!(CCHmac(_, _, _, _, _, _)),
     export_c_func!(CC_MD5_Init(_)),         // Было (_, _), нужно (_)
     export_c_func!(CC_MD5_Update(_, _, _)), // Было (_, _, _, _), нужно (_, _, _)
