@@ -12,11 +12,12 @@
 //! accessors round-trip instead of warning "class is unimplemented".
 
 use super::ca_layer::CALayerHostObject;
-use crate::frameworks::core_graphics::CGFloat;
+use crate::frameworks::core_graphics::{cg_affine_transform::CGAffineTransformIdentity, CGFloat, CGPoint, CGRect, CGSize};
+use crate::frameworks::core_animation::{ca_layer::kCAGravityResize, ca_transform3d::CATransform3DIdentity};
 use crate::frameworks::foundation::ns_string::get_static_str;
-use crate::objc::{id, msg, msg_class, objc_classes, release, retain, ClassExports};
+use crate::objc::{id, msg, msg_class, msg_super, nil, objc_classes, release, retain, ClassExports, NSZonePtr};
 use crate::Environment;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Gradient properties stored outside `CALayerHostObject` so we don't have
 /// to touch CALayer's allocator. Retained ids are released on drop.
@@ -27,11 +28,25 @@ pub struct State {
     gradients: HashMap<id, GradientProps>,
 }
 
+impl State {
+    pub fn get(&self, k: &id) -> Option<&GradientProps> {
+        self.gradients.get(k)
+    }
+    pub fn entry(&mut self, k: id) -> std::collections::hash_map::Entry<'_, id, GradientProps> {
+        self.gradients.entry(k)
+    }
+    pub fn remove(&mut self, k: &id) -> Option<GradientProps> {
+        self.gradients.remove(k)
+    }
+}
+
 #[derive(Clone, Copy)]
-struct GradientProps {
+pub struct GradientProps {
+    /// Colors of the gradient (`NSArray*` or nil).
+    pub colors: id,
     /// Normalized start/end points of the gradient axis.
-    start: (CGFloat, CGFloat),
-    end: (CGFloat, CGFloat),
+    pub start: (CGFloat, CGFloat),
+    pub end: (CGFloat, CGFloat),
 }
 
 impl Default for GradientProps {
@@ -39,6 +54,7 @@ impl Default for GradientProps {
         // Apple's defaults: vertical gradient from top (0.5, 0.0) to
         // bottom (0.5, 1.0).
         GradientProps {
+            colors: crate::objc::nil,
             start: (0.5, 0.0),
             end: (0.5, 1.0),
         }
@@ -52,8 +68,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 @implementation CAGradientLayer: CALayer
 
 + (id)allocWithZone:(NSZonePtr)_zone {
-    let host_object = Box::new(CALayerHostObject::new());
-    env.objc.alloc_object(this, host_object, &mut env.mem)
+    let _: crate::objc::NSZonePtr = _zone;
+    msg![env; this alloc]
 }
 
 // CAGradientLayer's designated creation path (also used by the older
@@ -86,8 +102,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         .core_animation
         .gradients
         .get(&this)
-        .map(|p| p.start)
-        .unwrap_or(GradientProps::default().start)
+        .map(|p| CGPoint { x: p.start.0, y: p.start.1 })
+        .unwrap_or(CGPoint { x: 0.5, y: 0.0 })
 }
 
 - (())setStartPoint:(CGPoint)point {
@@ -101,8 +117,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         .core_animation
         .gradients
         .get(&this)
-        .map(|p| p.end)
-        .unwrap_or(GradientProps::default().end)
+        .map(|p| CGPoint { x: p.end.0, y: p.end.1 })
+        .unwrap_or(CGPoint { x: 0.5, y: 1.0 })
 }
 
 - (())setEndPoint:(CGPoint)point {

@@ -13,6 +13,7 @@
 pub mod ca_animation;
 pub mod ca_display_link;
 pub mod ca_eagl_layer;
+pub mod ca_gradient_layer;
 pub mod ca_keyframe_animation; // <-- ДОБАВЛЕН НОВЫЙ МОДУЛЬ
 pub mod ca_layer;
 pub mod ca_media_timing_function;
@@ -42,6 +43,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ca_animation::CLASSES,
         ca_display_link::CLASSES,
         ca_eagl_layer::CLASSES,
+        ca_gradient_layer::CLASSES,
         ca_keyframe_animation::CLASSES, // <-- КЛАСС ЭКСПОРТИРОВАН
         ca_layer::CLASSES,
         ca_media_timing_function::CLASSES,
@@ -65,6 +67,7 @@ pub struct State {
     ca_media_timing_function: ca_media_timing_function::State,
     ca_transaction: ca_transaction::State,
     composition: composition::State,
+    gradients: ca_gradient_layer::State,
 }
 
 // This function should call mach_absolute_time() and convert the result into
