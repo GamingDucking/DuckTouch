@@ -7,7 +7,7 @@
 use crate::dyld::FunctionExports;
 use crate::environment::Environment;
 use crate::export_c_func;
-use crate::libc::errno::{set_errno, EINVAL, EIO, ENOTSUP};
+use crate::libc::errno::{set_errno, EINVAL, EIO};
 use crate::libc::posix_io;
 use crate::libc::posix_io::{off_t, open_direct, FileDescriptor, SEEK_SET};
 use crate::mem::{ConstPtr, GuestUSize, MutVoidPtr, PAGE_SIZE_ALIGN_MASK};
@@ -150,10 +150,46 @@ fn munmap(env: &mut Environment, addr: MutVoidPtr, len: GuestUSize) -> i32 {
     }
 }
 
+// Darwin `madvise` advice values (sys/mman.h).
+const MADV_NORMAL: i32 = 0;
+const MADV_RANDOM: i32 = 1;
+const MADV_SEQUENTIAL: i32 = 2;
+const MADV_WILLNEED: i32 = 3;
+const MADV_DONTNEED: i32 = 4;
+const MADV_FREE: i32 = 5;
+const MADV_ZERO_WIRED_PAGES: i32 = 6;
+const MADV_FREE_REUSABLE: i32 = 7;
+const MADV_FREE_REUSE: i32 = 8;
+const MADV_CAN_REUSE: i32 = 9;
+
+/// Guest memory is a plain host allocation with no paging, so every advice
+/// is a hint we can safely ignore. Only the argument validation that a real
+/// kernel performs is emulated: unknown advice values and unaligned
+/// addresses fail with `EINVAL`.
 fn madvise(env: &mut Environment, addr: MutVoidPtr, len: GuestUSize, advice: i32) -> i32 {
-    log!("TODO: madvise({:?}, {}, {}) -> -1", addr, len, advice);
-    set_errno(env, ENOTSUP);
-    -1
+    log_dbg!("madvise({:?}, {}, {})", addr, len, advice);
+    match advice {
+        MADV_NORMAL
+        | MADV_RANDOM
+        | MADV_SEQUENTIAL
+        | MADV_WILLNEED
+        | MADV_DONTNEED
+        | MADV_FREE
+        | MADV_ZERO_WIRED_PAGES
+        | MADV_FREE_REUSABLE
+        | MADV_FREE_REUSE
+        | MADV_CAN_REUSE => {}
+        _ => {
+            set_errno(env, EINVAL);
+            return -1;
+        }
+    }
+    if addr.to_bits() & PAGE_SIZE_ALIGN_MASK != 0 {
+        set_errno(env, EINVAL);
+        return -1;
+    }
+    set_errno(env, 0);
+    0
 }
 
 fn shm_open(env: &mut Environment, name: ConstPtr<u8>, oflag: i32, mode: u32) -> i32 {

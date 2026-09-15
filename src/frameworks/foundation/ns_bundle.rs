@@ -11,7 +11,9 @@ use crate::bundle::Bundle;
 use crate::frameworks::core_foundation::cf_bundle::{
     CFBundleCopyBundleLocalizations, CFBundleCopyPreferredLocalizationsFromArray,
 };
-use crate::frameworks::foundation::ns_string::{from_rust_string, NSUTF8StringEncoding};
+use crate::frameworks::foundation::ns_string::{
+    from_rust_string, NSUTF16StringEncoding, NSUTF8StringEncoding,
+};
 use crate::mem::{ConstVoidPtr, MutPtr, Ptr};
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
@@ -1105,17 +1107,22 @@ fn load_strings_as_standard_format(env: &mut Environment, dict_url: id) -> id {
     }
     let bytes: ConstVoidPtr = msg![env; data bytes];
     let maybe_bom = env.mem.bytes_at(bytes.cast(), 2);
-    if maybe_bom == [0xFE, 0xFF] || maybe_bom == [0xFF, 0xFE] {
-        // TODO: UTF-16 .strings files are not supported yet. Return an empty
-        // table instead of asserting (and crashing) on guest data.
-        log!("load_strings_as_standard_format: UTF-16 .strings not supported");
-        return res;
-    }
+    // Xcode writes .strings files as UTF-16 with a BOM by default, so pick
+    // the encoding from the BOM. NSString's UTF-16 decoder honours the BOM
+    // (and strips it), so the BOM-bearing encoding is used for both orders.
+    let encoding = if maybe_bom == [0xFE, 0xFF] || maybe_bom == [0xFF, 0xFE] {
+        NSUTF16StringEncoding
+    } else {
+        NSUTF8StringEncoding
+    };
     let strings_str = msg_class![env; NSString alloc];
-    let strings_str: id = msg![env; strings_str initWithData:data encoding:NSUTF8StringEncoding];
+    let strings_str: id = msg![env; strings_str initWithData:data encoding:encoding];
     if strings_str == nil {
-        // Guest-reachable: the file is not valid UTF-8.
-        log_dbg!("load_strings_as_standard_format: file is not valid UTF-8");
+        // Guest-reachable: the file is not valid in the detected encoding.
+        log_dbg!(
+            "load_strings_as_standard_format: file is not valid (encoding {})",
+            encoding
+        );
         return res;
     }
 
