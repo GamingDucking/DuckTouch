@@ -2684,6 +2684,14 @@ pub const CONSTANTS: ConstantExports = &[
             p.cast_const()
         }),
     ),
+    // `xmlGenericErrorFunc xmlGenericError` and `void *xmlGenericErrorContext`
+    // — global error handler slots in libxml2 (libxml/xmlerror.h). Apps like
+    // Chrome read/replace them directly to install their own logging. Our
+    // guest-side storage starts NULL; libxml2 inside the wrapper already
+    // routes its diagnostics through the quiet handler, so an app that
+    // installs its own handler simply sees no generic errors reported.
+    ("_xmlGenericError", HostConstant::NullPtr),
+    ("_xmlGenericErrorContext", HostConstant::NullPtr),
 ];
 
 const FUNCTIONS: FunctionExports = &[
