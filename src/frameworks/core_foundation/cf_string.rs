@@ -668,6 +668,32 @@ fn CFStringGetLength(env: &mut Environment, the_string: CFStringRef) -> CFIndex 
     length.try_into().unwrap_or(0)
 }
 
+/// `CFIndex CFStringGetMaximumSizeForEncoding(CFIndex length,
+///                                            CFStringEncoding encoding)`
+///
+/// Per Apple's Core Foundation reference, returns "the maximum number of
+/// bytes a string of a specified length (in UTF-16 code units) could occupy
+/// after conversion to the specified encoding". This is an upper bound used
+/// by callers to size buffers; it never inspects the actual string.
+///
+/// Worst-case bytes per UTF-16 code unit: 3 for UTF-8 (a code unit maps to
+/// at most 3 bytes on its own; surrogate pairs map to 4 bytes but consume
+/// two code units), 4 for UTF-32, 2 for UTF-16, 1 for 8-bit encodings that
+/// cannot represent everything (the caller must handle truncation).
+/// Chrome calls this before converting URLs and header strings to UTF-8.
+fn CFStringGetMaximumSizeForEncoding(_env: &mut Environment, length: CFIndex, encoding: CFStringEncoding) -> CFIndex {
+    if length < 0 {
+        return 0;
+    }
+    // Mirror CoreFoundation's own constants for the encodings that matter;
+    // anything else gets a conservative 4-bytes-per-unit bound.
+    match encoding {
+        kCFStringEncodingUTF8 => length * 3,
+        kCFStringEncodingUTF16 | kCFStringEncodingUTF16BE | kCFStringEncodingUTF16LE => length * 2,
+        _ => length * 4,
+    }
+}
+
 fn CFStringGetCharacterAtIndex(
     env: &mut Environment,
     the_string: CFStringRef,
@@ -2371,6 +2397,7 @@ pub const FUNCTIONS: FunctionExports = &[
     )),
     // Queries
     export_c_func!(CFStringGetLength(_)),
+    export_c_func!(CFStringGetMaximumSizeForEncoding(_, _)),
     export_c_func!(CFStringGetCharacterAtIndex(_, _)),
     export_c_func!(CFStringGetCharacters(_, _, _)),
     export_c_func!(CFStringGetCharacterFromInlineBuffer(_, _)),

@@ -1701,6 +1701,56 @@ pub fn method_getName(env: &mut crate::Environment, m: ConstVoidPtr) -> SEL {
     }
 }
 
+/// `BOOL class_isMetaClass(Class cls)`
+///
+/// Per Apple's [Objective-C Runtime Reference](https://developer.apple.com/documentation/objectivec/1418629-class_ismetaclass):
+/// returns `YES` if `cls` is a metaclass, `NO` otherwise (including when
+/// `cls` is `Nil` or not a class at all).
+///
+/// Chrome's networking layer calls this during Objective-C runtime
+/// introspection.
+pub fn class_isMetaClass(env: &mut crate::Environment, cls: Class) -> bool {
+    if cls.is_null() {
+        return false;
+    }
+    if let Some(host_obj) = env.objc.get_host_object(cls) {
+        if let Some(class_obj) = host_obj.as_any().downcast_ref::<ClassHostObject>() {
+            return class_obj.is_metaclass;
+        }
+        if let Some(unimpl) = host_obj.as_any().downcast_ref::<UnimplementedClass>() {
+            return unimpl.is_metaclass;
+        }
+        if let Some(fake) = host_obj.as_any().downcast_ref::<FakeClass>() {
+            return fake.is_metaclass;
+        }
+    }
+    // Guest-defined class: read the class struct from guest memory and check
+    // the CLS_META flag in its class_rw_t data (flags bit 0x2, matching the
+    // legacy Objective-C runtime this project targets).
+    let class_t_size = std::mem::size_of::<class_t>() as GuestUSize;
+    if env
+        .mem
+        .get_bytes_fallible(cls.cast_const().cast(), class_t_size)
+        .is_none()
+    {
+        return false;
+    }
+    let class_struct: class_t = env.mem.read(cls.cast());
+    if class_struct.data.is_null() {
+        return false;
+    }
+    let rw_size = std::mem::size_of::<class_rw_t>() as GuestUSize;
+    if env
+        .mem
+        .get_bytes_fallible(class_struct.data.cast(), rw_size)
+        .is_none()
+    {
+        return false;
+    }
+    let rw: class_rw_t = env.mem.read(class_struct.data.cast());
+    (rw._flags & 0x2) != 0
+}
+
 pub fn objc_getMetaClass(env: &mut crate::Environment, cls: Class, name: SEL) -> ConstVoidPtr {
     if cls.is_null() {
         return ConstVoidPtr::null();
