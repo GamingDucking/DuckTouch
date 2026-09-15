@@ -180,6 +180,17 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 @end
 
+@implementation UIPanGestureRecognizer: UIGestureRecognizer
+
++ (id)allocWithZone:(NSZonePtr)_zone {
+    let host_object = Box::new(UIGestureRecognizerHostObject::new(GestureKind::Generic));
+    env.objc.alloc_object(this, host_object, &mut env.mem)
+}
+// Chrome's gesture-driven UI creates pan recognizers from code; the base
+// class already covers target/action, state and touch plumbing.
+
+@end
+
 @implementation UITapGestureRecognizer: UIGestureRecognizer
 
 + (id)allocWithZone:(NSZonePtr)_zone {

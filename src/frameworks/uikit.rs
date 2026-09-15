@@ -27,6 +27,7 @@ pub mod ui_custom_object;
 pub mod ui_device;
 pub mod ui_document;
 pub mod ui_event;
+pub mod ui_bezier_path;
 pub mod ui_font;
 pub mod ui_geometry;
 pub mod ui_gesture_recognizer;
@@ -917,6 +918,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ui_alert_controller::CLASSES,
         ui_application::CLASSES,
         ui_color::CLASSES,
+        ui_bezier_path::CLASSES,
         ui_custom_object::CLASSES,
         ui_device::CLASSES,
         ui_document::CLASSES,

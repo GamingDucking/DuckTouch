@@ -68,6 +68,18 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.alloc_object(this, unarchiver, &mut env.mem)
 }
 
+// Chrome (and other apps) re-map classes when unarchiving nibs:
+// [NSKeyedUnarchiver setClass:ActualClass forClassName:@"NibName"].
+// The nib decoder already resolves swapped classes via UIClassSwapper,
+// so acknowledging the mapping without storing it is enough.
++ (())setClass:(id)_class forClassName:(id)_codename {
+    log_dbg!(
+        "NSKeyedUnarchiver setClass:{:?} forClassName:{:?} (mapping is a no-op)",
+        _class,
+        _codename
+    );
+}
+
 + (id)unarchiveObjectWithFile:(id)path { // NSString *
     let data: id = msg_class![env; NSData dataWithContentsOfFile:path];
     if data == nil {
@@ -122,7 +134,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     unarchiver
 }
-
 - (id)initForReadingWithData:(id)data { // NSData *
     if data == nil {
         release(env, this);

@@ -9,7 +9,9 @@ use crate::dyld::{export_c_func, FunctionExports};
 use crate::libc::mach::init::MACH_TASK_SELF;
 use crate::libc::mach::port::mach_port_t;
 use crate::libc::mach::thread_info::{kern_return_t, KERN_INVALID_ADDRESS, KERN_SUCCESS};
-use crate::mem::{ConstPtr, MutPtr, Ptr, PAGE_SIZE, PAGE_SIZE_ALIGN_MASK};
+use crate::mem::{
+    ConstPtr, MutPtr, Ptr, SafeRead, SafeWrite, PAGE_SIZE, PAGE_SIZE_ALIGN_MASK,
+};
 use crate::Environment;
 use std::collections::HashMap;
 
@@ -210,9 +212,101 @@ fn vm_purgable_control(
     KERN_SUCCESS
 }
 
+/// `kern_return_t vm_protect(vm_map_t target_task, vm_address_t address,
+/// vm_size_t size, boolean_t set_maximum, vm_prot_t new_protection)`
+///
+/// Guest memory has no per-page protection enforcement, so this is a no-op
+/// that reports success (a real kernel would return KERN_INVALID_ADDRESS for
+/// unmapped ranges; callers like Chrome's sandbox setup ignore the result).
+fn vm_protect(
+    _env: &mut Environment,
+    target_task: vm_map_t,
+    address: mach_vm_address_t,
+    size: mach_vm_size_t,
+    set_maximum: i32,
+    new_protection: vm_prot_t,
+) -> kern_return_t {
+    if target_task != MACH_TASK_SELF {
+        return KERN_INVALID_ADDRESS;
+    }
+    log_dbg!(
+        "vm_protect({:#x}, {:#x}, set_max={}, prot={:#x}) accepted (no-op)",
+        address,
+        size,
+        set_maximum != 0,
+        new_protection
+    );
+    KERN_SUCCESS
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct vm_region_basic_info_data_t {
+    protection: vm_prot_t,
+    max_protection: vm_prot_t,
+    inheritance: vm_inherit_t,
+    reserved: u32,
+    offset: u32,
+}
+unsafe impl SafeRead for vm_region_basic_info_data_t {}
+
+
+/// `kern_return_t vm_region_recurse(vm_map_t target_task,
+/// vm_address_t *address, vm_size_t *size, uint32_t *nesting_depth,
+/// vm_region_recurse_info_t info, mach_msg_type_number_t *info_count)`
+///
+/// Reports tracked heap regions. Apps like Chrome use this to probe mappings
+/// and tolerate failure, but returning success for tracked regions is closer
+/// to a real kernel.
+fn vm_region_recurse(
+    env: &mut Environment,
+    target_task: vm_map_t,
+    address_ptr: MutPtr<mach_vm_address_t>,
+    size_ptr: MutPtr<mach_vm_size_t>,
+    nesting_depth_ptr: MutPtr<u32>,
+    info_ptr: MutPtr<u8>,
+    info_count_ptr: MutPtr<u32>,
+) -> kern_return_t {
+    if target_task != MACH_TASK_SELF || address_ptr.is_null() || size_ptr.is_null() {
+        return KERN_INVALID_ADDRESS;
+    }
+    let address = env.mem.read(address_ptr);
+    let Some(&tracked_size) = env.libc_state.mach_vm.allocations.get(&address) else {
+        log_dbg!(
+            "vm_region_recurse({:#x}): untracked region; returning KERN_INVALID_ADDRESS",
+            address
+        );
+        return KERN_INVALID_ADDRESS;
+    };
+    env.mem.write(size_ptr, tracked_size);
+    if !nesting_depth_ptr.is_null() {
+        env.mem.write(nesting_depth_ptr, 0);
+    }
+    if !info_ptr.is_null() && !info_count_ptr.is_null() {
+        let info_count = env.mem.read(info_count_ptr);
+        if info_count >= 9 {
+            // vm_region_basic_info_data_t: five u32 fields in our layout
+            let info: MutPtr<vm_region_basic_info_data_t> = Ptr::from_bits(info_ptr.to_bits());
+            env.mem.write(
+                info,
+                vm_region_basic_info_data_t {
+                    protection: VM_PROT_READ | VM_PROT_WRITE,
+                    max_protection: VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE,
+                    inheritance: 1, // VM_INHERIT_COPY
+                    reserved: 0,
+                    offset: 0,
+                },
+            );
+        }
+    }
+    KERN_SUCCESS
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(vm_allocate(_, _, _, _)),
     export_c_func!(vm_deallocate(_, _, _)),
     export_c_func!(vm_remap(_, _, _, _, _, _, _, _, _, _, _)),
     export_c_func!(vm_purgable_control(_, _, _, _)),
+    export_c_func!(vm_protect(_, _, _, _, _)),
+    export_c_func!(vm_region_recurse(_, _, _, _, _, _)),
 ];

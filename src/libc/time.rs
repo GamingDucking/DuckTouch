@@ -553,7 +553,7 @@ fn mktime(env: &mut Environment, tm: MutPtr<tm>) -> time_t {
 type suseconds_t = i32;
 
 #[allow(non_camel_case_types)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 #[repr(C, packed)]
 pub(super) struct timeval {
     pub(super) tv_sec: time_t,
@@ -1063,7 +1063,101 @@ fn strftime_l(
     strftime(env, s, max_size, format, time_ptr)
 }
 
+#[allow(non_camel_case_types)]
+#[repr(C, packed)]
+pub(super) struct rusage {
+    ru_utime: timeval,
+    ru_stime: timeval,
+    // The remaining fields are long counters; zero-filled is fine.
+    ru_maxrss: i32,
+    ru_ixrss: i32,
+    ru_idrss: i32,
+    ru_isrss: i32,
+    ru_minflt: i32,
+    ru_majflt: i32,
+    ru_nswap: i32,
+    ru_inblock: i32,
+    ru_oublock: i32,
+    ru_msgsnd: i32,
+    ru_msgrcv: i32,
+    ru_nsignals: i32,
+    ru_nvcsw: i32,
+    ru_nivcsw: i32,
+}
+unsafe impl SafeRead for rusage {}
+
+const RUSAGE_SELF: i32 = 0;
+
+/// `int getrusage(int who, struct rusage *usage)` (Darwin)
+///
+/// Reports the host process CPU time as the guest's user/system time. Apps
+/// like Chrome call this for performance counters and tolerate zeros, but
+/// returning real elapsed CPU time is more faithful.
+fn getrusage(env: &mut Environment, who: i32, usage_ptr: MutPtr<rusage>) -> i32 {
+    if who != RUSAGE_SELF {
+        log!("Warning: getrusage(who: {}) for non-self usage is unimplemented; returning zeros", who);
+        grusage_zero(env, usage_ptr);
+        return 0;
+    }
+    if usage_ptr.is_null() {
+        set_errno(env, 14); // EFAULT
+        return -1;
+    }
+    let elapsed = env.startup_time.elapsed();
+    let mut usage = rusage {
+        ru_utime: timeval {
+            tv_sec: elapsed.as_secs() as crate::libc::time::time_t,
+            tv_usec: (elapsed.subsec_micros()) as suseconds_t,
+        },
+        ru_stime: timeval { tv_sec: 0, tv_usec: 0 },
+        ru_maxrss: 0,
+        ru_ixrss: 0,
+        ru_idrss: 0,
+        ru_isrss: 0,
+        ru_minflt: 0,
+        ru_majflt: 0,
+        ru_nswap: 0,
+        ru_inblock: 0,
+        ru_oublock: 0,
+        ru_msgsnd: 0,
+        ru_msgrcv: 0,
+        ru_nsignals: 0,
+        ru_nvcsw: 0,
+        ru_nivcsw: 0,
+    };
+    // time_t is i64 on Darwin; our packed struct above uses the right widths
+    // via the timeval fields. Write it out.
+    env.mem.write(usage_ptr, usage);
+    0
+}
+
+fn grusage_zero(env: &mut Environment, usage_ptr: MutPtr<rusage>) {
+    if usage_ptr.is_null() {
+        return;
+    }
+    let zero = rusage {
+        ru_utime: timeval { tv_sec: 0, tv_usec: 0 },
+        ru_stime: timeval { tv_sec: 0, tv_usec: 0 },
+        ru_maxrss: 0,
+        ru_ixrss: 0,
+        ru_idrss: 0,
+        ru_isrss: 0,
+        ru_minflt: 0,
+        ru_majflt: 0,
+        ru_nswap: 0,
+        ru_inblock: 0,
+        ru_oublock: 0,
+        ru_msgsnd: 0,
+        ru_msgrcv: 0,
+        ru_nsignals: 0,
+        ru_nvcsw: 0,
+        ru_nivcsw: 0,
+    };
+    env.mem.write(usage_ptr, zero);
+}
+
 pub const FUNCTIONS: FunctionExports = &[
+    export_c_func!(getrusage(_, _)),
     export_c_func!(clock()),
     export_c_func!(time(_)),
     export_c_func!(tzset()),

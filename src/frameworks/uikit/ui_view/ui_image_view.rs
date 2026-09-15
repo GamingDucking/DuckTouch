@@ -194,6 +194,21 @@ pub const CLASSES: ClassExports = objc_classes! {
     release(env, this);
 }
 
+// Chrome for iOS calls control-style methods on UIImageView instances that
+// come out of its nibs. Tolerate them so the views behave as inert controls.
+
+- (())setImage:(id)new_image forState:(NSUInteger)state {
+    () = msg![env; this setImage:new_image];
+}
+
+- (())setEnabled:(bool)_enabled {
+    // UIImageView is not a control; nothing to enable.
+}
+
+- (NSUInteger)state {
+    0 // UIControlStateNormal
+}
+
 @end
 
 };

@@ -86,11 +86,12 @@ pub mod ns_timer;
 pub mod ns_ubiquitous_key_value_store;
 pub mod ns_undo_manager;
 pub mod ns_url;
+pub mod ns_user_defaults;
+pub mod url_protocol;
 pub mod ns_url_connection;
 pub mod ns_url_request;
 pub mod ns_url_response;
 pub mod ns_url_session;
-pub mod ns_user_defaults;
 pub mod ns_uuid;
 pub mod ns_value;
 pub mod ns_xml_parser;
@@ -1558,6 +1559,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ns_url_request::CLASSES,
         ns_url_response::CLASSES,
         ns_url_session::CLASSES,
+        url_protocol::CLASSES,
         ns_user_defaults::CLASSES,
         ns_uuid::CLASSES,
         ns_value::CLASSES,
@@ -1603,6 +1605,7 @@ pub struct State {
     pub ns_undo_manager: ns_undo_manager::State,
     ns_user_defaults: ns_user_defaults::State,
     ns_url_session: ns_url_session::State,
+    url_protocol: url_protocol::State,
     /// Singleton for [NSURLCache sharedURLCache].
     pub url_cache_singleton: crate::objc::id,
 }
