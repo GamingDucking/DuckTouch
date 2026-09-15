@@ -31,21 +31,26 @@ mod imp {
         fn SDL_AndroidGetJNIEnv() -> *mut c_void;
     }
 
-    /// JNI function-table slot indices. The table starts with 4 reserved
-    /// pointers, hence every index below is `4 + <position in jni.h>`.
+    /// JNI function-table slot indices: the position of each function
+    /// pointer inside `struct JNINativeInterface_` from jni.h. The layout,
+    /// including the four reserved pointers at slots 0-3, is a stable ABI
+    /// shared by ART and desktop JVMs, so an index is simply the position
+    /// of the function in the struct. A slot that is off by a few entries
+    /// silently resolves to a *different* JNI function, which ends in a
+    /// native crash (SIGSEGV), so verify against jni.h when editing.
     mod slots {
         pub const FIND_CLASS: usize = 6;
         pub const EXCEPTION_OCCURRED: usize = 15;
         pub const EXCEPTION_CLEAR: usize = 17;
+        pub const DELETE_LOCAL_REF: usize = 23;
+        pub const GET_STATIC_METHOD_ID: usize = 113;
+        pub const CALL_STATIC_OBJECT_METHOD_A: usize = 116;
+        pub const CALL_STATIC_BOOLEAN_METHOD_A: usize = 119;
+        pub const CALL_STATIC_INT_METHOD_A: usize = 131;
+        pub const CALL_STATIC_VOID_METHOD_A: usize = 143;
         pub const NEW_STRING_UTF: usize = 167;
         pub const GET_STRING_UTF_CHARS: usize = 169;
         pub const RELEASE_STRING_UTF_CHARS: usize = 170;
-        pub const GET_STATIC_METHOD_ID: usize = 113 + 4;
-        pub const CALL_STATIC_OBJECT_METHOD_A: usize = 110 + 2;
-        pub const CALL_STATIC_BOOLEAN_METHOD_A: usize = 113 + 2;
-        pub const CALL_STATIC_INT_METHOD_A: usize = 125 + 2;
-        pub const CALL_STATIC_VOID_METHOD_A: usize = 137 + 2;
-        pub const DELETE_LOCAL_REF: usize = 23;
     }
 
     #[repr(C)]
