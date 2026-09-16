@@ -39,6 +39,17 @@ pub const UIDataDetectorTypeCalendarEvent: UIDataDetectorTypes = 1 << 3;
 pub const UIDataDetectorTypeNone: UIDataDetectorTypes = 0;
 pub const UIDataDetectorTypeAll: UIDataDetectorTypes = u32::MAX as UIDataDetectorTypes;
 
+/// A load that was initiated while the view had no on-screen extent (or
+/// the host window wasn't ready), so the native overlay could not be
+/// created yet. The load is remembered and retried from `-setFrame:`
+/// once the view is laid out. See [retry_pending_load].
+#[derive(Clone)]
+enum PendingLoad {
+    Url(String),
+    /// (payload, MIME type)
+    Data(String, String),
+}
+
 #[derive(Default)]
 struct UIWebViewHostObject {
     superclass: UIViewHostObject,
@@ -67,6 +78,8 @@ struct UIWebViewHostObject {
     /// been created yet (first `show` seeds it with a page); `-1` = a show
     /// was attempted but unavailable/zero-size; `>= 0` = live overlay id.
     overlay_id: i32,
+    /// Load deferred until the view has an on-screen extent.
+    pending_load: Option<PendingLoad>,
 }
 impl_HostObject_with_superclass!(UIWebViewHostObject);
 
@@ -102,6 +115,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         back_stack: Vec::new(),
         forward_stack: Vec::new(),
         overlay_id: -2,
+        pending_load: None,
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
@@ -192,12 +206,24 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     // Real engine path: hand the request to a genuine Android WebView
     // overlay; did-finish is scheduled for after the native page loads.
-    if android_web_view::native_webview_available()
-        && overlay_load(env, this, Some(&url_string), None)
-    {
+    if android_web_view::native_webview_available() {
+        if overlay_load(env, this, Some(&url_string), None) {
+            schedule_did_finish_load(env, this);
+            return;
+        }
+        // The bridge is up, but the view has no on-screen extent yet.
+        // Remember the load and retry it from -setFrame: once the view
+        // is laid out.
+        log!(
+            "UIWebView: deferring load of {} until the view is laid out",
+            url_string
+        );
+        env.objc.borrow_mut::<UIWebViewHostObject>(this).pending_load =
+            Some(PendingLoad::Url(url_string));
         schedule_did_finish_load(env, this);
         return;
     }
+    log!("UIWebView: native WebView bridge not available; using fallback rendering");
 
     // Desktop fallback: snapshot the URL with headless Chromium and install
     // the PNG as this view's layer contents. We don't stream content, so the
@@ -214,12 +240,19 @@ pub const CLASSES: ClassExports = objc_classes! {
     } else { String::new() };
     log_dbg!("UIWebView loadHTMLString: ({} chars)", html_str.len());
 
-    if android_web_view::native_webview_available()
-        && overlay_load(env, this, None, Some((&html_str, "text/html")))
-    {
+    if android_web_view::native_webview_available() {
+        if overlay_load(env, this, None, Some((&html_str, "text/html"))) {
+            schedule_did_finish_load(env, this);
+            return;
+        }
+        // The bridge is up, but the view has no on-screen extent yet.
+        log!("UIWebView: deferring HTML load until the view is laid out");
+        env.objc.borrow_mut::<UIWebViewHostObject>(this).pending_load =
+            Some(PendingLoad::Data(html_str, "text/html".to_string()));
         schedule_did_finish_load(env, this);
         return;
     }
+    log!("UIWebView: native WebView bridge not available; using fallback rendering");
 
     // Desktop fallback: write the HTML to a temp file and snapshot it.
     if !html_str.is_empty() {
@@ -256,12 +289,21 @@ pub const CLASSES: ClassExports = objc_classes! {
         String::new()
     };
 
-    if android_web_view::native_webview_available()
-        && overlay_load(env, this, None, Some((&payload, mime_str.as_str())))
-    {
+    if android_web_view::native_webview_available() {
+        if overlay_load(env, this, None, Some((&payload, mime_str.as_str()))) {
+            schedule_did_finish_load(env, this);
+            return;
+        }
+        // The bridge is up, but the view has no on-screen extent yet.
+        log!(
+            "UIWebView: deferring data load until the view is laid out"
+        );
+        env.objc.borrow_mut::<UIWebViewHostObject>(this).pending_load =
+            Some(PendingLoad::Data(payload, mime_str));
         schedule_did_finish_load(env, this);
         return;
     }
+    log!("UIWebView: native WebView bridge not available; using fallback rendering");
 
     // Desktop fallback: only HTML payloads can be rendered (temp file route).
     if mime_str.starts_with("text/html") && !payload.is_empty() {
@@ -556,6 +598,19 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 // =========================================================================
+// MARK: - Layout
+// =========================================================================
+
+- (())setFrame:(CGRect)frame {
+    msg_super![env; this setFrame:frame];
+    // A load may have been deferred because the view had no on-screen
+    // extent when the app initiated it (apps commonly load the request
+    // before the view is laid out). Now that the view has a size, take
+    // the deferred load.
+    retry_pending_load(env, this);
+}
+
+// =========================================================================
 // MARK: - View hierarchy (overlay teardown)
 // =========================================================================
 
@@ -724,6 +779,12 @@ fn snapshot_url_with_chromium(url: &str, width: u32, height: u32) -> Option<Vec<
 /// Snapshot `url` and install the decoded PNG as the UIWebView's
 /// `layer.contents` so the user sees the rendered web page.
 fn render_url_to_layer(env: &mut Environment, this: id, url: &str, frame: CGRect) {
+    if cfg!(target_os = "android") {
+        // There is no desktop Chromium to shell out to on a phone: the
+        // native WebView overlay is the only real rendering path there.
+        // (When the overlay is merely deferred we never get here either.)
+        return;
+    }
     if url.is_empty()
         || !(url.starts_with("http://")
             || url.starts_with("https://")
@@ -786,6 +847,39 @@ fn overlay_show_or_update(env: &mut Environment, this: id) -> Option<i32> {
         Some(current)
     } else {
         None
+    }
+}
+
+/// Carry out a load that was deferred because the view had no on-screen
+/// extent when the app initiated it. Called from `-setFrame:`; keeps the
+/// load deferred if the view still can't be shown.
+fn retry_pending_load(env: &mut Environment, this: id) {
+    if env.objc.borrow::<UIWebViewHostObject>(this).pending_load.is_none() {
+        return;
+    }
+    if !android_web_view::native_webview_available() {
+        return;
+    }
+    let frame: CGRect = msg![env; this frame];
+    if frame.size.width <= 0.0 || frame.size.height <= 0.0 {
+        // Still not laid out; keep waiting.
+        return;
+    }
+    let pending = env
+        .objc
+        .borrow_mut::<UIWebViewHostObject>(this)
+        .pending_load
+        .take()
+        .unwrap();
+    log!("UIWebView: retrying deferred load now that the view is laid out");
+    let shown = match &pending {
+        PendingLoad::Url(url) => overlay_load(env, this, Some(url), None),
+        PendingLoad::Data(payload, mime) => overlay_load(env, this, None, Some((payload, mime))),
+    };
+    if !shown {
+        // The overlay still couldn't be shown (e.g. the host window
+        // viewport isn't ready); keep the load deferred.
+        env.objc.borrow_mut::<UIWebViewHostObject>(this).pending_load = Some(pending);
     }
 }
 
