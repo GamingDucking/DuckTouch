@@ -223,7 +223,7 @@ pub const CLASSES: ClassExports = objc_classes! {
             url_string
         );
         {
-            let mut host_obj = env.objc.borrow_mut::<UIWebViewHostObject>(this);
+            let host_obj = env.objc.borrow_mut::<UIWebViewHostObject>(this);
             host_obj.pending_load = Some(PendingLoad::Url(url_string));
             host_obj.deferred_polls = 0;
         }
@@ -255,7 +255,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         // The bridge is up, but the view has no on-screen extent yet.
         log!("UIWebView: deferring HTML load until the view is laid out");
         {
-            let mut host_obj = env.objc.borrow_mut::<UIWebViewHostObject>(this);
+            let host_obj = env.objc.borrow_mut::<UIWebViewHostObject>(this);
             host_obj.pending_load = Some(PendingLoad::Data(html_str, "text/html".to_string()));
             host_obj.deferred_polls = 0;
         }
@@ -307,7 +307,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         // The bridge is up, but the view has no on-screen extent yet.
         log!("UIWebView: deferring data load until the view is laid out");
         {
-            let mut host_obj = env.objc.borrow_mut::<UIWebViewHostObject>(this);
+            let host_obj = env.objc.borrow_mut::<UIWebViewHostObject>(this);
             host_obj.pending_load = Some(PendingLoad::Data(payload, mime_str));
             host_obj.deferred_polls = 0;
         }
@@ -693,7 +693,11 @@ pub const CLASSES: ClassExports = objc_classes! {
         retry_pending_load(env, this);
         if env.objc.borrow::<UIWebViewHostObject>(this).pending_load.is_some() {
             let frame: CGRect = msg![env; this frame];
-            let mut host_obj = env.objc.borrow_mut::<UIWebViewHostObject>(this);
+            // CGRect is #[repr(packed)]: taking a reference to a field is
+            // unaligned (E0793), so copy the values out for the log.
+            let frame_w = frame.size.width;
+            let frame_h = frame.size.height;
+            let host_obj = env.objc.borrow_mut::<UIWebViewHostObject>(this);
             host_obj.deferred_polls += 1;
             if host_obj.deferred_polls == 1 {
                 // Make the poll visible in the log: without this line a
@@ -701,8 +705,8 @@ pub const CLASSES: ClassExports = objc_classes! {
                 // while the view still has no frame.
                 log!(
                     "UIWebView: deferred load still waiting (frame {}x{}); polling on a timer",
-                    frame.size.width,
-                    frame.size.height
+                    frame_w,
+                    frame_h
                 );
             }
             if host_obj.deferred_polls < 100 {
