@@ -692,8 +692,19 @@ pub const CLASSES: ClassExports = objc_classes! {
     if env.objc.borrow::<UIWebViewHostObject>(this).pending_load.is_some() {
         retry_pending_load(env, this);
         if env.objc.borrow::<UIWebViewHostObject>(this).pending_load.is_some() {
+            let frame: CGRect = msg![env; this frame];
             let mut host_obj = env.objc.borrow_mut::<UIWebViewHostObject>(this);
             host_obj.deferred_polls += 1;
+            if host_obj.deferred_polls == 1 {
+                // Make the poll visible in the log: without this line a
+                // healthy poll cycle is indistinguishable from a dead one
+                // while the view still has no frame.
+                log!(
+                    "UIWebView: deferred load still waiting (frame {}x{}); polling on a timer",
+                    frame.size.width,
+                    frame.size.height
+                );
+            }
             if host_obj.deferred_polls < 100 {
                 poll_again = true;
             } else {
@@ -872,7 +883,26 @@ fn overlay_show_or_update(env: &mut Environment, this: id) -> Option<i32> {
         return None;
     }
     let frame: CGRect = msg![env; this frame];
-    let (x, y, w, h) = env.window().guest_frame_to_window_px(frame);
+    let (mut x, mut y, mut w, mut h) = env.window().guest_frame_to_window_px(frame);
+    if w <= 0 || h <= 0 {
+        // The view itself has no extent yet. Apps commonly add the web
+        // view to a container and let autoresizing size it — which never
+        // happens here, as touchHLE has no automatic layout pass. If we
+        // already have a superview with a usable frame, borrow its
+        // geometry instead of staying blank.
+        let superview: id = msg![env; this superview];
+        if superview != nil {
+            let super_frame: CGRect = msg![env; superview frame];
+            let (sx, sy, sw, sh) = env.window().guest_frame_to_window_px(super_frame);
+            if sw > 0 && sh > 0 {
+                log!("UIWebView overlay: view has no extent yet; using superview frame");
+                x = sx;
+                y = sy;
+                w = sw;
+                h = sh;
+            }
+        }
+    }
     if w <= 0 || h <= 0 {
         log!("UIWebView overlay skipped: view has no on-screen extent yet");
         return None;
@@ -904,8 +934,17 @@ fn retry_pending_load(env: &mut Environment, this: id) {
     }
     let frame: CGRect = msg![env; this frame];
     if frame.size.width <= 0.0 || frame.size.height <= 0.0 {
-        // Still not laid out; keep waiting.
-        return;
+        // The view itself has no size yet. The overlay can still be shown
+        // from the superview's geometry (see overlay_show_or_update), so
+        // only keep waiting when there is no usable superview either.
+        let superview: id = msg![env; this superview];
+        if superview == nil {
+            return;
+        }
+        let super_frame: CGRect = msg![env; superview frame];
+        if super_frame.size.width <= 0.0 || super_frame.size.height <= 0.0 {
+            return;
+        }
     }
     let pending = env
         .objc
