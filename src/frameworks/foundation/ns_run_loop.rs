@@ -360,6 +360,14 @@ pub fn run_run_loop(
 
     let is_main_run_loop = env.current_thread == 0;
 
+    if is_main_run_loop && !single_iteration {
+        // Diagnostic: everything the app's UI does — event delivery,
+        // composition, timers — is dispatched from this loop. If this line
+        // never appears in the log, the app hung before its run loop ever
+        // started (e.g. somewhere inside applicationDidFinishLaunching).
+        log_once!("Main run loop: now dispatching events, timers and composition");
+    }
+
     loop {
         let mut sleep_until = None;
 

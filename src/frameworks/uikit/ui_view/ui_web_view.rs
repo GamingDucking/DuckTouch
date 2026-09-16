@@ -13,8 +13,8 @@ use crate::frameworks::foundation::NSUInteger;
 use crate::frameworks::uikit::ui_view::UIViewHostObject;
 use crate::image::Image;
 use crate::objc::{
-    id, impl_HostObject_with_superclass, msg, msg_class, nil, objc_classes, release, retain,
-    ClassExports, HostObject, NSZonePtr,
+    id, impl_HostObject_with_superclass, msg, msg_class, msg_super, nil, objc_classes, release,
+    retain, Class, ClassExports, NSZonePtr,
 };
 use crate::Environment;
 use std::path::PathBuf;
@@ -38,6 +38,17 @@ pub const UIDataDetectorTypeAddress: UIDataDetectorTypes = 1 << 2;
 pub const UIDataDetectorTypeCalendarEvent: UIDataDetectorTypes = 1 << 3;
 pub const UIDataDetectorTypeNone: UIDataDetectorTypes = 0;
 pub const UIDataDetectorTypeAll: UIDataDetectorTypes = u32::MAX as UIDataDetectorTypes;
+
+/// A load that was initiated while the view had no on-screen extent (or
+/// the host window wasn't ready), so the native overlay could not be
+/// created yet. The load is remembered and retried from `-setFrame:`
+/// once the view is laid out. See [retry_pending_load].
+#[derive(Clone)]
+enum PendingLoad {
+    Url(String),
+    /// (payload, MIME type)
+    Data(String, String),
+}
 
 #[derive(Default)]
 struct UIWebViewHostObject {
@@ -67,6 +78,11 @@ struct UIWebViewHostObject {
     /// been created yet (first `show` seeds it with a page); `-1` = a show
     /// was attempted but unavailable/zero-size; `>= 0` = live overlay id.
     overlay_id: i32,
+    /// Load deferred until the view has an on-screen extent.
+    pending_load: Option<PendingLoad>,
+    /// How many times the deferred load has been retried on a timer so
+    /// far (bounded so a view that never gets a frame can't poll forever).
+    deferred_polls: u32,
 }
 impl_HostObject_with_superclass!(UIWebViewHostObject);
 
@@ -102,6 +118,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         back_stack: Vec::new(),
         forward_stack: Vec::new(),
         overlay_id: -2,
+        pending_load: None,
+        deferred_polls: 0,
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
@@ -192,12 +210,28 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     // Real engine path: hand the request to a genuine Android WebView
     // overlay; did-finish is scheduled for after the native page loads.
-    if android_web_view::native_webview_available()
-        && overlay_load(env, this, Some(&url_string), None)
-    {
+    if android_web_view::native_webview_available() {
+        if overlay_load(env, this, Some(&url_string), None) {
+            schedule_did_finish_load(env, this);
+            return;
+        }
+        // The bridge is up, but the view has no on-screen extent yet.
+        // Remember the load and retry it from -setFrame: once the view
+        // is laid out.
+        log!(
+            "UIWebView: deferring load of {} until the view is laid out ({})",
+            url_string,
+            deferred_load_context(env, this)
+        );
+        {
+            let host_obj = env.objc.borrow_mut::<UIWebViewHostObject>(this);
+            host_obj.pending_load = Some(PendingLoad::Url(url_string));
+            host_obj.deferred_polls = 0;
+        }
         schedule_did_finish_load(env, this);
         return;
     }
+    log!("UIWebView: native WebView bridge not available; using fallback rendering");
 
     // Desktop fallback: snapshot the URL with headless Chromium and install
     // the PNG as this view's layer contents. We don't stream content, so the
@@ -214,12 +248,25 @@ pub const CLASSES: ClassExports = objc_classes! {
     } else { String::new() };
     log_dbg!("UIWebView loadHTMLString: ({} chars)", html_str.len());
 
-    if android_web_view::native_webview_available()
-        && overlay_load(env, this, None, Some((&html_str, "text/html")))
-    {
+    if android_web_view::native_webview_available() {
+        if overlay_load(env, this, None, Some((&html_str, "text/html"))) {
+            schedule_did_finish_load(env, this);
+            return;
+        }
+        // The bridge is up, but the view has no on-screen extent yet.
+        log!(
+            "UIWebView: deferring HTML load until the view is laid out ({})",
+            deferred_load_context(env, this)
+        );
+        {
+            let host_obj = env.objc.borrow_mut::<UIWebViewHostObject>(this);
+            host_obj.pending_load = Some(PendingLoad::Data(html_str, "text/html".to_string()));
+            host_obj.deferred_polls = 0;
+        }
         schedule_did_finish_load(env, this);
         return;
     }
+    log!("UIWebView: native WebView bridge not available; using fallback rendering");
 
     // Desktop fallback: write the HTML to a temp file and snapshot it.
     if !html_str.is_empty() {
@@ -256,12 +303,25 @@ pub const CLASSES: ClassExports = objc_classes! {
         String::new()
     };
 
-    if android_web_view::native_webview_available()
-        && overlay_load(env, this, None, Some((&payload, mime_str.as_str())))
-    {
+    if android_web_view::native_webview_available() {
+        if overlay_load(env, this, None, Some((&payload, mime_str.as_str()))) {
+            schedule_did_finish_load(env, this);
+            return;
+        }
+        // The bridge is up, but the view has no on-screen extent yet.
+        log!(
+            "UIWebView: deferring data load until the view is laid out ({})",
+            deferred_load_context(env, this)
+        );
+        {
+            let host_obj = env.objc.borrow_mut::<UIWebViewHostObject>(this);
+            host_obj.pending_load = Some(PendingLoad::Data(payload, mime_str));
+            host_obj.deferred_polls = 0;
+        }
         schedule_did_finish_load(env, this);
         return;
     }
+    log!("UIWebView: native WebView bridge not available; using fallback rendering");
 
     // Desktop fallback: only HTML payloads can be rendered (temp file route).
     if mime_str.starts_with("text/html") && !payload.is_empty() {
@@ -556,6 +616,21 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 // =========================================================================
+// MARK: - Layout
+// =========================================================================
+
+- (())setFrame:(CGRect)frame {
+    // `() = ` pins the void return type (house style for non-tail super
+    // calls, e.g. UITableView's own -setFrame: override).
+    () = msg_super![env; this setFrame:frame];
+    // A load may have been deferred because the view had no on-screen
+    // extent when the app initiated it (apps commonly load the request
+    // before the view is laid out). Now that the view has a size, take
+    // the deferred load.
+    retry_pending_load(env, this);
+}
+
+// =========================================================================
 // MARK: - View hierarchy (overlay teardown)
 // =========================================================================
 
@@ -612,9 +687,53 @@ pub const CLASSES: ClassExports = objc_classes! {
 // Called by an NSTimer scheduled in loadRequest:/loadHTMLString:/loadData:.
 // The timer argument is the (retained) NSTimer; we release our retain of
 // `this` here to keep refcounts balanced.
+//
+// A deferred load normally retries from -setFrame:, but a view that was
+// sized via initWithFrame: and never re-laid-out never receives -setFrame:
+// again — so this handler doubles as a poll: while a load stays deferred,
+// keep retrying on a timer until the overlay can be shown (or we give up
+// and simply report the load as finished).
 - (())touchhleWebViewLoadDidFinish:(id)_timer {
     env.objc.borrow_mut::<UIWebViewHostObject>(this).loading = false;
-    fire_did_finish_load(env, this);
+    let mut poll_again = false;
+    if env.objc.borrow::<UIWebViewHostObject>(this).pending_load.is_some() {
+        retry_pending_load(env, this);
+        if env.objc.borrow::<UIWebViewHostObject>(this).pending_load.is_some() {
+            let frame: CGRect = msg![env; this frame];
+            // CGRect is #[repr(packed)]: taking a reference to a field is
+            // unaligned (E0793), so copy the values out for the log.
+            let frame_w = frame.size.width;
+            let frame_h = frame.size.height;
+            let host_obj = env.objc.borrow_mut::<UIWebViewHostObject>(this);
+            host_obj.deferred_polls += 1;
+            if host_obj.deferred_polls == 1 {
+                // Make the poll visible in the log: without this line a
+                // healthy poll cycle is indistinguishable from a dead one
+                // while the view still has no frame.
+                log!(
+                    "UIWebView: deferred load still waiting (frame {}x{}); polling on a timer",
+                    frame_w,
+                    frame_h
+                );
+            }
+            if host_obj.deferred_polls < 100 {
+                poll_again = true;
+            } else {
+                log!(
+                    "UIWebView: giving up on deferred load (view never got a frame)"
+                );
+                host_obj.pending_load = None;
+            }
+        }
+    }
+    if poll_again {
+        // Schedule_did_finish_load re-retains `this`, balancing the
+        // release below; the delegate's webViewDidFinishLoad: fires only
+        // once, after the overlay is really up (or on give-up).
+        schedule_did_finish_load(env, this);
+    } else {
+        fire_did_finish_load(env, this);
+    }
     release(env, this);
 }
 
@@ -724,6 +843,12 @@ fn snapshot_url_with_chromium(url: &str, width: u32, height: u32) -> Option<Vec<
 /// Snapshot `url` and install the decoded PNG as the UIWebView's
 /// `layer.contents` so the user sees the rendered web page.
 fn render_url_to_layer(env: &mut Environment, this: id, url: &str, frame: CGRect) {
+    if cfg!(target_os = "android") {
+        // There is no desktop Chromium to shell out to on a phone: the
+        // native WebView overlay is the only real rendering path there.
+        // (When the overlay is merely deferred we never get here either.)
+        return;
+    }
     if url.is_empty()
         || !(url.starts_with("http://")
             || url.starts_with("https://")
@@ -769,8 +894,28 @@ fn overlay_show_or_update(env: &mut Environment, this: id) -> Option<i32> {
         return None;
     }
     let frame: CGRect = msg![env; this frame];
-    let (x, y, w, h) = env.window().guest_frame_to_window_px(frame);
+    let (mut x, mut y, mut w, mut h) = env.window().guest_frame_to_window_px(frame);
     if w <= 0 || h <= 0 {
+        // The view itself has no extent yet. Apps commonly add the web
+        // view to a container and let autoresizing size it — which never
+        // happens here, as touchHLE has no automatic layout pass. If we
+        // already have a superview with a usable frame, borrow its
+        // geometry instead of staying blank.
+        let superview: id = msg![env; this superview];
+        if superview != nil {
+            let super_frame: CGRect = msg![env; superview frame];
+            let (sx, sy, sw, sh) = env.window().guest_frame_to_window_px(super_frame);
+            if sw > 0 && sh > 0 {
+                log!("UIWebView overlay: view has no extent yet; using superview frame");
+                x = sx;
+                y = sy;
+                w = sw;
+                h = sh;
+            }
+        }
+    }
+    if w <= 0 || h <= 0 {
+        log!("UIWebView overlay skipped: view has no on-screen extent yet");
         return None;
     }
     let current = env.objc.borrow::<UIWebViewHostObject>(this).overlay_id;
@@ -785,6 +930,124 @@ fn overlay_show_or_update(env: &mut Environment, this: id) -> Option<i32> {
         Some(current)
     } else {
         None
+    }
+}
+
+/// Carry out a load that was deferred because the view had no on-screen
+/// extent when the app initiated it. Called from `-setFrame:`; keeps the
+/// load deferred if the view still can't be shown.
+fn retry_pending_load(env: &mut Environment, this: id) {
+    if env.objc.borrow::<UIWebViewHostObject>(this).pending_load.is_none() {
+        return;
+    }
+    if !android_web_view::native_webview_available() {
+        return;
+    }
+    let frame: CGRect = msg![env; this frame];
+    if frame.size.width <= 0.0 || frame.size.height <= 0.0 {
+        // The view itself has no size yet. The overlay can still be shown
+        // from the superview's geometry (see overlay_show_or_update), so
+        // only keep waiting when there is no usable superview either.
+        let superview: id = msg![env; this superview];
+        if superview == nil {
+            return;
+        }
+        let super_frame: CGRect = msg![env; superview frame];
+        if super_frame.size.width <= 0.0 || super_frame.size.height <= 0.0 {
+            return;
+        }
+    }
+    let pending = env
+        .objc
+        .borrow_mut::<UIWebViewHostObject>(this)
+        .pending_load
+        .take()
+        .unwrap();
+    log!("UIWebView: retrying deferred load now that the view is laid out");
+    let shown = match &pending {
+        PendingLoad::Url(url) => overlay_load(env, this, Some(url), None),
+        PendingLoad::Data(payload, mime) => overlay_load(env, this, None, Some((payload, mime))),
+    };
+    if !shown {
+        // The overlay still couldn't be shown (e.g. the host window
+        // viewport isn't ready); keep the load deferred.
+        env.objc.borrow_mut::<UIWebViewHostObject>(this).pending_load = Some(pending);
+    }
+}
+
+/// One-line description of a deferred webview's geometry: its own frame
+/// and, if it has one, its superview's frame. Included in the deferral log
+/// so that a single line shows whether the superview fallback (see
+/// `overlay_show_or_update`) will be able to size the overlay — and so the
+/// line itself identifies builds that carry this diagnostic.
+fn deferred_load_context(env: &mut Environment, this: id) -> String {
+    let frame: CGRect = msg![env; this frame];
+    // CGRect is #[repr(packed)]: references to its fields in format args
+    // would be unaligned (E0793), so copy the values out first.
+    let frame_w = frame.size.width;
+    let frame_h = frame.size.height;
+    let superview: id = msg![env; this superview];
+    if superview == nil {
+        return format!("frame {}x{}, no superview yet", frame_w, frame_h);
+    }
+    let super_frame: CGRect = msg![env; superview frame];
+    let super_w = super_frame.size.width;
+    let super_h = super_frame.size.height;
+    format!(
+        "frame {}x{}, superview {:?} {}x{}",
+        frame_w, frame_h, superview, super_w, super_h
+    )
+}
+
+/// Retry deferred loads for every UIWebView in `root`'s view subtree.
+/// Called when a freshly built hierarchy has just been attached to a window
+/// (see `-[UIViewController presentModalViewController:animated:]`): at that
+/// point the containers the app created its webviews in finally exist, so a
+/// load deferred because the webview had no extent can often proceed right
+/// away — synchronously, without depending on the NSTimer poll.
+pub(crate) fn retry_pending_loads_in_subtree(env: &mut Environment, root: id) {
+    if root == nil {
+        return;
+    }
+    let uiwebview_class: Class = msg_class![env; UIWebView class];
+    let is_webview: bool = msg![env; root isKindOfClass:uiwebview_class];
+    if is_webview
+        && env
+            .objc
+            .borrow::<UIWebViewHostObject>(root)
+            .pending_load
+            .is_some()
+    {
+        log!(
+            "UIWebView: view hierarchy is in place; retrying deferred load of {:?}",
+            root
+        );
+        retry_pending_load(env, root);
+        if env
+            .objc
+            .borrow::<UIWebViewHostObject>(root)
+            .pending_load
+            .is_none()
+            && cfg!(target_os = "android")
+        {
+            // The retry just showed the overlay, which completes the load.
+            // The NSTimer that would normally deliver webViewDidFinishLoad:
+            // has never been observed to fire on Android, so finish the
+            // load here instead. (If the timer ever does fire as well, a
+            // second webViewDidFinishLoad: is harmless — real UIWebView
+            // delivers it once per frame navigation.)
+            finish_load(env, root);
+        }
+    }
+    let subviews: id = msg![env; root subviews];
+    if subviews != nil {
+        let count: NSUInteger = msg![env; subviews count];
+        let mut i: NSUInteger = 0;
+        while i < count {
+            let child: id = msg![env; subviews objectAtIndex:i];
+            retry_pending_loads_in_subtree(env, child);
+            i += 1;
+        }
     }
 }
 
