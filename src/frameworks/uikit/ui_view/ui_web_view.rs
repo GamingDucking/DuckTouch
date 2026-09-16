@@ -602,7 +602,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 // =========================================================================
 
 - (())setFrame:(CGRect)frame {
-    msg_super![env; this setFrame:frame];
+    // `() = ` pins the void return type (house style for non-tail super
+    // calls, e.g. UITableView's own -setFrame: override).
+    () = msg_super![env; this setFrame:frame];
     // A load may have been deferred because the view had no on-screen
     // extent when the app initiated it (apps commonly load the request
     // before the view is laid out). Now that the view has a size, take
