@@ -351,6 +351,14 @@ fn AudioUnitSetProperty(
                     {
                         obj.mic_input_enabled = enabled != 0;
                     }
+                    // Start/stop the host mic stream so read_mic_chunk()
+                    // actually delivers PCM (games enable input only when the
+                    // user starts recording, so this maps 1:1).
+                    if enabled != 0 {
+                        crate::android_media::start_mic();
+                    } else {
+                        crate::android_media::stop_mic();
+                    }
                 }
             }
             kAudioUnitProperty_ElementCount => {

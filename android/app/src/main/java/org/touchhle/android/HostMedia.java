@@ -84,13 +84,18 @@ public class HostMedia {
         if (!missing) {
             return true;
         }
-        final CountDownLatch latch = new CountDownLatch(1);
         final AtomicReference<Boolean> granted = new AtomicReference<Boolean>(Boolean.FALSE);
         try {
-            act.requestPermissions(permissions, 0x484D); // "HM"
-            // Poll until the dialog is answered — onRequestPermissionsResult
-            // re-checks grant state; simplest robust path is polling
-            // checkSelfPermission for up to 15 seconds.
+            // Activity.requestPermissions must run on the UI thread; SDL
+            // calls arrive on the native thread, so hop over first.
+            act.runOnUiThread(new Runnable() {
+                public void run() {
+                    act.requestPermissions(permissions, 0x484D); // "HM"
+                }
+            });
+            // Poll until the dialog is answered  -  the system updates the
+            // grant state regardless of the callback, so polling
+            // checkSelfPermission for up to 15 seconds is robust.
             for (int i = 0; i < 300; i++) {
                 Thread.sleep(50);
                 boolean all = true;
@@ -126,10 +131,9 @@ public class HostMedia {
             return false;
         }
         try {
-            if (!ensurePermissions(
-                    new String[] { Manifest.permission.CAMERA })) {
-                return false;
-            }
+            // Pure hardware probe  -  NO permission request here. Games poll
+            // availability during startup; the CAMERA permission dialog is
+            // shown by takePhoto() when capture actually starts.
             CameraManager cm =
                     (CameraManager) act.getSystemService(android.content.Context.CAMERA_SERVICE);
             if (cm == null) {
@@ -313,7 +317,11 @@ public class HostMedia {
             return false;
         }
         try {
-            if (!ensurePermissions(new String[] { Manifest.permission.RECORD_AUDIO })) {
+            // Pure hardware probe  -  NO permission request here. Games check
+            // isInputAvailable during startup; the RECORD_AUDIO permission
+            // dialog is shown by startMic() when capture actually starts.
+            if (!act.getPackageManager().hasSystemFeature(
+                    android.content.pm.PackageManager.FEATURE_MICROPHONE)) {
                 return false;
             }
             int min =
@@ -338,7 +346,15 @@ public class HostMedia {
             return false;
         }
         try {
+            if (!act.getPackageManager().hasSystemFeature(
+                    android.content.pm.PackageManager.FEATURE_MICROPHONE)) {
+                return false;
+            }
+            // Capture is actually starting now  -  this is where the
+            // RECORD_AUDIO permission dialog belongs. Without it AudioRecord
+            // never reaches STATE_INITIALIZED on Android 6+.
             if (!ensurePermissions(new String[] { Manifest.permission.RECORD_AUDIO })) {
+                Log.w(TAG, "startMic: RECORD_AUDIO permission denied");
                 return false;
             }
             int min =
