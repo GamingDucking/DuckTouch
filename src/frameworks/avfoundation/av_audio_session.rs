@@ -537,7 +537,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: - Input / output availability
 
 - (bool)isInputAvailable {
-    false
+    // Real answer from the host microphone (Android: AudioManager /
+    // AudioRecord probe; desktop: no mic bridge, so false).
+    crate::android_media::has_microphone()
 }
 
 - (bool)isOtherAudioPlaying {

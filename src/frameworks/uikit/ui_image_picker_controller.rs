@@ -8,7 +8,7 @@
 //! `UIImagePickerController`
 
 use crate::dyld::{export_c_func, FunctionExports};
-use crate::frameworks::foundation::ns_string::to_rust_string;
+use crate::frameworks::foundation::ns_string::{self, get_static_str, to_rust_string};
 use crate::frameworks::foundation::NSInteger;
 use crate::objc::{
     id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr,
@@ -34,6 +34,11 @@ const UIImagePickerControllerQualityTypeLow: NSInteger = 2;
 // UIImagePickerControllerCameraDevice values
 const UIImagePickerControllerCameraDeviceRear: NSInteger = 0;
 const UIImagePickerControllerCameraDeviceFront: NSInteger = 1;
+
+// UIImagePickerControllerCameraCaptureMode values
+const UIImagePickerControllerCameraCaptureModePhoto: UIImagePickerControllerCameraCaptureMode = 0;
+const UIImagePickerControllerCameraCaptureModeVideo: UIImagePickerControllerCameraCaptureMode = 1;
+
 
 // UIImagePickerControllerCameraFlashMode values
 const UIImagePickerControllerCameraFlashModeOff: NSInteger = -1;
@@ -79,25 +84,61 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // MARK: - Source type
 
-+ (bool)isSourceTypeAvailable:(UIImagePickerControllerSourceType)_source_type {
-    false
++ (bool)isSourceTypeAvailable:(UIImagePickerControllerSourceType)source_type {
+    match source_type {
+        UIImagePickerControllerSourceTypeCamera => {
+            // Real answer from the host: does this device have a camera?
+            crate::android_media::has_camera(false)
+                || crate::android_media::has_camera(true)
+        }
+        UIImagePickerControllerSourceTypePhotoLibrary => true,
+        UIImagePickerControllerSourceTypeSavedPhotosAlbum => true,
+        _ => false,
+    }
 }
 
-+ (id)availableMediaTypesForSourceType:(UIImagePickerControllerSourceType)_source_type {
++ (id)availableMediaTypesForSourceType:(UIImagePickerControllerSourceType)source_type {
+    if source_type == UIImagePickerControllerSourceTypeCamera
+        && (crate::android_media::has_camera(false)
+            || crate::android_media::has_camera(true))
+    {
+        // "public.image" — a real still camera is available.
+        let image_type = get_static_str(env, "public.image");
+        let arr: id = msg_class![env; NSArray arrayWithObject:image_type];
+        return arr;
+    }
     // Return an empty array — no sources are available.
     msg_class![env; NSArray new]
 }
 
-+ (bool)isCameraDeviceAvailable:(UIImagePickerControllerCameraDevice)_device {
-    false
++ (bool)isCameraDeviceAvailable:(UIImagePickerControllerCameraDevice)device {
+    let has_back = crate::android_media::has_camera(false);
+    let has_front = crate::android_media::has_camera(true);
+    match device {
+        UIImagePickerControllerCameraDeviceRear => has_back,
+        UIImagePickerControllerCameraDeviceFront => has_front,
+        _ => false,
+    }
 }
 
 + (bool)isFlashAvailableForCameraDevice:(UIImagePickerControllerCameraDevice)_device {
     false
 }
 
-+ (id)availableCaptureModesForCameraDevice:(UIImagePickerControllerCameraDevice)_device {
-    msg_class![env; NSArray new]
++ (id)availableCaptureModesForCameraDevice:(UIImagePickerControllerCameraDevice)device {
+    let available = match device {
+        UIImagePickerControllerCameraDeviceRear => crate::android_media::has_camera(false),
+        UIImagePickerControllerCameraDeviceFront => crate::android_media::has_camera(true),
+        _ => false,
+    };
+    if !available {
+        return msg_class![env; NSArray new];
+    }
+    // Photo capture is available on a real camera.
+    let photo: id = msg_class![env; NSNumber numberWithInteger:
+        (UIImagePickerControllerCameraCaptureModePhoto)];
+    let arr: id = msg_class![env; NSArray arrayWithObject:photo];
+    arr
 }
 
 - (id)init {
@@ -238,6 +279,53 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())takePicture {
+    let (source_type, camera_device, delegate, media_types) = {
+        let host = env.objc.borrow::<UIImagePickerControllerHostObject>(this);
+        (host.source_type, host.camera_device, host.delegate, host.media_types)
+    };
+
+    // A real capture: ask the host camera (front or back) for a JPEG frame.
+    if source_type == UIImagePickerControllerSourceTypeCamera {
+        let front = camera_device == UIImagePickerControllerCameraDeviceFront;
+        if let Some(jpeg) = crate::android_media::take_photo(front) {
+            // Build NSData -> UIImage -> deliver to the delegate the same way
+            // iOS does: didFinishPickingMediaWithInfo with the original image.
+            let bytes = env.mem.alloc(jpeg.len() as u32);
+            env.mem
+                .bytes_at_mut(bytes.cast(), jpeg.len() as u32)
+                .copy_from_slice(&jpeg);
+            let data: id = msg_class![env; NSData dataWithBytes:bytes length:(jpeg.len())];
+            env.mem.free(bytes.cast_void());
+            let image: id = msg_class![env; UIImage imageWithData:data];
+
+            let info: id = msg_class![env; NSMutableDictionary dictionary];
+            let key = get_static_str(env, "UIImagePickerControllerOriginalImage");
+            let _: () = msg![env; info setObject:image forKey:key];
+            let key = get_static_str(env, "UIImagePickerControllerMediaType");
+            let media_type = if media_types != nil {
+                let first: id = msg![env; media_types objectAtIndex:(0u64)];
+                first
+            } else {
+                get_static_str(env, "public.image")
+            };
+            let _: () = msg![env; info setObject:media_type forKey:key];
+
+            log!("UIImagePickerController takePicture: captured {:?} bytes from {} host camera", jpeg.len(), if front { "front" } else { "back" });
+            if delegate != nil {
+                let _: () = msg![env; delegate
+                    imagePickerController:this
+                    didFinishPickingMediaWithInfo:info
+                ];
+            }
+            return;
+        }
+        log!("UIImagePickerController takePicture: host camera capture failed");
+        if delegate != nil {
+            let _: () = msg![env; delegate imagePickerControllerDidCancel:this];
+        }
+        return;
+    }
+
     log!("UIImagePickerController takePicture: stubbed");
 }
 

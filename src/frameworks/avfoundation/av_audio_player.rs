@@ -8,11 +8,13 @@
 //!
 //! Implemented using Audio Queue Services based on [the PlayingAudio example](https://developer.apple.com/library/archive/documentation/MusicAudio/Conceptual/AudioQueueProgrammingGuide/AQPlayback/PlayingAudio.html)
 
+use std::time::Instant;
+
 use crate::dyld::HostFunction;
 use crate::frameworks::audio_toolbox::audio_file::{
-    self, kAudioFilePropertyDataFormat, kAudioFilePropertyPacketSizeUpperBound,
-    kAudioFileReadPermission, AudioFileClose, AudioFileGetProperty, AudioFileHostObject,
-    AudioFileID, AudioFileOpenURL, AudioFileReadPackets,
+    self, kAudioFileCAFType, kAudioFilePropertyDataFormat, kAudioFilePropertyPacketSizeUpperBound,
+    kAudioFileReadPermission, AudioFileClose, AudioFileCreateWithURL, AudioFileGetProperty,
+    AudioFileHostObject, AudioFileID, AudioFileOpenURL, AudioFileReadPackets, AudioFileWriteBytes,
 };
 use crate::frameworks::audio_toolbox::audio_queue::{
     kAudioQueueParam_Pan, kAudioQueueParam_Volume, AudioQueueAllocateBuffer, AudioQueueBufferRef,
@@ -26,6 +28,7 @@ use crate::frameworks::core_foundation::cf_run_loop::kCFRunLoopCommonModes;
 use crate::frameworks::foundation::ns_error::NSOSStatusErrorDomain;
 use crate::frameworks::foundation::{ns_string, NSInteger, NSTimeInterval, NSUInteger};
 use crate::mem::{guest_size_of, ConstVoidPtr, GuestUSize, MutPtr, MutVoidPtr, Ptr};
+use crate::frameworks::core_audio_types::kAudioFormatLinearPCM;
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, release, retain, Class, ClassExports, HostObject,
     NSZonePtr,
@@ -41,6 +44,15 @@ struct AVAudioRecorderHostObject {
     is_recording: bool,
     metering_enabled: bool,
     delegate: id,
+    /// Real microphone capture state (all None/zero when the host has no
+    /// mic — in that case the recorder degrades to its old silent stub).
+    audio_file_id: Option<AudioFileID>,
+    format: Option<AudioStreamBasicDescription>,
+    write_offset: u64,
+    mic_started: bool,
+    last_pump: Option<Instant>,
+    average_power: f32,
+    peak_power: f32,
 }
 impl HostObject for AVAudioRecorderHostObject {}
 
@@ -522,6 +534,13 @@ pub const CLASSES: ClassExports = objc_classes! {
         is_recording: false,
         metering_enabled: false,
         delegate: nil,
+        audio_file_id: None,
+        format: None,
+        write_offset: 0,
+        mic_started: false,
+        last_pump: None,
+        average_power: -160.0,
+        peak_power: -160.0,
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
@@ -545,53 +564,35 @@ pub const CLASSES: ClassExports = objc_classes! {
     this
 }
 
-- (bool)record {
-    log!(
-        "[(AVAudioRecorder *){:?} record] — stub, recording not \
-         supported",
-        this
-    );
-    env.objc
-        .borrow_mut::<AVAudioRecorderHostObject>(this)
-        .is_recording = true;
-    true
-}
-
 - (bool)recordForDuration:(NSTimeInterval)_duration {
     msg![env; this record]
 }
 
 - (bool)prepareToRecord {
-    log_dbg!(
-        "[(AVAudioRecorder *){:?} prepareToRecord] — stub",
-        this
-    );
+    // The real capture session (destination CAF file + host mic) is created
+    // lazily by `record`; games that call prepareToRecord first then record
+    // get the same behaviour either way.
+    log_dbg!("[(AVAudioRecorder *){:?} prepareToRecord]", this);
     true
 }
 
 - (())pause {
-    env.objc
-        .borrow_mut::<AVAudioRecorderHostObject>(this)
-        .is_recording = false;
+    recorder_stop_capture(env, this);
 }
 
 - (())stop {
-    env.objc
-        .borrow_mut::<AVAudioRecorderHostObject>(this)
-        .is_recording = false;
+    recorder_stop_capture(env, this);
 }
 
 - (bool)isRecording {
+    pump_recorder(env, this);
     env.objc
         .borrow::<AVAudioRecorderHostObject>(this)
         .is_recording
 }
 
 - (bool)deleteRecording {
-    log_dbg!(
-        "[(AVAudioRecorder *){:?} deleteRecording] — stub",
-        this
-    );
+    recorder_stop_capture(env, this);
     true
 }
 
@@ -600,11 +601,21 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (NSTimeInterval)currentTime {
-    0.0
+    pump_recorder(env, this);
+    let host = env.objc.borrow::<AVAudioRecorderHostObject>(this);
+    let bytes_per_frame = host
+        .format
+        .map(|f| (f.bytes_per_frame.max(1)) as u64)
+        .unwrap_or(2);
+    let sample_rate = host
+        .format
+        .map(|f| if f.sample_rate > 0.0 { f.sample_rate } else { 44100.0 })
+        .unwrap_or(44100.0);
+    (host.write_offset / bytes_per_frame) as f64 / sample_rate
 }
 
 - (NSTimeInterval)deviceCurrentTime {
-    0.0
+    msg![env; this currentTime]
 }
 
 - (())setMeteringEnabled:(bool)enabled {
@@ -620,18 +631,23 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())updateMeters {
-    log_dbg!(
-        "[(AVAudioRecorder *){:?} updateMeters] — stub",
-        this
-    );
+    pump_recorder(env, this);
 }
 
 - (f32)averagePowerForChannel:(NSInteger)_channel {
-    -160.0
+    pump_recorder(env, this);
+    let _ = _channel;
+    env.objc
+        .borrow::<AVAudioRecorderHostObject>(this)
+        .average_power
 }
 
 - (f32)peakPowerForChannel:(NSInteger)_channel {
-    -160.0
+    pump_recorder(env, this);
+    let _ = _channel;
+    env.objc
+        .borrow::<AVAudioRecorderHostObject>(this)
+        .peak_power
 }
 
 - (id)delegate {
@@ -655,9 +671,223 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.dealloc_object(this, &mut env.mem)
 }
 
+- (bool)record {
+    // Real microphone capture when the host provides one (Android: JNI ->
+    // AudioRecord; elsewhere: graceful degradation to the old silent stub).
+    let (url, already) = {
+        let host = env.objc.borrow::<AVAudioRecorderHostObject>(this);
+        (host.url, host.is_recording)
+    };
+    if already {
+        return true;
+    }
+    if url == nil {
+        return false;
+    }
+
+    if !crate::android_media::has_microphone() {
+        log!(
+            "[(AVAudioRecorder *){:?} record] no host microphone available; \
+             recording silence",
+            this
+        );
+
+    }
+
+    // Build the ASBD from the settings dictionary (Linear PCM only; anything
+    // else falls back to 16-bit mono at the settings' sample rate).
+    let path: id = msg![env; url path];
+    let asbd = AudioStreamBasicDescription {
+        sample_rate: 44100.0,
+        format_id: kAudioFormatLinearPCM,
+        format_flags: crate::frameworks::core_audio_types::kAudioFormatFlagIsSignedInteger
+            | crate::frameworks::core_audio_types::kAudioFormatFlagIsPacked,
+        bytes_per_packet: 2,
+        frames_per_packet: 1,
+        bytes_per_frame: 2,
+        channels_per_frame: 1,
+        bits_per_channel: 16,
+        _reserved: 0,
+    };
+    let _ = path;
+    let tmp_afi_ptr: MutPtr<AudioFileID> = env.mem.alloc(guest_size_of::<AudioFileID>()).cast();
+    let asbd_ptr = env.mem.alloc_and_write(asbd);
+    let status = AudioFileCreateWithURL(
+        env,
+        url.cast(),
+        kAudioFileCAFType,
+        asbd_ptr.cast_const(),
+        0,
+        tmp_afi_ptr,
+    );
+    env.mem.free(asbd_ptr.cast());
+    let audio_file_id = env.mem.read(tmp_afi_ptr);
+    env.mem.free(tmp_afi_ptr.cast());
+    if status != 0 {
+        log!(
+            "[(AVAudioRecorder *){:?} record] AudioFileCreateWithURL failed: {}",
+            this,
+            status
+        );
+        return false;
+    }
+
+    let mic_started = crate::android_media::start_mic();
+    if !mic_started {
+        log!(
+            "[(AVAudioRecorder *){:?} record] mic unavailable, recording silence",
+            this
+        );
+    }
+
+    {
+        let host = env.objc.borrow_mut::<AVAudioRecorderHostObject>(this);
+        host.audio_file_id = Some(audio_file_id);
+        host.format = Some(asbd);
+        host.write_offset = 0;
+        host.mic_started = mic_started;
+        host.last_pump = Some(Instant::now());
+        host.is_recording = true;
+        host.average_power = -160.0;
+        host.peak_power = -160.0;
+    }
+    log!(
+        "[(AVAudioRecorder *){:?} record] real capture {}",
+        this,
+        if mic_started { "started" } else { "(silence)" }
+    );
+    true
+}
 @end
 
 };
+
+/// Stop capture: halt the host mic stream and close the audio file.
+fn recorder_stop_capture(env: &mut Environment, this: id) {
+    let (was_recording, mic_started, file_id) = {
+        let host = env.objc.borrow::<AVAudioRecorderHostObject>(this);
+        (host.is_recording, host.mic_started, host.audio_file_id)
+    };
+    if !was_recording {
+        return;
+    }
+    if mic_started {
+        crate::android_media::stop_mic();
+    }
+    if let Some(file_id) = file_id {
+        AudioFileClose(env, file_id);
+    }
+    let host = env.objc.borrow_mut::<AVAudioRecorderHostObject>(this);
+    host.is_recording = false;
+    host.mic_started = false;
+    host.audio_file_id = None;
+    host.format = None;
+}
+
+
+/// Pump pending mic samples into the recorder's audio file. Called lazily
+/// from currentTime/updateMeters/isRecording so no background thread is
+/// needed. On platforms without a host mic this is a no-op.
+fn pump_recorder(env: &mut Environment, this: id) {
+    let (recording, file_id, format, mic_started) = {
+        let host = env.objc.borrow::<AVAudioRecorderHostObject>(this);
+        (
+            host.is_recording,
+            host.audio_file_id,
+            host.format,
+            host.mic_started,
+        )
+    };
+    if !recording {
+        return;
+    }
+    let Some(file_id) = file_id else { return };
+    let Some(format) = format else { return };
+
+    // Read one ~40ms chunk of 16-bit mono host PCM (44.1 kHz).
+    let mut samples: Vec<i16> = if mic_started {
+        crate::android_media::read_mic_chunk()
+    } else {
+        Vec::new()
+    };
+    if samples.is_empty() {
+        // Keep metering quiet and file untouched between host chunks.
+        return;
+    }
+
+    // Metering.
+    let peak = samples.iter().fold(0i16, |a, &s| a.max(s.abs()));
+    let avg = samples.iter().map(|&s| (s as f64).abs()).sum::<f64>() / samples.len() as f64;
+    let db = |v: f64| {
+        if v <= 0.0 {
+            -160.0
+        } else {
+            (20.0 * v.log10()).clamp(-160.0, 0.0) as f32
+        }
+    };
+
+    // Naive resample from 44.1 kHz to the file's sample rate.
+    let src_rate = crate::android_media::MIC_SAMPLE_RATE as f64;
+    let dst_rate = if format.sample_rate > 0.0 {
+        format.sample_rate
+    } else {
+        44100.0
+    };
+    let converted: Vec<i16> = if (src_rate - dst_rate).abs() < 1.0 {
+        samples
+    } else {
+        let out_len = ((samples.len() as f64) * dst_rate / src_rate).round() as usize;
+        (0..out_len)
+            .map(|i| {
+                let pos = i as f64 * src_rate / dst_rate;
+                let i0 = pos as usize;
+                let i1 = (i0 + 1).min(samples.len() - 1);
+                let frac = pos - i0 as f64;
+                let a = samples[i0] as f64;
+                let b = samples[i1] as f64;
+                (a + (b - a) * frac).round().clamp(-32768.0, 32767.0) as i16
+            })
+            .collect()
+    };
+
+    // Channel layout: duplicate to stereo or drop to mono as needed.
+    let bytes: Vec<u8> = match format.channels_per_frame {
+        2 => converted
+            .iter()
+            .flat_map(|&s| s.to_le_bytes())
+            .chain(converted.iter().flat_map(|&s| s.to_le_bytes()))
+            .collect(),
+        _ => converted.iter().flat_map(|&s| s.to_le_bytes()).collect(),
+    };
+
+    let bytes_ptr = env.mem.alloc(bytes.len() as u32);
+    let slice = env.mem.bytes_at_mut(bytes_ptr.cast(), bytes.len() as u32);
+    slice.copy_from_slice(&bytes);
+    let mut num_bytes: u32 = bytes.len() as u32;
+    let io_ptr = env.mem.alloc_and_write(num_bytes);
+    let write_offset = {
+        let host = env.objc.borrow::<AVAudioRecorderHostObject>(this);
+        host.write_offset as i64
+    };
+    let status = AudioFileWriteBytes(
+        env,
+        file_id,
+        false,
+        write_offset,
+        io_ptr,
+        bytes_ptr.cast_const(),
+    );
+    num_bytes = env.mem.read(io_ptr);
+    env.mem.free(io_ptr.cast());
+    env.mem.free(bytes_ptr.cast_void());
+    if status == 0 {
+        let host = env.objc.borrow_mut::<AVAudioRecorderHostObject>(this);
+        host.write_offset += num_bytes as u64;
+        host.average_power = db(avg);
+        host.peak_power = db(peak as f64);
+    }
+}
+
 
 fn derive_buffer_size(
     audio_desc: AudioStreamBasicDescription,

@@ -115,7 +115,7 @@ pub const kAudioFileWritePermission: AudioFilePermissions = 2;
 pub const kAudioFileReadWritePermission: AudioFilePermissions = 3;
 
 type AudioFileTypeID = u32;
-const kAudioFileCAFType: AudioFileTypeID = fourcc(b"caff");
+pub const kAudioFileCAFType: AudioFileTypeID = fourcc(b"caff");
 const kAUdioFileAIFFType: AudioFileTypeID = fourcc(b"AIFF");
 
 type AudioFilePropertyID = u32;

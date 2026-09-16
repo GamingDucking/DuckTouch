@@ -49,6 +49,7 @@ pub struct AudioBufferList<const COUNT: usize> {
     pub number_buffers: u32,
     pub buffers: [AudioBuffer; COUNT],
 }
+unsafe impl SafeRead for AudioBuffer {}
 unsafe impl SafeRead for AudioBufferList<1> {}
 unsafe impl SafeRead for AudioBufferList<2> {}
 
@@ -328,7 +329,6 @@ fn AudioUnitSetProperty(
                 );
             }
             kAudioOutputUnitProperty_EnableIO => {
-                // Ввод/Вывод включен по умолчанию. Игнорируем.
                 let enabled: u32 = env.mem.read::<u32, false>(in_data.cast());
                 log_dbg!(
                     "AudioUnitSetProperty(EnableIO) \
@@ -338,6 +338,20 @@ fn AudioUnitSetProperty(
                     in_element,
                     enabled
                 );
+                // Track RemoteIO input enablement (scope=Input, element=1) so
+                // AudioUnitRender can fill the guest's buffers with real mic
+                // samples from the host.
+                if in_scope == kAudioUnitScope_Input && in_element == 1 {
+                    if let Some(obj) = env
+                        .framework_state
+                        .audio_toolbox
+                        .audio_components
+                        .audio_component_instances
+                        .get_mut(&in_unit)
+                    {
+                        obj.mic_input_enabled = enabled != 0;
+                    }
+                }
             }
             kAudioUnitProperty_ElementCount => {
                 // Apple docs: kAudioUnitProperty_ElementCount (11)
@@ -836,12 +850,135 @@ fn AudioUnitRender(
     in_unit: AudioUnit,
     _f: MutPtr<u32>,
     _t: ConstVoidPtr,
-    _b: u32,
-    _n: u32,
-    _d: MutVoidPtr,
+    in_bus_number: u32,
+    in_number_frames: u32,
+    io_data: MutVoidPtr,
 ) -> OSStatus {
+    // RemoteIO input: when the guest enabled the input element (scope=Input,
+    // element=1) the io_data AudioBufferList is meant to be filled with fresh
+    // microphone samples. Fill it from the host mic (silence when the host
+    // has none), then fall through to the normal playback render path.
+    fill_mic_input(env, in_unit, in_bus_number, in_number_frames, io_data);
+
     render_audio_unit(env, in_unit);
     0
+}
+
+/// Fill the caller-provided `AudioBufferList` at `io_data` with microphone
+/// PCM, converted to the unit's input stream format. `mic_input_enabled` is
+/// tracked per instance from kAudioOutputUnitProperty_EnableIO writes.
+fn fill_mic_input(
+    env: &mut Environment,
+    audio_unit: AudioUnit,
+    bus_number: u32,
+    frames: u32,
+    io_data: MutVoidPtr,
+) {
+    if io_data.is_null() || frames == 0 {
+        return;
+    }
+    let mic_enabled = {
+        let at = &mut env.framework_state.audio_toolbox;
+        at.audio_components
+            .audio_component_instances
+            .get(&audio_unit)
+            .map(|obj| obj.mic_input_enabled)
+            .unwrap_or(false)
+    };
+    if !mic_enabled || bus_number != 1 {
+        return;
+    }
+    let stream_format = {
+        let at = &mut env.framework_state.audio_toolbox;
+        at.audio_components
+            .audio_component_instances
+            .get(&audio_unit)
+            .and_then(|obj| obj.input_stream_format)
+            .unwrap_or_else(|| {
+                at.audio_components
+                    .audio_component_instances
+                    .get(&audio_unit)
+                    .map(|obj| obj.global_stream_format)
+                    .unwrap()
+            })
+    };
+
+    // Pull a chunk of 16-bit mono host PCM and resample it to the unit's
+    // sample rate (naive linear interpolation is plenty for voice).
+    let host_rate = crate::android_media::MIC_SAMPLE_RATE as f64;
+    let dst_rate = if stream_format.sample_rate > 0.0 {
+        stream_format.sample_rate
+    } else {
+        host_rate
+    };
+    let want = ((frames as f64) * host_rate / dst_rate).ceil() as usize;
+    let src: Vec<i16> = if crate::android_media::has_microphone() {
+        let chunk = crate::android_media::read_mic_chunk();
+        if chunk.is_empty() {
+            vec![0i16; want]
+        } else if want <= chunk.len() {
+            chunk[..want].to_vec()
+        } else {
+            // Repeat the tail of the chunk (host delivers in ~20-40ms bursts;
+            // stretching by repetition keeps the pitch right).
+            let mut v = Vec::with_capacity(want);
+            while v.len() < want {
+                let take = want - v.len();
+                v.extend_from_slice(&chunk[..take.min(chunk.len())]);
+            }
+            v
+        }
+    } else {
+        vec![0i16; want]
+    };
+
+    // Convert to the requested sample format.
+    let is_float = stream_format.format_flags & crate::frameworks::core_audio_types::kAudioFormatFlagIsFloat
+        != 0;
+    let bytes_per_out = (stream_format.bits_per_channel / 8) as usize;
+    let channels = stream_format.channels_per_frame.max(1) as usize;
+    let mut out: Vec<u8> = Vec::with_capacity(frames as usize * channels * bytes_per_out);
+    for &s in &src {
+        let src_s = s as f32 / 32768.0;
+        for _ in 0..channels {
+            if is_float {
+                match bytes_per_out {
+                    4 => out.extend_from_slice(&src_s.to_le_bytes()),
+                    8 => out.extend_from_slice(&((src_s as f64).to_le_bytes())),
+                    _ => out.extend_from_slice(&s.to_le_bytes()),
+                }
+            } else {
+                match bytes_per_out {
+                    1 => out.push(((s >> 8) as u8).wrapping_add(0x80)),
+                    2 => out.extend_from_slice(&s.to_le_bytes()),
+                    4 => out.extend_from_slice(&((s as i32) << 16).to_le_bytes()),
+                    _ => out.extend_from_slice(&s.to_le_bytes()),
+                }
+            }
+        }
+    }
+
+    // Read the AudioBufferList header and fill every buffer.
+    let list = io_data.cast::<AudioBufferList<1>>();
+    let number_buffers: u32 = env.mem.read(list.cast());
+    // buffers[0] follows the u32 count (sizeof(u32) = 4 bytes).
+    let buf_ptr: MutPtr<AudioBuffer> = (list.cast::<u8>() + 4u32).cast();
+    for i in 0..number_buffers.min(2) as u64 {
+        let b: AudioBuffer = env.mem.read(buf_ptr + (i * 12) as u32);
+        if b.data.is_null() || b.data_byte_size == 0 {
+            continue;
+        }
+        let n = (b.data_byte_size as usize).min(out.len());
+        let slice = env.mem.bytes_at_mut(b.data.cast(), n as u32);
+        slice.copy_from_slice(&out[..n]);
+        // Zero the remainder rather than leaving stale guest memory.
+        if n < b.data_byte_size as usize {
+            let rest = env
+                .mem
+                .bytes_at_mut(b.data.cast::<u8>() + n as u32, (b.data_byte_size as usize - n) as u32);
+            rest.fill(0);
+        }
+    }
 }
 
 fn AudioUnitProcess(

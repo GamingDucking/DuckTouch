@@ -111,6 +111,11 @@ pub struct AudioComponentInstanceHostObject {
     // --- 3D Mixer State ---
     pub is_3d_mixer: bool,
     pub mixer_buses: HashMap<u32, MixerBusState>,
+
+    /// RemoteIO input element (element=1, scope=Input) enabled — the unit is
+    /// being used to capture microphone audio. Filled by
+    /// `AudioUnitRender` with real host-mic samples when available.
+    pub mic_input_enabled: bool,
 }
 
 impl Default for AudioComponentInstanceHostObject {
@@ -140,6 +145,7 @@ impl Default for AudioComponentInstanceHostObject {
             is_running_handler: false,
             is_3d_mixer: false,
             mixer_buses: HashMap::new(),
+            mic_input_enabled: false,
         }
     }
 }
