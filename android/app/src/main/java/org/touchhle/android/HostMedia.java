@@ -61,7 +61,7 @@ public class HostMedia {
     // ------------------------------------------------------------------
 
     private static boolean hasPermission(String permission) {
-        android.app.Activity act = MainActivity.mSingleton;
+        android.app.Activity act = MainActivity.getActivity();
         if (act == null) {
             return false;
         }
@@ -70,7 +70,7 @@ public class HostMedia {
 
     /** Request permissions and block until answered (or timeout). */
     private static boolean ensurePermissions(String[] permissions) {
-        android.app.Activity act = MainActivity.mSingleton;
+        android.app.Activity act = MainActivity.getActivity();
         if (act == null) {
             return false;
         }
@@ -118,7 +118,7 @@ public class HostMedia {
     /** Whether a camera with the given facing exists AND we can use it. */
     @SuppressLint("MissingPermission")
     public static boolean hasCamera(final boolean front) {
-        android.app.Activity act = MainActivity.mSingleton;
+        android.app.Activity act = MainActivity.getActivity();
         if (act == null) {
             return false;
         }
@@ -158,7 +158,7 @@ public class HostMedia {
      */
     @SuppressLint("MissingPermission")
     public static byte[] takePhoto(final boolean front) {
-        android.app.Activity act = MainActivity.mSingleton;
+        android.app.Activity act = MainActivity.getActivity();
         if (act == null || android.os.Build.VERSION.SDK_INT < 21) {
             return null;
         }
@@ -308,7 +308,7 @@ public class HostMedia {
 
     /** Whether the host has a usable microphone. */
     public static boolean hasMicrophone() {
-        android.app.Activity act = MainActivity.mSingleton;
+        android.app.Activity act = MainActivity.getActivity();
         if (act == null) {
             return false;
         }
@@ -333,7 +333,7 @@ public class HostMedia {
         if (micRunning) {
             return true;
         }
-        android.app.Activity act = MainActivity.mSingleton;
+        android.app.Activity act = MainActivity.getActivity();
         if (act == null) {
             return false;
         }

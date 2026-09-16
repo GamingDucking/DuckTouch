@@ -32,6 +32,12 @@ import java.io.InputStream;
 public class MainActivity extends SDLActivity {
     private static final String TAG = "touchHLE";
 
+    // Public accessor for SDLActivity's protected static mSingleton, so
+    // helper classes in this package (HostMedia) can reach the Activity.
+    public static android.app.Activity getActivity() {
+        return mSingleton;
+    }
+
     // Keeps Wi-Fi multicast packets flowing while the app runs. Without this
     // the Android Wi-Fi driver filters mDNS (224.0.0.251:5353), breaking
     // Bonjour/CFNetService local multiplayer discovery. Held for the process
