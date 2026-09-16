@@ -80,6 +80,9 @@ struct UIWebViewHostObject {
     overlay_id: i32,
     /// Load deferred until the view has an on-screen extent.
     pending_load: Option<PendingLoad>,
+    /// How many times the deferred load has been retried on a timer so
+    /// far (bounded so a view that never gets a frame can't poll forever).
+    deferred_polls: u32,
 }
 impl_HostObject_with_superclass!(UIWebViewHostObject);
 
@@ -116,6 +119,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         forward_stack: Vec::new(),
         overlay_id: -2,
         pending_load: None,
+        deferred_polls: 0,
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
@@ -218,8 +222,11 @@ pub const CLASSES: ClassExports = objc_classes! {
             "UIWebView: deferring load of {} until the view is laid out",
             url_string
         );
-        env.objc.borrow_mut::<UIWebViewHostObject>(this).pending_load =
-            Some(PendingLoad::Url(url_string));
+        {
+            let mut host_obj = env.objc.borrow_mut::<UIWebViewHostObject>(this);
+            host_obj.pending_load = Some(PendingLoad::Url(url_string));
+            host_obj.deferred_polls = 0;
+        }
         schedule_did_finish_load(env, this);
         return;
     }
@@ -247,8 +254,11 @@ pub const CLASSES: ClassExports = objc_classes! {
         }
         // The bridge is up, but the view has no on-screen extent yet.
         log!("UIWebView: deferring HTML load until the view is laid out");
-        env.objc.borrow_mut::<UIWebViewHostObject>(this).pending_load =
-            Some(PendingLoad::Data(html_str, "text/html".to_string()));
+        {
+            let mut host_obj = env.objc.borrow_mut::<UIWebViewHostObject>(this);
+            host_obj.pending_load = Some(PendingLoad::Data(html_str, "text/html".to_string()));
+            host_obj.deferred_polls = 0;
+        }
         schedule_did_finish_load(env, this);
         return;
     }
@@ -295,11 +305,12 @@ pub const CLASSES: ClassExports = objc_classes! {
             return;
         }
         // The bridge is up, but the view has no on-screen extent yet.
-        log!(
-            "UIWebView: deferring data load until the view is laid out"
-        );
-        env.objc.borrow_mut::<UIWebViewHostObject>(this).pending_load =
-            Some(PendingLoad::Data(payload, mime_str));
+        log!("UIWebView: deferring data load until the view is laid out");
+        {
+            let mut host_obj = env.objc.borrow_mut::<UIWebViewHostObject>(this);
+            host_obj.pending_load = Some(PendingLoad::Data(payload, mime_str));
+            host_obj.deferred_polls = 0;
+        }
         schedule_did_finish_load(env, this);
         return;
     }
@@ -669,9 +680,38 @@ pub const CLASSES: ClassExports = objc_classes! {
 // Called by an NSTimer scheduled in loadRequest:/loadHTMLString:/loadData:.
 // The timer argument is the (retained) NSTimer; we release our retain of
 // `this` here to keep refcounts balanced.
+//
+// A deferred load normally retries from -setFrame:, but a view that was
+// sized via initWithFrame: and never re-laid-out never receives -setFrame:
+// again — so this handler doubles as a poll: while a load stays deferred,
+// keep retrying on a timer until the overlay can be shown (or we give up
+// and simply report the load as finished).
 - (())touchhleWebViewLoadDidFinish:(id)_timer {
     env.objc.borrow_mut::<UIWebViewHostObject>(this).loading = false;
-    fire_did_finish_load(env, this);
+    let mut poll_again = false;
+    if env.objc.borrow::<UIWebViewHostObject>(this).pending_load.is_some() {
+        retry_pending_load(env, this);
+        if env.objc.borrow::<UIWebViewHostObject>(this).pending_load.is_some() {
+            let mut host_obj = env.objc.borrow_mut::<UIWebViewHostObject>(this);
+            host_obj.deferred_polls += 1;
+            if host_obj.deferred_polls < 100 {
+                poll_again = true;
+            } else {
+                log!(
+                    "UIWebView: giving up on deferred load (view never got a frame)"
+                );
+                host_obj.pending_load = None;
+            }
+        }
+    }
+    if poll_again {
+        // Schedule_did_finish_load re-retains `this`, balancing the
+        // release below; the delegate's webViewDidFinishLoad: fires only
+        // once, after the overlay is really up (or on give-up).
+        schedule_did_finish_load(env, this);
+    } else {
+        fire_did_finish_load(env, this);
+    }
     release(env, this);
 }
 
