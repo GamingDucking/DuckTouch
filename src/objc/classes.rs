@@ -1308,97 +1308,33 @@ pub fn object_getClass(env: &mut crate::Environment, obj: id) -> Class {
     objc_obj.isa
 }
 
-pub fn objc_retainAutoreleasedReturnValue(
-    env: &mut crate::Environment,
-    name: ConstPtr<u8>,
-) -> Class {
-    if name.is_null() {
-        return nil;
-    }
-
-    let name_str = match env.mem.cstr_at_utf8(name) {
-        Ok(s) => s.to_string(),
-        Err(_) => return nil,
-    };
-    if let Some(class) = env.objc.get_class(&name_str, false, &env.mem) {
-        return class;
-    }
-
-    if ObjC::find_template(&name_str).is_some() {
-        return env.objc.link_class(&name_str, false, &mut env.mem);
-    }
-
-    nil
+/// ARC return-value helpers use the ordinary retain/autorelease fallback.
+/// We do not implement the caller/callee optimisation that elides the pair.
+/// Their argument is an object, not a C string naming an Objective-C class.
+pub fn objc_retainAutoreleasedReturnValue(env: &mut crate::Environment, obj: id) -> id {
+    crate::objc::retain(env, obj)
 }
 
-pub fn objc_autoreleaseReturnValue(env: &mut crate::Environment, name: ConstPtr<u8>) -> Class {
-    if name.is_null() {
-        return nil;
-    }
-
-    let name_str = match env.mem.cstr_at_utf8(name) {
-        Ok(s) => s.to_string(),
-        Err(_) => return nil,
-    };
-    if let Some(class) = env.objc.get_class(&name_str, false, &env.mem) {
-        return class;
-    }
-
-    if ObjC::find_template(&name_str).is_some() {
-        return env.objc.link_class(&name_str, false, &mut env.mem);
-    }
-
-    nil
+pub fn objc_autoreleaseReturnValue(env: &mut crate::Environment, obj: id) -> id {
+    crate::objc::autorelease(env, obj)
 }
 
-pub fn objc_retainAutoreleaseReturnValue(
-    env: &mut crate::Environment,
-    name: ConstPtr<u8>,
-) -> Class {
-    if name.is_null() {
-        return nil;
-    }
-
-    let name_str = match env.mem.cstr_at_utf8(name) {
-        Ok(s) => s.to_string(),
-        Err(_) => return nil,
-    };
-    if let Some(class) = env.objc.get_class(&name_str, false, &env.mem) {
-        return class;
-    }
-
-    if ObjC::find_template(&name_str).is_some() {
-        return env.objc.link_class(&name_str, false, &mut env.mem);
-    }
-
-    nil
+pub fn objc_retainAutoreleaseReturnValue(env: &mut crate::Environment, obj: id) -> id {
+    objc_retainAutorelease(env, obj)
 }
 
-pub fn objc_autoreleasePoolPush(env: &mut crate::Environment, name: ConstPtr<u8>) -> Class {
-    if name.is_null() {
-        return nil;
-    }
-
-    let name_str = match env.mem.cstr_at_utf8(name) {
-        Ok(s) => s.to_string(),
-        Err(_) => return nil,
-    };
-    if let Some(class) = env.objc.get_class(&name_str, false, &env.mem) {
-        return class;
-    }
-
-    if ObjC::find_template(&name_str).is_some() {
-        return env.objc.link_class(&name_str, false, &mut env.mem);
-    }
-
-    nil
+/// The opaque token is a retained NSAutoreleasePool. Its implementation
+/// already tracks nested pools per guest thread and drains inner pools first.
+pub fn objc_autoreleasePoolPush(env: &mut crate::Environment) -> MutVoidPtr {
+    let pool: id = crate::objc::msg_class![env; NSAutoreleasePool new];
+    pool.cast_void()
 }
 
-pub fn objc_autoreleasePoolPop(_env: &mut crate::Environment, _context: MutVoidPtr) {
-    // touchHLE manages autorelease pools through NSAutoreleasePool objects, so
-    // the matching `objc_autoreleasePoolPush` is a no-op stub that returns
-    // nil, and there is nothing to drain here. iPhone OS 2.x/3.x apps target
-    // this path very rarely (it's primarily used by ARC).
+pub fn objc_autoreleasePoolPop(env: &mut crate::Environment, context: MutVoidPtr) {
+    if !context.is_null() {
+        let pool: id = context.cast();
+        let (): () = crate::objc::msg![env; pool drain];
+    }
 }
 
 pub fn class_getSuperclass(env: &mut crate::Environment, cls: Class) -> Class {
