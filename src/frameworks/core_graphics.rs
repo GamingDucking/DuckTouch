@@ -69,3 +69,5 @@ pub struct State {
 pub type CGFloat = f32;
 
 pub use cg_geometry::{CGPoint, CGRect, CGSize};
+
+mod path_geometry;

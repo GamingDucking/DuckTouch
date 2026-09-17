@@ -40,6 +40,45 @@ pub const UITouchPhaseEnded: UITouchPhase = 3;
 #[derive(Default)]
 pub struct State {
     pub current_touches: HashMap<FingerId, id>,
+    cancelled_by_gesture: HashSet<id>,
+}
+
+/// Cancel view delivery once a recognizer begins, while continuing to feed
+/// the recognizer itself with movement/end events from these touches.
+pub(super) fn cancel_for_gesture(env: &mut Environment, touches: &[id]) {
+    let mut groups: HashMap<id, Vec<id>> = HashMap::new();
+    for &touch in touches {
+        if !env.framework_state.uikit.ui_touch.cancelled_by_gesture.insert(touch) { continue; }
+        let view: id = msg![env; touch view];
+        if view != nil { groups.entry(view).or_default().push(touch); }
+    }
+    for (view, touches) in groups {
+        let set: id = msg_class![env; NSMutableSet new];
+        let mut phases = Vec::new();
+        for touch in touches {
+            () = msg![env; set addObject:touch];
+            let old_phase = touch_ivars(env, touch, |v| { let old = v.phase; v.phase = 4; old });
+            phases.push((touch, old_phase));
+        }
+        let event = ui_event::new_event(env, set);
+        () = msg![env; view touchesCancelled:set withEvent:event];
+        for (touch, phase) in phases { touch_ivars(env, touch, |v| v.phase = phase); }
+        release(env, event);
+        release(env, set);
+    }
+}
+
+fn touches_for_view_delivery(env: &mut Environment, touches: id) -> id {
+    let filtered: id = msg_class![env; NSMutableSet new];
+    let array: id = msg![env; touches allObjects];
+    let count: NSUInteger = msg![env; array count];
+    for i in 0..count {
+        let touch: id = msg![env; array objectAtIndex:i];
+        if !env.framework_state.uikit.ui_touch.cancelled_by_gesture.contains(&touch) {
+            () = msg![env; filtered addObject:touch];
+        }
+    }
+    filtered
 }
 
 /// Guest-memory ivars for `UITouch`.
@@ -880,10 +919,14 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     let event = ui_event::new_event(env, all_touches_set);
     autorelease(env, event);
     for (view, v_set) in view_touches {
-        let _: () = msg![env;
-            view touchesMoved:v_set withEvent:event];
         super::ui_gesture_recognizer::touches_moved(env, view, v_set);
-        touchhle_send_cocos_touch_aliases_to_chain(env, view, "moved", v_set, event);
+        let deliver = touches_for_view_delivery(env, v_set);
+        let count: NSUInteger = msg![env; deliver count];
+        if count != 0 {
+            let _: () = msg![env; view touchesMoved:deliver withEvent:event];
+            touchhle_send_cocos_touch_aliases_to_chain(env, view, "moved", deliver, event);
+        }
+        release(env, deliver);
     }
     release(env, pool);
 }
@@ -1035,10 +1078,14 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     let event = ui_event::new_event(env, all_touches_set);
     autorelease(env, event);
     for (view, v_set) in view_touches {
-        let _: () = msg![env;
-            view touchesEnded:v_set withEvent:event];
         super::ui_gesture_recognizer::touches_ended(env, view, v_set);
-        touchhle_send_cocos_touch_aliases_to_chain(env, view, "ended", v_set, event);
+        let deliver = touches_for_view_delivery(env, v_set);
+        let count: NSUInteger = msg![env; deliver count];
+        if count != 0 {
+            let _: () = msg![env; view touchesEnded:deliver withEvent:event];
+            touchhle_send_cocos_touch_aliases_to_chain(env, view, "ended", deliver, event);
+        }
+        release(env, deliver);
     }
 
     // Now that all touchesEnded: callbacks have returned, remove the touches
@@ -1047,6 +1094,7 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     // addObject:, which retains), so they remain alive until those sets are
     // released when the autorelease pool drains.
     for (finger_id, touch) in touches_to_remove {
+        env.framework_state.uikit.ui_touch.cancelled_by_gesture.remove(&touch);
         if let Some(current_touch) = env
             .framework_state
             .uikit

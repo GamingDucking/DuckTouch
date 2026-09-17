@@ -5,9 +5,11 @@
  */
 //! `UIGestureRecognizer` and the tap/swipe recognizers available in iOS 3.2.
 
-use crate::frameworks::core_graphics::CGPoint;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+use crate::frameworks::core_graphics::{CGPoint, CGFloat};
 use crate::frameworks::foundation::{NSInteger, NSUInteger};
-use crate::objc::{id, msg, msg_send, nil, objc_classes, ClassExports, HostObject, NSZonePtr, SEL};
+use crate::objc::{id, msg, msg_class, msg_send, nil, release, retain, objc_classes, ClassExports, HostObject, NSZonePtr, SEL};
 use crate::Environment;
 
 pub type UIGestureRecognizerState = NSInteger;
@@ -26,6 +28,7 @@ enum GestureKind {
     Generic,
     Tap,
     Swipe,
+    LongPress,
 }
 
 pub(super) struct UIGestureRecognizerHostObject {
@@ -46,6 +49,13 @@ pub(super) struct UIGestureRecognizerHostObject {
     initial_location: CGPoint,
     current_location: CGPoint,
     tracking: bool,
+    minimum_press_duration: f64,
+    allowable_movement: CGFloat,
+    press_timer: id,
+    completed_taps: NSUInteger,
+    previous_tap: Option<(Instant, CGPoint)>,
+    press_started: Option<Instant>,
+    active_touches: HashMap<id, (CGPoint, CGPoint)>,
 }
 impl HostObject for UIGestureRecognizerHostObject {}
 
@@ -62,12 +72,19 @@ impl UIGestureRecognizerHostObject {
             cancels_touches_in_view: true,
             delays_touches_began: false,
             delays_touches_ended: true,
-            number_of_taps_required: 1,
+            number_of_taps_required: if kind == GestureKind::LongPress { 0 } else { 1 },
             number_of_touches_required: 1,
             direction: UISwipeGestureRecognizerDirectionRight,
             initial_location: CGPoint { x: 0.0, y: 0.0 },
             current_location: CGPoint { x: 0.0, y: 0.0 },
             tracking: false,
+            minimum_press_duration: 0.5,
+            allowable_movement: 10.0,
+            press_timer: nil,
+            completed_taps: 0,
+            previous_tap: None,
+            press_started: None,
+            active_touches: HashMap::new(),
         }
     }
 }
@@ -81,7 +98,7 @@ impl Default for UIGestureRecognizerHostObject {
 fn init_with_target(env: &mut Environment, this: id, target: id, action: SEL) -> id {
     let recognizer = env.objc.borrow_mut::<UIGestureRecognizerHostObject>(this);
     recognizer.target = target;
-    recognizer.action = Some(action);
+    recognizer.action = if action.is_null() { None } else { Some(action) };
     this
 }
 
@@ -136,13 +153,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (id)view { env.objc.borrow::<UIGestureRecognizerHostObject>(this).view }
 - (())setView:(id)view {
-    env.objc.borrow_mut::<UIGestureRecognizerHostObject>(this).view = view;
+    set_view(env, this, view);
 }
 - (UIGestureRecognizerState)state {
     env.objc.borrow::<UIGestureRecognizerHostObject>(this).state
 }
 - (bool)isEnabled { env.objc.borrow::<UIGestureRecognizerHostObject>(this).enabled }
 - (())setEnabled:(bool)enabled {
+    if !enabled { cancel_long_press(env, this); }
     let host = env.objc.borrow_mut::<UIGestureRecognizerHostObject>(this);
     host.enabled = enabled;
     host.tracking = false;
@@ -178,6 +196,44 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 }
 
+@end
+
+@implementation UILongPressGestureRecognizer: UIGestureRecognizer
++ (id)allocWithZone:(NSZonePtr)_zone {
+    let host = UIGestureRecognizerHostObject::new(GestureKind::LongPress);
+    env.objc.alloc_object(this, Box::new(host), &mut env.mem)
+}
+- (f64)minimumPressDuration { env.objc.borrow::<UIGestureRecognizerHostObject>(this).minimum_press_duration }
+- (())setMinimumPressDuration:(f64)value {
+    if value.is_finite() && value >= 0.0 {
+        env.objc.borrow_mut::<UIGestureRecognizerHostObject>(this).minimum_press_duration = value;
+    }
+}
+- (CGFloat)allowableMovement { env.objc.borrow::<UIGestureRecognizerHostObject>(this).allowable_movement }
+- (())setAllowableMovement:(CGFloat)value {
+    if value.is_finite() && value >= 0.0 {
+        env.objc.borrow_mut::<UIGestureRecognizerHostObject>(this).allowable_movement = value;
+    }
+}
+- (NSUInteger)numberOfTapsRequired { env.objc.borrow::<UIGestureRecognizerHostObject>(this).number_of_taps_required }
+- (())setNumberOfTapsRequired:(NSUInteger)value {
+    cancel_long_press(env, this);
+    env.objc.borrow_mut::<UIGestureRecognizerHostObject>(this).number_of_taps_required = value;
+}
+- (NSUInteger)numberOfTouchesRequired { env.objc.borrow::<UIGestureRecognizerHostObject>(this).number_of_touches_required }
+- (())setNumberOfTouchesRequired:(NSUInteger)value {
+    cancel_long_press(env, this);
+    env.objc.borrow_mut::<UIGestureRecognizerHostObject>(this).number_of_touches_required = value.max(1);
+}
+- (())_touchHLE_longPressTimer:(id)timer { long_press_timer(env, this, timer); }
+- (())reset {
+    cancel_long_press(env, this);
+    env.objc.borrow_mut::<UIGestureRecognizerHostObject>(this).state = UIGestureRecognizerStatePossible;
+}
+- (())dealloc {
+    stop_press_timer(env, this);
+    env.objc.dealloc_object(this, &mut env.mem)
+}
 @end
 
 @implementation UIPanGestureRecognizer: UIGestureRecognizer
@@ -237,9 +293,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 };
 
 pub(super) fn set_view(env: &mut Environment, recognizer: id, view: id) {
+    retain(env, recognizer);
+    if env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer).view != view {
+        cancel_long_press(env, recognizer);
+    }
     env.objc
         .borrow_mut::<UIGestureRecognizerHostObject>(recognizer)
         .view = view;
+    release(env, recognizer);
 }
 
 fn delegate_allows_touch(env: &mut Environment, recognizer: id, touch: id) -> bool {
@@ -289,8 +350,13 @@ pub(super) fn touches_began(env: &mut Environment, view: id, touches: id) {
     if touch == nil {
         return;
     }
-    let recognizers = super::ui_view::gesture_recognizers(env, view);
-    for recognizer in recognizers {
+    let recognizers = recognizers_in_chain(env, view);
+    for &recognizer in &recognizers { retain(env, recognizer); }
+    for &recognizer in &recognizers {
+        if env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer).kind == GestureKind::LongPress {
+            long_press_touches(env, recognizer, touches, 0);
+            continue;
+        }
         let (enabled, recognizer_view) = {
             let host = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer);
             (host.enabled, host.view)
@@ -307,6 +373,7 @@ pub(super) fn touches_began(env: &mut Environment, view: id, touches: id) {
         host.state = UIGestureRecognizerStatePossible;
         host.tracking = true;
     }
+    for recognizer in recognizers { release(env, recognizer); }
 }
 
 pub(super) fn touches_moved(env: &mut Environment, view: id, touches: id) {
@@ -317,8 +384,13 @@ pub(super) fn touches_moved(env: &mut Environment, view: id, touches: id) {
     if touch == nil {
         return;
     }
-    let recognizers = super::ui_view::gesture_recognizers(env, view);
-    for recognizer in recognizers {
+    let recognizers = recognizers_in_chain(env, view);
+    for &recognizer in &recognizers { retain(env, recognizer); }
+    for &recognizer in &recognizers {
+        if env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer).kind == GestureKind::LongPress {
+            long_press_touches(env, recognizer, touches, 1);
+            continue;
+        }
         let (tracking, recognizer_view) = {
             let host = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer);
             (host.tracking, host.view)
@@ -330,6 +402,7 @@ pub(super) fn touches_moved(env: &mut Environment, view: id, touches: id) {
                 .current_location = location;
         }
     }
+    for recognizer in recognizers { release(env, recognizer); }
 }
 
 pub(super) fn touches_ended(env: &mut Environment, view: id, touches: id) {
@@ -340,8 +413,13 @@ pub(super) fn touches_ended(env: &mut Environment, view: id, touches: id) {
     if touch == nil {
         return;
     }
-    let recognizers = super::ui_view::gesture_recognizers(env, view);
-    for recognizer in recognizers {
+    let recognizers = recognizers_in_chain(env, view);
+    for &recognizer in &recognizers { retain(env, recognizer); }
+    for &recognizer in &recognizers {
+        if env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer).kind == GestureKind::LongPress {
+            long_press_touches(env, recognizer, touches, 2);
+            continue;
+        }
         let (tracking, recognizer_view) = {
             let host = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer);
             (host.tracking, host.view)
@@ -390,7 +468,7 @@ pub(super) fn touches_ended(env: &mut Environment, view: id, touches: id) {
                         && cross_distance <= distance
                         && host.direction & direction != 0
                 }
-                GestureKind::Generic => false,
+                GestureKind::Generic | GestureKind::LongPress => false,
             }
         };
 
@@ -404,5 +482,156 @@ pub(super) fn touches_ended(env: &mut Environment, view: id, touches: id) {
                 .borrow_mut::<UIGestureRecognizerHostObject>(recognizer)
                 .state = UIGestureRecognizerStateFailed;
         }
+    }
+    for recognizer in recognizers { release(env, recognizer); }
+}
+
+// A recognizer on a container observes touches hitting any descendant.
+fn recognizers_in_chain(env: &mut Environment, mut view: id) -> Vec<id> {
+    let mut result = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    while view != nil && seen.insert(view) {
+        for r in super::ui_view::gesture_recognizers(env, view) {
+            if !result.contains(&r) { result.push(r); }
+        }
+        view = msg![env; view superview];
+    }
+    result
+}
+
+fn stop_press_timer(env: &mut Environment, recognizer: id) {
+    let timer = std::mem::replace(&mut env.objc.borrow_mut::<UIGestureRecognizerHostObject>(recognizer).press_timer, nil);
+    if timer != nil {
+        () = msg![env; timer invalidate];
+        release(env, timer);
+    }
+}
+
+fn cancel_long_press(env: &mut Environment, recognizer: id) {
+    let h = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer);
+    if h.kind != GestureKind::LongPress { return; }
+    retain(env, recognizer);
+    stop_press_timer(env, recognizer);
+    let h = env.objc.borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
+    let active = matches!(h.state, 1 | 2);
+    h.state = if active { 4 } else { UIGestureRecognizerStateFailed };
+    h.active_touches.clear();
+    h.completed_taps = 0;
+    h.previous_tap = None;
+    h.press_started = None;
+    h.tracking = false;
+    if active { send_action(env, recognizer); }
+    release(env, recognizer);
+}
+
+fn movement_allowed(a: CGPoint, b: CGPoint, limit: CGFloat) -> bool {
+    let dx = a.x - b.x;
+    let dy = a.y - b.y;
+    dx * dx + dy * dy <= limit * limit
+}
+
+fn long_press_timer(env: &mut Environment, recognizer: id, timer: id) {
+    let h = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer);
+    if h.press_timer != timer { return; }
+    let ready = h.enabled && h.view != nil && h.tracking && h.state == 0
+        && h.active_touches.len() == h.number_of_touches_required as usize;
+    stop_press_timer(env, recognizer);
+    if !ready || !delegate_allows_begin(env, recognizer) {
+        env.objc.borrow_mut::<UIGestureRecognizerHostObject>(recognizer).state = UIGestureRecognizerStateFailed;
+        return;
+    }
+    // Delegate code may have detached or disabled the recognizer.
+    let h = env.objc.borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
+    if !h.enabled || h.view == nil || !h.tracking { return; }
+    h.state = 1; // Began, while the finger is still down, not at release.
+    h.completed_taps = 0;
+    h.previous_tap = None;
+    let cancel = h.cancels_touches_in_view;
+    let touches: Vec<id> = h.active_touches.keys().copied().collect();
+    if cancel { super::ui_touch::cancel_for_gesture(env, &touches); }
+    send_action(env, recognizer);
+}
+
+fn long_press_touches(env: &mut Environment, recognizer: id, touches: id, phase: u8) {
+    retain(env, recognizer);
+    long_press_touches_inner(env, recognizer, touches, phase);
+    release(env, recognizer);
+}
+
+fn long_press_touches_inner(env: &mut Environment, recognizer: id, touches: id, phase: u8) {
+    let h = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer);
+    if !h.enabled { return; }
+    let view = h.view;
+    let array: id = msg![env; touches allObjects];
+    let count: NSUInteger = msg![env; array count];
+    let mut failed = false;
+    for i in 0..count {
+        let touch: id = msg![env; array objectAtIndex:i];
+        if phase == 0 && !delegate_allows_touch(env, recognizer, touch) { continue; }
+        let point: CGPoint = msg![env; touch locationInView:view];
+        let h = env.objc.borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
+        if phase == 0 {
+            if h.active_touches.is_empty() {
+                let follows_tap = h.previous_tap.map(|(when, at)|
+                    when.elapsed() <= Duration::from_millis(300) && movement_allowed(at, point, h.allowable_movement)
+                ).unwrap_or(false);
+                if !follows_tap { h.completed_taps = 0; }
+                h.press_started = Some(Instant::now());
+                h.state = 0;
+                h.tracking = true;
+            }
+            h.active_touches.insert(touch, (point, point));
+        } else if let Some((start, current)) = h.active_touches.get_mut(&touch) {
+            *current = point;
+            // Once recognised, motion reports Changed rather than failing.
+            if h.state == 0 && !movement_allowed(*start, point, h.allowable_movement) { failed = true; }
+        }
+        if phase == 2 { h.active_touches.remove(&touch); }
+    }
+    let h = env.objc.borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
+    let n = h.active_touches.len();
+    if n > 0 {
+        let (x, y) = h.active_touches.values().fold((0.0, 0.0), |(x, y), (_, p)| (x + p.x, y + p.y));
+        h.current_location = CGPoint { x: x / n as f32, y: y / n as f32 };
+    }
+    if n > h.number_of_touches_required as usize { failed = true; }
+    let active = matches!(h.state, 1 | 2);
+    if failed {
+        cancel_long_press(env, recognizer);
+    } else if phase == 2 && n < h.number_of_touches_required as usize {
+        if !active && h.tracking && h.number_of_taps_required > 0
+            && h.press_started.map(|at| at.elapsed() <= Duration::from_millis(300)).unwrap_or(false) {
+            h.completed_taps = (h.completed_taps + 1).min(h.number_of_taps_required);
+            h.previous_tap = Some((Instant::now(), h.current_location));
+        }
+        h.tracking = false;
+        h.state = if active { 3 } else { 5 };
+        stop_press_timer(env, recognizer);
+        if active { send_action(env, recognizer); }
+    } else if active && phase == 1 {
+        h.state = 2; // Changed
+        send_action(env, recognizer);
+    } else if h.state == 0 && h.tracking && h.press_timer == nil && n == h.number_of_touches_required as usize
+        && h.completed_taps == h.number_of_taps_required {
+        let duration = h.minimum_press_duration;
+        let selector = env.objc.lookup_selector("_touchHLE_longPressTimer:").unwrap();
+        let timer: id = msg_class![env; NSTimer scheduledTimerWithTimeInterval:duration target:recognizer selector:selector userInfo:nil repeats:false];
+        retain(env, timer);
+        env.objc.borrow_mut::<UIGestureRecognizerHostObject>(recognizer).press_timer = timer;
+    }
+}
+
+#[cfg(test)]
+mod long_press_tests {
+    use super::*;
+    #[test]
+    fn defaults_and_motion_threshold() {
+        let h = UIGestureRecognizerHostObject::new(GestureKind::LongPress);
+        assert_eq!(h.minimum_press_duration, 0.5);
+        assert_eq!(h.number_of_taps_required, 0);
+        assert_eq!(h.number_of_touches_required, 1);
+        assert!(h.press_timer == nil);
+        assert!(movement_allowed(CGPoint { x: 0.0, y: 0.0 }, CGPoint { x: 6.0, y: 8.0 }, h.allowable_movement));
+        assert!(!movement_allowed(CGPoint { x: 0.0, y: 0.0 }, CGPoint { x: 6.0, y: 8.1 }, h.allowable_movement));
     }
 }

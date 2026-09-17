@@ -106,7 +106,7 @@ pub fn CGBitmapContextCreate(
         font: crate::mem::Ptr::null(),
         font_size: 17.0,
         state_stack: Vec::new(),
-        path_points: Vec::new(),
+        path_elements: Vec::new(),
         // Apple defaults: rendering intent unspecified = `kCGRenderingIntentDefault` (0).
         rendering_intent: 0,
         shadow: crate::frameworks::core_graphics::cg_context::CGShadowState::default(),

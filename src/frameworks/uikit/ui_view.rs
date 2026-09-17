@@ -1218,9 +1218,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         env.objc.borrow::<UIViewHostObject>(this).gesture_recognizers.clone();
     for r in &old {
         // Clear the recognizer's view back-pointer before releasing.
-        env.objc
-            .borrow_mut::<crate::frameworks::uikit::ui_gesture_recognizer::UIGestureRecognizerHostObject>(*r)
-            .view = nil;
+        super::ui_gesture_recognizer::set_view(env, *r, nil);
     }
     for r in old { release(env, r); }
     let mut new_list: Vec<id> = Vec::new();
@@ -1233,9 +1231,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     env.objc.borrow_mut::<UIViewHostObject>(this).gesture_recognizers = new_list.clone();
     for r in &new_list {
-        env.objc
-            .borrow_mut::<crate::frameworks::uikit::ui_gesture_recognizer::UIGestureRecognizerHostObject>(*r)
-            .view = this;
+        super::ui_gesture_recognizer::set_view(env, *r, this);
     }
 }
 

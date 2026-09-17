@@ -288,6 +288,20 @@ pub const CLASSES: ClassExports = objc_classes! {
     });
 }
 
+- (())touchesCancelled:(id)touches withEvent:(id)event {
+    let tracked = env.objc.borrow::<UIControlHostObject>(this).tracked_touch;
+    if tracked == nil { return; }
+    let contains: bool = msg![env; touches containsObject:tracked];
+    if !contains { return; }
+    let host = env.objc.borrow_mut::<UIControlHostObject>(this);
+    host.tracked_touch = nil;
+    host.tracking = false;
+    () = msg![env; this cancelTrackingWithEvent:event];
+    () = msg![env; this setHighlighted:false];
+    send_actions(env, this, event, UIControlEventTouchCancel);
+    release(env, tracked);
+}
+
 - (())addTarget:(id)target
          action:(SEL)action
 forControlEvents:(UIControlEvents)events {

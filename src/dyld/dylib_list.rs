@@ -165,7 +165,7 @@ pub const AD_SUPPORT: super::HostDylib = super::HostDylib {
 pub const CORE_IMAGE: super::HostDylib = super::HostDylib {
     path: "/System/Library/Frameworks/CoreImage.framework/CoreImage",
     aliases: &[],
-    class_exports: &[frameworks::core_image::CLASSES],
+    class_exports: &[frameworks::core_image::CLASSES, frameworks::core_image::pipeline::CLASSES],
     constant_exports: &[frameworks::core_image::CONSTANTS],
     function_exports: &[frameworks::core_image::FUNCTIONS],
 };
