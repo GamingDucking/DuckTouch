@@ -1897,15 +1897,31 @@ unsafe fn present_renderbuffer(env: &mut Environment, renderbuffer: GLuint, draw
     // way Mali never has a reason to discard the tile data: the same
     // FBO that the draws went into is the FBO we're now reading from.
     //
-    // The standard iPhone EAGL pattern guarantees old_framebuffer != 0
-    // at this point (the app must bind its own FBO before drawing into
-    // a renderbuffer-attached attachment, since FBO 0 has no such
-    // attachment). Out of paranoia we still keep a fallback for
-    // old_framebuffer == 0 that creates a temporary FBO and attaches
-    // the renderbuffer to it — this matches the pre-fix behaviour and
-    // lets weird non-iOS-pattern apps still present *something*.
+    // The standard iPhone EAGL pattern guarantees that the app's FBO has
+    // the drawable attached at COLOR_ATTACHMENT0. Verify that assumption
+    // instead of treating every non-zero FBO as a valid source: some engines
+    // bind a temporary depth/post-processing FBO immediately before present.
+    // Out of paranoia we keep a fallback that creates a temporary FBO and
+    // attaches the renderbuffer when no suitable app FBO is bound.
+    let (attached_renderbuffer, framebuffer_status) = if old_framebuffer != 0 {
+        let mut attached = 0;
+        gles.GetFramebufferAttachmentParameterivOES(
+            gles11::FRAMEBUFFER_OES,
+            gles11::COLOR_ATTACHMENT0_OES,
+            gles11::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME_OES,
+            &mut attached,
+        );
+        (
+            attached as GLuint,
+            gles.CheckFramebufferStatusOES(gles11::FRAMEBUFFER_OES),
+        )
+    } else {
+        (0, gles11::FRAMEBUFFER_COMPLETE_OES)
+    };
+    let used_app_fbo = old_framebuffer != 0
+        && attached_renderbuffer == renderbuffer
+        && framebuffer_status == gles11::FRAMEBUFFER_COMPLETE_OES;
     let mut src_framebuffer: GLuint = 0;
-    let used_app_fbo = old_framebuffer != 0;
     if !used_app_fbo {
         gles.GenFramebuffersOES(1, &mut src_framebuffer);
         gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, src_framebuffer);

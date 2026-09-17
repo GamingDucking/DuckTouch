@@ -1767,10 +1767,35 @@ pub fn create_gles1_ctx_no_parent_stack(
     let using_angle = std::env::var("SDL_VIDEO_EGL_DRIVER")
         .map(|driver| driver.contains("angle"))
         .unwrap_or(false);
+    // Qualcomm's native Adreno ES 1.1 implementation is the one backend
+    // where a context can be created successfully, accept every fixed-function
+    // call, and still produce an all-black frame for a subset of old iPhone
+    // games. Keep native GLES1 as the first choice everywhere else (including
+    // ANGLE), but on a detected *native* Adreno stack prefer the GLES1-on-ES2
+    // translator. It implements the same fixed-function GLES1 API, while
+    // avoiding the vendor's broken ES 1.1 front-end. Native GLES1 remains the
+    // explicit escape hatch via --gles1=gles1_native or TOUCHHLE_FORCE_GLES1.
+    let adreno_fallback = [
+        GLESImplementation::GLES1OnGLES2,
+        GLESImplementation::GLES1Native,
+        GLESImplementation::GLES1OnGL2,
+    ];
+    let auto_adreno_translator = !using_angle
+        && options.gles1_implementation.is_none()
+        && std::env::var_os("TOUCHHLE_GLES1_NATIVE").is_none()
+        && window.is_native_adreno_backend();
     let list: &[GLESImplementation] = match forced {
         Some(_) => &forced_list[..],
         None => match options.gles1_implementation {
             Some(ref preference) => std::slice::from_ref(preference),
+            None if auto_adreno_translator => {
+                log!(
+                    "Native Adreno ES 1.1 detected; trying GLES1-on-GLES2 translator first \
+                     to avoid game-specific black frames (set TOUCHHLE_GLES1_NATIVE=1 \
+                     or use --gles1=gles1_native to force native GLES1)."
+                );
+                &adreno_fallback
+            }
             None if using_angle => &[
                 GLESImplementation::GLES1Native,
                 GLESImplementation::GLES1OnGL2,
