@@ -11,18 +11,13 @@
 //! They are documented in the
 //! [Blocks ABI](https://clang.llvm.org/docs/Block-ABI-Apple.html#imported-variables-1).
 //!
-//! For touchHLE we provide working implementations of `_Block_copy`,
-//! `_Block_release`, and `_Block_object_assign` / `_Block_object_dispose`
-//! that perform the appropriate ARC retains/releases. Block copying itself
-//! is not implemented — a captured-block "copy" returns the same pointer
-//! (matching how _global_ blocks behave on iOS) — but the bookkeeping for
-//! captured ObjC objects is correct, so games that simply use blocks as
-//! callbacks (e.g. `MFMailComposeViewController` completion handlers,
-//! `dispatch_async`) link and run.
+//! Stack blocks and byref captures are promoted to guest heap storage before
+//! asynchronous use. Compiler-generated copy/dispose helpers own captures.
 
+use crate::abi::{CallFromHost, GuestFunction};
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::mem::{ConstVoidPtr, MutVoidPtr, Ptr};
-use crate::objc::{id, release, retain};
+use crate::objc::{release, retain};
 use crate::Environment;
 
 /// Bit-flag values passed to `_Block_object_assign` / `_Block_object_dispose`.
@@ -31,21 +26,132 @@ const BLOCK_FIELD_IS_OBJECT: i32 = 3;
 const BLOCK_FIELD_IS_BLOCK: i32 = 7;
 const BLOCK_FIELD_IS_BYREF: i32 = 8;
 const BLOCK_FIELD_IS_WEAK: i32 = 16;
-#[allow(dead_code)]
 const BLOCK_BYREF_CALLER: i32 = 128;
 
-/// `_Block_copy(block) -> block`. We don't actually duplicate the block
-/// (block copies are reference-counted under-the-hood and stack blocks need
-/// promotion to the heap, both of which require deeper Block ABI work),
-/// so we just return the input pointer. Apps that store copied blocks for
-/// later use will continue to see the same heap-resident block; this is
-/// correct for blocks compiled as `__NSConcreteGlobalBlock` (the common
-/// case for static literal blocks) and best-effort for stack blocks.
-fn _Block_copy(_env: &mut Environment, block: ConstVoidPtr) -> ConstVoidPtr {
-    block
+const BLOCK_NEEDS_FREE: u32 = 1 << 24;
+const BLOCK_HAS_COPY_DISPOSE: u32 = 1 << 25;
+const BLOCK_IS_GLOBAL: u32 = 1 << 28;
+const REFCOUNT_MASK: u32 = 0xffff;
+
+fn add_reference(env: &mut Environment, flags_ptr: crate::mem::MutPtr<u32>) {
+    let flags: u32 = env.mem.read(flags_ptr);
+    // A saturated reference count is immortal, rather than wrapping to zero.
+    if flags & REFCOUNT_MASK != REFCOUNT_MASK {
+        env.mem.write(flags_ptr, flags + 1);
+    }
 }
 
-fn _Block_release(_env: &mut Environment, _block: ConstVoidPtr) {}
+fn remove_reference(env: &mut Environment, flags_ptr: crate::mem::MutPtr<u32>) -> bool {
+    let flags: u32 = env.mem.read(flags_ptr);
+    let count = flags & REFCOUNT_MASK;
+    if count == REFCOUNT_MASK {
+        return false;
+    }
+    assert!(count != 0, "Releasing a block with zero references");
+    env.mem.write(flags_ptr, flags - 1);
+    count == 1
+}
+
+/// Promote a stack block, or retain an existing heap block. Global blocks
+/// are immortal. All offsets below are words in the 32-bit Apple Blocks ABI.
+pub fn _Block_copy(env: &mut Environment, block: ConstVoidPtr) -> ConstVoidPtr {
+    if block.is_null() {
+        return block;
+    }
+    let words = block.cast::<u32>();
+    let flags: u32 = env.mem.read(words + 1);
+    if flags & BLOCK_IS_GLOBAL != 0 {
+        return block;
+    }
+    if flags & BLOCK_NEEDS_FREE != 0 {
+        add_reference(env, (words + 1).cast_mut());
+        return block;
+    }
+    let descriptor: crate::mem::ConstPtr<u32> = env.mem.read(words + 4);
+    let size: u32 = env.mem.read(descriptor + 1);
+    assert!(size >= 20, "Invalid block descriptor size");
+    let bytes = env.mem.bytes_at(block.cast(), size).to_vec();
+    let copy = env.mem.alloc(size);
+    env.mem
+        .bytes_at_mut(copy.cast(), size)
+        .copy_from_slice(&bytes);
+    env.mem.write(
+        copy.cast::<u32>() + 1,
+        (flags & !REFCOUNT_MASK) | BLOCK_NEEDS_FREE | 1,
+    );
+    if flags & BLOCK_HAS_COPY_DISPOSE != 0 {
+        let helper: u32 = env.mem.read(descriptor + 2);
+        let helper = GuestFunction::from_addr_with_thumb_bit(helper);
+        let (): () = helper.call_from_host(env, (copy, block));
+    }
+    copy.cast_const()
+}
+
+pub fn _Block_release(env: &mut Environment, block: ConstVoidPtr) {
+    if block.is_null() {
+        return;
+    }
+    let words = block.cast::<u32>();
+    let flags: u32 = env.mem.read(words + 1);
+    if flags & BLOCK_IS_GLOBAL != 0 || flags & BLOCK_NEEDS_FREE == 0 {
+        return;
+    }
+    if !remove_reference(env, (words + 1).cast_mut()) {
+        return;
+    }
+    if flags & BLOCK_HAS_COPY_DISPOSE != 0 {
+        let descriptor: crate::mem::ConstPtr<u32> = env.mem.read(words + 4);
+        let helper: u32 = env.mem.read(descriptor + 3);
+        let helper = GuestFunction::from_addr_with_thumb_bit(helper);
+        let (): () = helper.call_from_host(env, (block,));
+    }
+    env.mem.free(block.cast_mut());
+}
+
+fn copy_byref(env: &mut Environment, object: ConstVoidPtr) -> ConstVoidPtr {
+    let original = object.cast::<u32>();
+    let forwarded: crate::mem::MutPtr<u32> = env.mem.read(original + 1);
+    let flags: u32 = env.mem.read(forwarded + 2);
+    if flags & BLOCK_NEEDS_FREE != 0 {
+        add_reference(env, forwarded + 2);
+        return forwarded.cast().cast_const();
+    }
+    let size: u32 = env.mem.read(forwarded + 3);
+    assert!(size >= 16, "Invalid byref size");
+    let bytes = env
+        .mem
+        .bytes_at(forwarded.cast().cast_const(), size)
+        .to_vec();
+    let copy = env.mem.alloc(size).cast::<u32>();
+    env.mem
+        .bytes_at_mut(copy.cast(), size)
+        .copy_from_slice(&bytes);
+    // One reference belongs to the stack scope, the other to the copied block.
+    env.mem
+        .write(copy + 2, (flags & !REFCOUNT_MASK) | BLOCK_NEEDS_FREE | 2);
+    env.mem.write(copy + 1, copy);
+    env.mem.write(forwarded + 1, copy);
+    if flags & BLOCK_HAS_COPY_DISPOSE != 0 {
+        let helper: u32 = env.mem.read(forwarded + 4);
+        let helper = GuestFunction::from_addr_with_thumb_bit(helper);
+        let (): () = helper.call_from_host(env, (copy, forwarded));
+    }
+    copy.cast().cast_const()
+}
+
+fn release_byref(env: &mut Environment, object: ConstVoidPtr) {
+    let forwarded: crate::mem::MutPtr<u32> = env.mem.read(object.cast::<u32>() + 1);
+    let flags: u32 = env.mem.read(forwarded + 2);
+    if flags & BLOCK_NEEDS_FREE == 0 || !remove_reference(env, forwarded + 2) {
+        return;
+    }
+    if flags & BLOCK_HAS_COPY_DISPOSE != 0 {
+        let helper: u32 = env.mem.read(forwarded + 5);
+        let helper = GuestFunction::from_addr_with_thumb_bit(helper);
+        let (): () = helper.call_from_host(env, (forwarded,));
+    }
+    env.mem.free(forwarded.cast());
+}
 
 /// `_Block_object_assign(destAddr, object, flags)`. Called by the
 /// compiler-generated copy helper to retain `object` and store it at
@@ -61,33 +167,41 @@ fn _Block_object_assign(
     object: ConstVoidPtr,
     flags: i32,
 ) {
-    if flags & BLOCK_FIELD_IS_WEAK != 0 {
-        // __weak: no retain. Just store the pointer.
-        env.mem.write(dest_addr.cast(), object);
-        return;
-    }
-    let kind = flags & 0xFF & !BLOCK_FIELD_IS_WEAK;
-    if kind == BLOCK_FIELD_IS_OBJECT || kind == BLOCK_FIELD_IS_BLOCK {
-        let obj: id = Ptr::from_bits(object.to_bits());
-        retain(env, obj);
-    }
-    // BLOCK_FIELD_IS_BYREF: caller already manages the byref structure.
-    env.mem.write(dest_addr.cast(), object);
+    // Byref copy helpers use BYREF_CALLER for their payload. They must not
+    // recursively retain/copy that payload (nor retain weak captures).
+    let value = if flags & (BLOCK_FIELD_IS_WEAK | BLOCK_BYREF_CALLER) != 0 {
+        if flags & BLOCK_FIELD_IS_BYREF != 0 && !object.is_null() {
+            copy_byref(env, object)
+        } else {
+            object
+        }
+    } else {
+        match flags & 0xf {
+            BLOCK_FIELD_IS_OBJECT => {
+                retain(env, Ptr::from_bits(object.to_bits()));
+                object
+            }
+            BLOCK_FIELD_IS_BLOCK => _Block_copy(env, object),
+            BLOCK_FIELD_IS_BYREF if !object.is_null() => copy_byref(env, object),
+            _ => object,
+        }
+    };
+    env.mem.write(dest_addr.cast(), value);
 }
 
-/// `_Block_object_dispose(object, flags)`. Called by the compiler-generated
-/// dispose helper to release a captured object that was retained by
-/// `_Block_object_assign`.
 fn _Block_object_dispose(env: &mut Environment, object: ConstVoidPtr, flags: i32) {
-    if flags & BLOCK_FIELD_IS_WEAK != 0 {
+    if flags & BLOCK_BYREF_CALLER != 0 {
         return;
     }
-    let kind = flags & 0xFF & !BLOCK_FIELD_IS_WEAK;
-    if kind == BLOCK_FIELD_IS_OBJECT || kind == BLOCK_FIELD_IS_BLOCK {
-        let obj: id = Ptr::from_bits(object.to_bits());
-        release(env, obj);
+    if flags & BLOCK_FIELD_IS_BYREF != 0 && !object.is_null() {
+        release_byref(env, object);
+    } else if flags & BLOCK_FIELD_IS_WEAK == 0 {
+        match flags & 0xf {
+            BLOCK_FIELD_IS_OBJECT => release(env, Ptr::from_bits(object.to_bits())),
+            BLOCK_FIELD_IS_BLOCK => _Block_release(env, object),
+            _ => (),
+        }
     }
-    // BLOCK_FIELD_IS_BYREF: caller manages.
 }
 
 pub const FUNCTIONS: FunctionExports = &[

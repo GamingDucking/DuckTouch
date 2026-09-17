@@ -600,19 +600,13 @@ pub const CLASSES: ClassExports = objc_classes! {
         invoke_void_block(env, animations);
     }
 
-    // 2. Fire `completion(BOOL finished)` after `delay + duration`
-    //    seconds via a one-shot NSTimer on the main run loop. We must
-    //    retain the block first because the user-supplied block is
-    //    typically a stack block; on real iOS the runtime promotes it
-    //    to the heap as part of the call. _Block_copy is a no-op for
-    //    global blocks but `objc::retain` does the right thing for
-    //    blocks that have an isa pointing at `_NSConcreteMallocBlock`.
+    // Copy for asynchronous use: guest code may reuse stack storage
+    // once this method returns. A plain ObjC retain cannot promote a block.
     if completion.is_null() {
         return;
     }
     let total_delay = (delay + duration).max(0.0);
-    let completion_id: id = completion.cast();
-    retain(env, completion_id);
+    let completion = crate::libc::blocks::_Block_copy(env, completion.cast_const());
 
     // Pack the block pointer into an NSNumber so it survives userInfo.
     let bits = completion.to_bits();
@@ -645,9 +639,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     let block: MutPtr<()> = MutPtr::from_bits(bits);
     if !block.is_null() {
         invoke_bool_block(env, block, true);
-        // Pair the retain we issued in `animateWithDuration:...`.
-        let block_id: id = block.cast();
-        release(env, block_id);
+        // Balance the heap copy held by this timer.
+        crate::libc::blocks::_Block_release(env, block.cast_const());
     }
 }
 
