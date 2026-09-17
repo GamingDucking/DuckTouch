@@ -15,7 +15,7 @@
 use crate::gles::present::present_frame;
 use crate::gles::{
     create_gles1_ctx_no_parent_stack, create_gles2_ctx_no_parent_stack, GLESContext, GLES,
-    GLESImplementation, LoggingGLESContext,
+    LoggingGLESContext,
 };
 use crate::image::Image;
 use crate::matrix::Matrix;
@@ -982,37 +982,6 @@ impl Window {
         };
         log!("Driver info: {}", gl_driver_description);
 
-        // The internal context is also used by the Core Animation compositor
-        // and by the splash screen. If the first probe found native Adreno,
-        // replace that GLES1 context with the fixed-function translator before
-        // anything is composited. Otherwise a game that uses readback or
-        // force-composition could still end up black even when its own EAGL
-        // context later uses the translator.
-        let native_adreno = env::consts::OS == "android"
-            && (gl_driver_description.contains("Adreno")
-                || gl_driver_description.contains("Qualcomm"))
-            && !gl_driver_description.contains("ANGLE")
-            && options.gles1_implementation.is_none()
-            && std::env::var_os("TOUCHHLE_GLES1_NATIVE").is_none();
-        if native_adreno {
-            log!(
-                "Native Adreno GLES1 detected for the window context; trying the \
-                 GLES1-on-GLES2 translator for compositor/splash presentation."
-            );
-            match GLESImplementation::GLES1OnGLES2.construct(&mut window) {
-                Ok(translator) => {
-                    gl_ins = translator;
-                    log!("=> GLES1-on-GLES2 translator selected for the window context.");
-                }
-                Err(err) => {
-                    log!(
-                        "Warning: GLES1-on-GLES2 window translator unavailable ({}); \
-                         keeping native GLES1.",
-                        err
-                    );
-                }
-            }
-        }
         window.gl_driver_description = gl_driver_description;
         window.internal_gl_ins = Some(gl_ins);
 
@@ -1047,14 +1016,6 @@ impl Window {
     pub fn is_adreno_gpu(&self) -> bool {
         let d = &self.gl_driver_description;
         d.contains("Adreno") || d.contains("Qualcomm")
-    }
-
-    /// Whether the selected backend is the vendor's native Adreno GLES
-    /// implementation rather than ANGLE. GLES1 callers use this to select the
-    /// fixed-function translator automatically for games that render black on
-    /// Qualcomm's native ES1 front-end.
-    pub fn is_native_adreno_backend(&self) -> bool {
-        env::consts::OS == "android" && self.is_adreno_gpu() && !self.is_angle_backend()
     }
 
     /// The cached `GL_VERSION / GL_VENDOR / GL_RENDERER` string for the internal

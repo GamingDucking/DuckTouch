@@ -250,15 +250,10 @@ Graphics driver options:
         This may be useful for troubleshooting graphics driver issues.
 
         --gles1=gles1_on_gl2 will use touchHLE's GLES1-on-GL2 layer.
-        --gles1=gles1_on_gles2 will use the fixed-function GLES1-on-GLES2
-        translator.
         --gles1=gles1_native will use native OpenGL ES 1.1.
 
         When this option isn't in use, touchHLE will try each in order and use
-        the first one that works. On native Qualcomm Adreno, the GLES1-on-GLES2
-        translator is tried first because some games render black through the
-        vendor's native ES 1.1 front-end. Set TOUCHHLE_GLES1_NATIVE=1 or use
-        --gles1=gles1_native to restore the native path for testing.
+        the first one that works.
 
 Debugging options:
     --disable-direct-memory-access

@@ -1064,6 +1064,11 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, renderbuffer: GLuint, mut pixel
         && framebuffer_status == gles11::FRAMEBUFFER_COMPLETE_OES;
     let mut src_framebuffer: GLuint = 0;
     if !use_bound_framebuffer {
+        // Resolve the guest's current draw target before any fallback bind.
+        // Binding another FBO first is exactly what can discard tile-local
+        // contents on Adreno/Mali when the guest left framebuffer zero (or a
+        // different FBO) bound.
+        gles.Finish();
         gles.GenFramebuffersOES(1, &mut src_framebuffer);
         gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, src_framebuffer);
         gles.FramebufferRenderbufferOES(
