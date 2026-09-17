@@ -132,10 +132,6 @@ fn enumerate_apps(apps_dir: &Path) -> Result<Vec<AppInfo>, std::io::Error> {
 #[derive(Default)]
 struct AppPickerDelegateHostObject {
     icon_tapped: id,
-    copyright_show: bool,
-    copyright_hide: bool,
-    copyright_prev: bool,
-    copyright_next: bool,
     quick_options_show: bool,
     quick_options_hide: bool,
     scale_hack_default: bool,
@@ -182,19 +178,6 @@ const CLASSES: ClassExports = objc_classes! {
     // used within the app picker, so it can't be abused. :)
     let host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(this);
     host_obj.icon_tapped = sender;
-}
-
-- (())copyrightInfoShow {
-    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).copyright_show = true;
-}
-- (())copyrightInfoHide {
-    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).copyright_hide = true;
-}
-- (())copyrightInfoPrevPage {
-    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).copyright_prev = true;
-}
-- (())copyrightInfoNextPage {
-    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).copyright_next = true;
 }
 
 - (())quickOptionsShow {
@@ -504,7 +487,6 @@ fn app_picker_inner(
     };
 
     let buttons_row_center = divider + (app_frame.size.height - divider) / 4.0;
-    let buttons_row2_center = divider + (app_frame.size.height - divider) / 1.6;
     make_button_row(
         env,
         delegate,
@@ -517,34 +499,6 @@ fn app_picker_inner(
         ],
         None,
     );
-    make_button_row(
-        env,
-        delegate,
-        main_view,
-        app_frame.size,
-        buttons_row2_center,
-        &[
-            ("Copyright info", "copyrightInfoShow"),
-        ],
-        None,
-    );
-
-    let copyright_info_text = "touchHLE \u{a9} 2023\u{2013}2026 touchHLE project contributors.
-
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program.  If not, see <https://www.gnu.org/licenses/>.";
-    let mut copyright_info_stuff = setup_copyright_info(env, delegate, main_view, app_frame);
-    let mut copyright_info_page_idx = 0;
 
     let quick_options_stuff = setup_quick_options(env, delegate, main_view, app_frame);
     let mut quick_options_scale_hack: Option<NonZeroU32> = None;
@@ -644,36 +598,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.";
             }
             continue;
         }
-        if std::mem::take(&mut host_obj.copyright_show) {
-            copyright_info_page_idx = 0;
-            change_copyright_page(
-                env,
-                &mut copyright_info_stuff,
-                &copyright_info_text,
-                copyright_info_page_idx,
-            );
-            () = msg![env; (copyright_info_stuff.main_view) setHidden:false];
-        } else if std::mem::take(&mut host_obj.copyright_hide) {
-            () = msg![env; (copyright_info_stuff.main_view) setHidden:true];
-        } else if std::mem::take(&mut host_obj.copyright_prev) && copyright_info_page_idx != 0 {
-            copyright_info_page_idx -= 1;
-            change_copyright_page(
-                env,
-                &mut copyright_info_stuff,
-                &copyright_info_text,
-                copyright_info_page_idx,
-            );
-        } else if std::mem::take(&mut host_obj.copyright_next)
-            && Some(copyright_info_page_idx) != copyright_info_stuff.last_page_idx
-        {
-            copyright_info_page_idx += 1;
-            change_copyright_page(
-                env,
-                &mut copyright_info_stuff,
-                &copyright_info_text,
-                copyright_info_page_idx,
-            );
-        } else if std::mem::take(&mut host_obj.quick_options_show) {
+        if std::mem::take(&mut host_obj.quick_options_show) {
             () = msg![env; (quick_options_stuff.main_view) setHidden:false];
         } else if std::mem::take(&mut host_obj.quick_options_hide) {
             () = msg![env; (quick_options_stuff.main_view) setHidden:true];
@@ -1161,202 +1086,6 @@ fn make_button_row(
     ui_buttons
 }
 
-struct CopyrightInfoStuff {
-    main_view: id,
-    text_frame: CGRect,
-    text_label: id,
-    font: id,
-    pages: Vec<(std::ops::Range<usize>, CGFloat)>,
-    last_page_idx: Option<usize>,
-    prev_page_button: id,
-    next_page_button: id,
-}
-
-fn setup_copyright_info(
-    env: &mut Environment,
-    delegate: id,
-    super_view: id,
-    app_frame: CGRect,
-) -> CopyrightInfoStuff {
-    let main_frame = CGRect {
-        origin: CGPoint { x: 0.0, y: 0.0 },
-        size: app_frame.size,
-    };
-
-    let divider = main_frame.size.height - 40.0;
-
-    // Container for all the other stuff
-
-    let main_view: id = msg_class![env; UIView alloc];
-    let main_view: id = msg![env; main_view initWithFrame:main_frame];
-    // TODO: Isn't white the default?
-    let bg_color: id = msg_class![env; UIColor whiteColor];
-    () = msg![env; main_view setBackgroundColor:bg_color];
-    // This main_view is hidden until the copyright info button is tapped.
-    () = msg![env; main_view setHidden:true];
-    () = msg![env; super_view addSubview:main_view];
-
-    // UILabel that will display part of the copyright text
-
-    let padding = 10.0;
-    let text_frame = CGRect {
-        origin: CGPoint {
-            x: padding,
-            y: padding,
-        },
-        size: CGSize {
-            width: app_frame.size.width - padding * 2.0,
-            height: divider - padding * 2.0,
-        },
-    };
-
-    let text_label: id = msg_class![env; UILabel alloc];
-    let text_label: id = msg![env; text_label initWithFrame:text_frame];
-    () = msg![env; text_label setNumberOfLines:0]; // unlimited
-    let text_color: id = msg_class![env; UIColor blackColor];
-    () = msg![env; text_label setTextColor:text_color];
-    let bg_color: id = msg_class![env; UIColor clearColor];
-    () = msg![env; text_label setBackgroundColor:bg_color];
-    let font_size: CGFloat = 16.0;
-    let font: id = msg_class![env; UIFont systemFontOfSize:font_size];
-    () = msg![env; text_label setFont:font];
-    () = msg![env; main_view addSubview:text_label];
-
-    // Navigation
-
-    let buttons_row_center = (main_frame.size.height + divider) / 2.0;
-    let buttons = make_button_row(
-        env,
-        delegate,
-        main_view,
-        main_frame.size,
-        buttons_row_center,
-        &[
-            ("↑", "copyrightInfoPrevPage"),
-            ("↓", "copyrightInfoNextPage"),
-            ("×", "copyrightInfoHide"),
-        ],
-        Some(30.0),
-    );
-
-    CopyrightInfoStuff {
-        main_view,
-        text_frame,
-        text_label,
-        font,
-        pages: Vec::new(),
-        last_page_idx: None,
-        prev_page_button: buttons[0],
-        next_page_button: buttons[1],
-    }
-}
-
-fn change_copyright_page(
-    env: &mut Environment,
-    copyright_info_stuff: &mut CopyrightInfoStuff,
-    copyright_info_text: &str,
-    page_idx: usize,
-) {
-    // TODO: Eventually this should be ripped out and replaced with a scrolling
-    // UITextView, once that's implemented.
-
-    let &mut CopyrightInfoStuff {
-        text_frame,
-        text_label,
-        font,
-        ref mut pages,
-        ref mut last_page_idx,
-        prev_page_button,
-        next_page_button,
-        ..
-    } = copyright_info_stuff;
-
-    // Lazily lay out pages of text as needed.
-
-    if page_idx == pages.len() {
-        let mut page_start = pages.last().map_or(0, |page| page.0.end);
-        while copyright_info_text[page_start..].starts_with([' ', '\n', '\r']) {
-            page_start += 1;
-        }
-        let mut page_height = 0.0;
-        let page_end = loop {
-            let mut line_start = page_start;
-            while line_start < copyright_info_text.len() {
-                let is_first_line = line_start == page_start;
-
-                let line_end = if let Some(i) = copyright_info_text[line_start..].find('\n') {
-                    line_start + i + 1
-                } else {
-                    copyright_info_text.len()
-                };
-
-                let line = &copyright_info_text[line_start..line_end];
-
-                // Force pagination before headings (in Dynarmic's license text)
-                if !is_first_line && line.starts_with("###") {
-                    break;
-                }
-
-                let line_temp = ns_string::from_rust_string(env, line.to_string());
-                let line_size: CGSize = msg![env; line_temp sizeWithFont:font
-                                                       constrainedToSize:(text_frame.size)];
-                // Avoid accumulation of old line strings.
-                release(env, line_temp);
-
-                if page_height + line_size.height > text_frame.size.height {
-                    break;
-                }
-
-                page_height += line_size.height;
-                line_start = line_end;
-
-                // Force pagination after dividers
-                if !is_first_line && line.starts_with("---") {
-                    break;
-                }
-            }
-            let page_end = line_start;
-            assert!(page_start != page_end);
-
-            // Avoid entirely blank pages
-            if copyright_info_text[page_start..page_end].trim() == "" {
-                page_start = page_end;
-            } else {
-                break page_end;
-            }
-        };
-        assert!(page_start != page_end);
-        pages.push((page_start..page_end, page_height));
-        if page_end == copyright_info_text.len() {
-            *last_page_idx = Some(page_idx);
-        }
-    }
-
-    // Actually display the page
-
-    let (page, page_height) = pages[page_idx].clone();
-    let page = &copyright_info_text[page];
-
-    let page: id = ns_string::from_rust_string(env, page.to_string());
-    () = msg![env; text_label setText:page];
-    // Avoid accumulation of old page strings.
-    release(env, page);
-
-    // UILabel always vertically centers text. Work around that by resizing it.
-    let label_frame = CGRect {
-        origin: text_frame.origin,
-        size: CGSize {
-            width: text_frame.size.width,
-            // The page height is slightly off, a little padding is needed.
-            height: page_height + 10.0,
-        },
-    };
-    () = msg![env; text_label setFrame:label_frame];
-
-    () = msg![env; prev_page_button setHidden:(page_idx == 0)];
-    () = msg![env; next_page_button setHidden:(Some(page_idx) == *last_page_idx)];
-}
-
 struct QuickOptionsStuff {
     main_view: id,
     scale_hack_buttons: [id; 5],
@@ -1436,7 +1165,7 @@ fn setup_quick_options(
     // TODO: Isn't white the default?
     let bg_color: id = msg_class![env; UIColor whiteColor];
     () = msg![env; main_view setBackgroundColor:bg_color];
-    // This main_view is hidden until the copyright info button is tapped.
+    // This main_view is hidden until the quick options button is tapped.
     () = msg![env; main_view setHidden:true];
     () = msg![env; super_view addSubview:main_view];
 
