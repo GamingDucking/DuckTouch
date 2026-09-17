@@ -981,7 +981,6 @@ impl Window {
             unsafe { gl_ctx.driver_description() }
         };
         log!("Driver info: {}", gl_driver_description);
-
         window.gl_driver_description = gl_driver_description;
         window.internal_gl_ins = Some(gl_ins);
 
