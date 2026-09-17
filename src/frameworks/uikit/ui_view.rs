@@ -606,7 +606,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         return;
     }
     let total_delay = (delay + duration).max(0.0);
-    let completion = crate::libc::blocks::_Block_copy(env, completion.cast_const());
+    let completion = crate::libc::blocks::_Block_copy(env, completion.cast_void().cast_const());
 
     // Pack the block pointer into an NSNumber so it survives userInfo.
     let bits = completion.to_bits();
@@ -640,7 +640,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     if !block.is_null() {
         invoke_bool_block(env, block, true);
         // Balance the heap copy held by this timer.
-        crate::libc::blocks::_Block_release(env, block.cast_const());
+        crate::libc::blocks::_Block_release(env, block.cast_void().cast_const());
     }
 }
 

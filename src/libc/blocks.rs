@@ -67,7 +67,7 @@ pub fn _Block_copy(env: &mut Environment, block: ConstVoidPtr) -> ConstVoidPtr {
         add_reference(env, (words + 1).cast_mut());
         return block;
     }
-    let descriptor: crate::mem::ConstPtr<u32> = env.mem.read(words + 4);
+    let descriptor: crate::mem::ConstPtr<u32> = env.mem.read((words + 4).cast());
     let size: u32 = env.mem.read(descriptor + 1);
     assert!(size >= 20, "Invalid block descriptor size");
     let bytes = env.mem.bytes_at(block.cast(), size).to_vec();
@@ -100,7 +100,7 @@ pub fn _Block_release(env: &mut Environment, block: ConstVoidPtr) {
         return;
     }
     if flags & BLOCK_HAS_COPY_DISPOSE != 0 {
-        let descriptor: crate::mem::ConstPtr<u32> = env.mem.read(words + 4);
+        let descriptor: crate::mem::ConstPtr<u32> = env.mem.read((words + 4).cast());
         let helper: u32 = env.mem.read(descriptor + 3);
         let helper = GuestFunction::from_addr_with_thumb_bit(helper);
         let (): () = helper.call_from_host(env, (block,));
@@ -110,7 +110,7 @@ pub fn _Block_release(env: &mut Environment, block: ConstVoidPtr) {
 
 fn copy_byref(env: &mut Environment, object: ConstVoidPtr) -> ConstVoidPtr {
     let original = object.cast::<u32>();
-    let forwarded: crate::mem::MutPtr<u32> = env.mem.read(original + 1);
+    let forwarded: crate::mem::MutPtr<u32> = env.mem.read((original + 1).cast());
     let flags: u32 = env.mem.read(forwarded + 2);
     if flags & BLOCK_NEEDS_FREE != 0 {
         add_reference(env, forwarded + 2);
@@ -129,8 +129,8 @@ fn copy_byref(env: &mut Environment, object: ConstVoidPtr) -> ConstVoidPtr {
     // One reference belongs to the stack scope, the other to the copied block.
     env.mem
         .write(copy + 2, (flags & !REFCOUNT_MASK) | BLOCK_NEEDS_FREE | 2);
-    env.mem.write(copy + 1, copy);
-    env.mem.write(forwarded + 1, copy);
+    env.mem.write((copy + 1).cast(), copy);
+    env.mem.write((forwarded + 1).cast(), copy);
     if flags & BLOCK_HAS_COPY_DISPOSE != 0 {
         let helper: u32 = env.mem.read(forwarded + 4);
         let helper = GuestFunction::from_addr_with_thumb_bit(helper);
@@ -140,7 +140,7 @@ fn copy_byref(env: &mut Environment, object: ConstVoidPtr) -> ConstVoidPtr {
 }
 
 fn release_byref(env: &mut Environment, object: ConstVoidPtr) {
-    let forwarded: crate::mem::MutPtr<u32> = env.mem.read(object.cast::<u32>() + 1);
+    let forwarded: crate::mem::MutPtr<u32> = env.mem.read((object.cast::<u32>() + 1).cast());
     let flags: u32 = env.mem.read(forwarded + 2);
     if flags & BLOCK_NEEDS_FREE == 0 || !remove_reference(env, forwarded + 2) {
         return;

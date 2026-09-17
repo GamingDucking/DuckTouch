@@ -161,7 +161,7 @@ fn mach_msg(
         let bytes = env.mem.bytes_at(msg.cast().cast_const(), send_size).to_vec();
         let start = Instant::now();
         loop {
-            if let Some(result) = try_send(&mut env.libc.mach_ports, &bytes) {
+            if let Some(result) = try_send(&mut env.libc_state.mach_ports, &bytes) {
                 if result != KERN_SUCCESS {
                     return result;
                 }
@@ -179,12 +179,12 @@ fn mach_msg(
     if msg.is_null() || msg.to_bits().checked_add(rcv_size).is_none() {
         return MACH_RCV_INVALID_DATA;
     }
-    if !env.libc.mach_ports.ports.contains_key(&rcv_name) {
+    if !env.libc_state.mach_ports.ports.contains_key(&rcv_name) {
         return MACH_RCV_INVALID_NAME;
     }
     let start = Instant::now();
     loop {
-        match try_receive(&mut env.libc.mach_ports, rcv_name, rcv_size, option & MACH_RCV_LARGE != 0) {
+        match try_receive(&mut env.libc_state.mach_ports, rcv_name, rcv_size, option & MACH_RCV_LARGE != 0) {
             Err(error) => return error,
             Ok(Receive::TooLarge(size)) => {
                 if option & MACH_RCV_LARGE != 0 && rcv_size >= 8 {

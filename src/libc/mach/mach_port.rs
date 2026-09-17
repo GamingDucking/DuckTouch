@@ -56,7 +56,7 @@ fn mach_port_allocate(
     if task != MACH_TASK_SELF || name.is_null() || right != 1 {
         return KERN_INVALID_ARGUMENT;
     }
-    let Some(port) = env.libc.mach_ports.allocate() else {
+    let Some(port) = env.libc_state.mach_ports.allocate() else {
         return 3;
     }; // KERN_NO_SPACE
     env.mem.write(name, port);
@@ -78,7 +78,7 @@ fn mach_port_insert_right(
     if task != MACH_TASK_SELF || name != poly {
         return KERN_INVALID_ARGUMENT;
     }
-    let Some(port) = env.libc.mach_ports.ports.get_mut(&name) else {
+    let Some(port) = env.libc_state.mach_ports.ports.get_mut(&name) else {
         return KERN_INVALID_NAME;
     };
     match disposition {
@@ -104,7 +104,7 @@ fn mach_port_mod_refs(
     if task != MACH_TASK_SELF {
         return KERN_INVALID_ARGUMENT;
     }
-    let Some(port) = env.libc.mach_ports.ports.get_mut(&name) else {
+    let Some(port) = env.libc_state.mach_ports.ports.get_mut(&name) else {
         return KERN_INVALID_NAME;
     };
     match right {
@@ -120,7 +120,7 @@ fn mach_port_mod_refs(
         }
         1 if delta == 0 => (),
         1 if delta == -1 => {
-            env.libc.mach_ports.ports.remove(&name);
+            env.libc_state.mach_ports.ports.remove(&name);
         }
         1 => return KERN_INVALID_ARGUMENT,
         _ => return KERN_INVALID_RIGHT,
@@ -132,7 +132,7 @@ fn mach_port_destroy(env: &mut Environment, task: u32, name: u32) -> kern_return
     if task != MACH_TASK_SELF {
         return KERN_INVALID_ARGUMENT;
     }
-    if env.libc.mach_ports.ports.remove(&name).is_none() {
+    if env.libc_state.mach_ports.ports.remove(&name).is_none() {
         return KERN_INVALID_NAME;
     }
     KERN_SUCCESS
