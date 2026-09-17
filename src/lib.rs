@@ -40,7 +40,6 @@ mod gdb;
 mod gles;
 mod image;
 mod libc;
-mod licenses;
 mod mach_o;
 mod matrix;
 mod mem;
@@ -104,15 +103,12 @@ Special options:
     --help
         Display this help text.
 
-    --copyright
-        Display copyright, authorship and license information.
-
     --info
         Print basic information about the app bundle without running the app.
 ";
 pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
     echo!(
-        "touchHLE {}{}{} — https://touchhle.org/",
+        "touchHLE {}{}{}",
         branding(),
         if branding().is_empty() { "" } else { " " },
         VERSION,
@@ -150,9 +146,6 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         } else if arg == "--help" {
             echo!("{}", USAGE);
             echo!("{}", options::OPTIONS_HELP);
-            return Ok(());
-        } else if arg == "--copyright" {
-            echo!("{}", licenses::get_text());
             return Ok(());
         } else if arg == "--info" {
             just_info = true;

@@ -276,16 +276,6 @@ const CLASSES: ClassExports = objc_classes! {
     }
 }
 
-- (())visitWebsite {
-    // Assert (see above).
-    let _ = env.objc.borrow_mut::<AppPickerDelegateHostObject>(this);
-
-    let url = ns_string::get_static_str(env, "https://touchhle.org/");
-    let url: id = msg_class![env; NSURL URLWithString:url];
-    let ui_application: id = msg_class![env; UIApplication sharedApplication];
-    assert!(msg![env; ui_application openURL:url]);
-}
-
 @end
 
 };
@@ -535,12 +525,24 @@ fn app_picker_inner(
         buttons_row2_center,
         &[
             ("Copyright info", "copyrightInfoShow"),
-            ("touchHLE.org", "visitWebsite"),
         ],
         None,
     );
 
-    let copyright_info_text = crate::licenses::get_text();
+    let copyright_info_text = "touchHLE \u{a9} 2023\u{2013}2026 touchHLE project contributors.
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.";
     let mut copyright_info_stuff = setup_copyright_info(env, delegate, main_view, app_frame);
     let mut copyright_info_page_idx = 0;
 
