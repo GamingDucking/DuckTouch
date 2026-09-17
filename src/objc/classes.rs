@@ -484,7 +484,7 @@ impl ObjC {
     }
 
     fn find_template(name: &str) -> Option<&'static ClassTemplate> {
-        crate::dyld::search_host_catalogue(|dylib| dylib.class_exports, name)
+        crate::dyld::search_host_dylibs(|dylib| dylib.class_exports, name)
             .map(|&(_name, ref template)| template)
     }
 

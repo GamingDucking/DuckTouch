@@ -22,7 +22,7 @@ use crate::abi::GuestFunction;
 use crate::fs::{Fs, GuestPath};
 use crate::mem::{GuestUSize, Mem, Ptr};
 use mach_object::{
-    cpu_subtype_t, vm_prot_t, Bind, BindSymbolType, LazyBind, DyLib, LoadCommand, MachCommand, OFile, Rebase,
+    cpu_subtype_t, vm_prot_t, Bind, BindSymbolType, DyLib, LoadCommand, MachCommand, OFile, Rebase,
     Symbol, SymbolIter, ThreadState, N_ARM_THUMB_DEF, S_LAZY_SYMBOL_POINTERS,
     S_MOD_INIT_FUNC_POINTERS, S_NON_LAZY_SYMBOL_POINTERS, S_SYMBOL_STUBS,
 };
@@ -34,65 +34,18 @@ const VM_PROT_WRITE: vm_prot_t = 2;
 #[allow(dead_code)]
 const VM_PROT_EXECUTE: vm_prot_t = 4;
 
-/// Library ordinals are relative to the importing image, never process-wide.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum LibraryOrdinal {
-    #[default]
-    Flat,
-    SelfImage,
-    MainExecutable,
-    Dependency(usize), // one-based LC_LOAD_*_DYLIB ordinal
-    Invalid,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ImportInfo {
-    pub ordinal: LibraryOrdinal,
-    pub weak: bool,
-}
-impl ImportInfo {
-    fn from_nlist(desc: u16, two_level: bool) -> Self {
-        let ordinal = if !two_level { LibraryOrdinal::Flat } else {
-            match desc >> 8 {
-                0 => LibraryOrdinal::SelfImage,
-                0xfe => LibraryOrdinal::MainExecutable,
-                0xff => LibraryOrdinal::Flat,
-                n => LibraryOrdinal::Dependency(n as usize),
-            }
-        };
-        Self { ordinal, weak: desc & 0x40 != 0 }
-    }
-    fn from_bind(ordinal: usize, weak: bool) -> Self {
-        let ordinal = match ordinal as isize {
-            0 => LibraryOrdinal::SelfImage,
-            -1 => LibraryOrdinal::MainExecutable,
-            -2 | -3 => LibraryOrdinal::Flat,
-            n if n > 0 => LibraryOrdinal::Dependency(n as usize),
-            _ => LibraryOrdinal::Invalid,
-        };
-        Self { ordinal, weak }
-    }
-}
-
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MachO {
     /// Name (for debugging purposes and sorting)
     pub name: String,
     /// Paths of dynamic libraries referenced by the binary.
     pub dynamic_libraries: Vec<String>,
-    pub install_name: Option<String>,
-    pub reexported_libraries: Vec<String>,
-    /// Import metadata keyed by relocation site, not by name: the same name
-    /// can be imported from different libraries in one image.
-    pub relocation_imports: HashMap<u32, ImportInfo>,
     /// Metadata related to sections.
     pub sections: Vec<Section>,
     /// Defined symbols in the binary (both external and local). This is a
     /// hashmap so the dynamic linker can look things up quickly. Thumb function
     /// symbols always have the Thumb bit set.
     pub exported_symbols: HashMap<String, u32>,
-    pub private_symbols: std::collections::HashSet<String>,
-    pub force_flat_namespace: bool,
     /// List of addresses and names of external relocations for the dynamic
     /// linker to resolve.
     pub external_relocations: Vec<(u32, String)>,
@@ -162,7 +115,6 @@ pub struct DyldIndirectSymbolInfo {
     pub entry_size: u32,
     /// A list of symbol names corresponding to the entries.
     pub indirect_undef_symbols: Vec<Option<String>>,
-    pub imports: Vec<ImportInfo>,
 }
 
 /// Helper trait that makes [MachO::get_section] work. Yes, this is overkill. :)
@@ -503,13 +455,7 @@ impl MachO {
         // Info used for the result
         let mut dynamic_libraries = Vec::new();
         let mut exported_symbols = HashMap::new();
-        let mut private_symbols = std::collections::HashSet::new();
         let mut indirect_undef_symbols: Vec<Option<String>> = Vec::new();
-        let mut indirect_imports = Vec::new();
-        let mut relocation_imports = HashMap::new();
-        let mut install_name = None;
-        let mut reexported_libraries = Vec::new();
-        let two_level = header.flags & mach_object::MH_TWOLEVEL != 0;
         let mut external_relocations: Vec<(u32, String)> = Vec::new();
         let mut entry_point_pc: Option<u32> = None;
         let mut entry_point_is_lc_main = false;
@@ -659,7 +605,6 @@ impl MachO {
                                 name: Some(name),
                                 entry,
                                 desc,
-                                external,
                                 ..
                             } = symbol
                             {
@@ -669,7 +614,6 @@ impl MachO {
                                 } else {
                                     entry
                                 };
-                                if !external { private_symbols.insert(name.to_string()); }
                                 exported_symbols.insert(name.to_string(), slide + entry);
                             };
                         }
@@ -709,12 +653,6 @@ impl MachO {
                             is_64bit,
                             &mut cursor,
                         );
-                        let import = match &sym {
-                            Some(Symbol::Undefined { desc, .. }) | Some(Symbol::Prebound { desc, .. }) =>
-                                ImportInfo::from_nlist(*desc, two_level),
-                            _ => ImportInfo { ordinal: LibraryOrdinal::SelfImage, weak: false },
-                        };
-                        indirect_imports.push(import);
                         indirect_undef_symbols.push(match sym {
                             // Если имя есть (Some), оно превратится в
                             // Some(String).
@@ -792,8 +730,7 @@ impl MachO {
                         );
                         assert_eq!(slide, 0); // TODO
                         match sym {
-                            Some(Symbol::Undefined { name: Some(n), desc, .. }) => {
-                                relocation_imports.insert(addr, ImportInfo::from_nlist(desc, two_level));
+                            Some(Symbol::Undefined { name: Some(n), .. }) => {
                                 external_relocations.push((addr, String::from(n)));
                             }
                             Some(Symbol::Defined { entry, desc, .. }) => {
@@ -813,8 +750,7 @@ impl MachO {
                                 };
                                 into_mem.write(addr, entry.wrapping_add(addend));
                             }
-                            Some(Symbol::Prebound { name: Some(n), desc, .. }) => {
-                                relocation_imports.insert(addr, ImportInfo::from_nlist(desc, two_level));
+                            Some(Symbol::Prebound { name: Some(n), .. }) => {
                                 let ptr_ptr = Ptr::<u32, true>::from_bits(addr);
                                 into_mem.write(ptr_ptr, 0); // Clear prebinding.
                                 external_relocations.push((addr, String::from(n)));
@@ -836,18 +772,8 @@ impl MachO {
                         );
                     }
                 }
-                LoadCommand::LoadDyLib(DyLib { name, .. })
-                | LoadCommand::LoadWeakDyLib(DyLib { name, .. })
-                | LoadCommand::LoadUpwardDylib(DyLib { name, .. })
-                | LoadCommand::LazyLoadDylib(DyLib { name, .. }) => {
+                LoadCommand::LoadDyLib(DyLib { name, .. }) => {
                     dynamic_libraries.push(String::from(&*name));
-                }
-                LoadCommand::ReexportDyLib(DyLib { name, .. }) => {
-                    reexported_libraries.push(String::from(&*name));
-                    dynamic_libraries.push(String::from(&*name));
-                }
-                LoadCommand::IdDyLib(DyLib { name, .. }) => {
-                    install_name = Some(String::from(&*name));
                 }
                 // Old-style entry point PC command
                 LoadCommand::UnixThread { state, .. } => {
@@ -904,8 +830,6 @@ impl MachO {
                     rebase_size,
                     bind_off,
                     bind_size,
-                    lazy_bind_off,
-                    lazy_bind_size,
                     ..
                 } => {
                     fn checked_dyld_info_slice<'a>(
@@ -1004,20 +928,6 @@ impl MachO {
                         }
                     }
 
-                    // Bind opcode-only lazy imports eagerly as well: a stripped
-                    // image need not have nlist records for these pointers.
-                    for symb in LazyBind::parse(checked_dyld_info_slice(
-                        bytes, lazy_bind_off.into(), lazy_bind_size.into(), "lazy_bind", &name,
-                    ), 4) {
-                        let addr = segment_offsets[symb.segment_index]
-                            + symb.symbol_offset as u32 + slide;
-                        relocation_imports.insert(addr, ImportInfo::from_bind(
-                            symb.dylib_ordinal, symb.flags.bits() & 1 != 0,
-                        ));
-                        into_mem.write(Ptr::<u32, true>::from_bits(addr), 0u32);
-                        external_relocations.push((addr, symb.name));
-                    }
-
                     let bind_opcodes = Bind::parse(
                         checked_dyld_info_slice(
                             bytes,
@@ -1035,11 +945,6 @@ impl MachO {
                                     + symb.symbol_offset as u32
                                     + slide;
                                 log_dbg!("Pointer bind: {:#x} -> {}", addr, symb.name);
-                                relocation_imports.insert(addr, ImportInfo::from_bind(
-                                    symb.dylib_ordinal, symb.flags.bits() & 1 != 0,
-                                ));
-                                // Bind opcodes carry an explicit addend, unlike nlist relocations.
-                                into_mem.write(Ptr::<u32, true>::from_bits(addr), symb.addend as u32);
                                 external_relocations.push((addr, symb.name));
                             }
                             other => {
@@ -1119,9 +1024,6 @@ impl MachO {
                     Some(DyldIndirectSymbolInfo {
                         entry_size,
                         indirect_undef_symbols: indirects,
-                        imports: indirect_imports.get(indirect_start..)
-                            .and_then(|s| s.get(..indirect_count))
-                            .map(|s| s.to_vec()).unwrap_or_else(|| vec![ImportInfo::default(); indirect_count]),
                     })
                 });
 
@@ -1138,13 +1040,8 @@ impl MachO {
         Ok(MachO {
             name,
             dynamic_libraries,
-            install_name,
-            reexported_libraries,
-            relocation_imports,
             sections,
             exported_symbols,
-            private_symbols,
-            force_flat_namespace: header.flags & mach_object::MH_FORCE_FLAT != 0,
             external_relocations,
             entry_point_pc,
             entry_point_is_lc_main,
@@ -1313,26 +1210,6 @@ mod segment_validation_tests {
             let image = MachO::load_from_bytes(&bytes, &mut mem, "supported".into(), 0).unwrap();
             assert_eq!(image.text_base, 0x9000);
         }
-    }
-
-
-    #[test]
-    fn nlist_library_ordinals_and_weak_imports() {
-        assert_eq!(ImportInfo::from_nlist(0x0240, true).ordinal, LibraryOrdinal::Dependency(2));
-        assert!(ImportInfo::from_nlist(0x0240, true).weak);
-        assert_eq!(ImportInfo::from_nlist(0xfe00, true).ordinal, LibraryOrdinal::MainExecutable);
-        assert_eq!(ImportInfo::from_nlist(0xff00, true).ordinal, LibraryOrdinal::Flat);
-        assert_eq!(ImportInfo::from_nlist(0, true).ordinal, LibraryOrdinal::SelfImage);
-        assert_eq!(ImportInfo::from_nlist(0x0200, false).ordinal, LibraryOrdinal::Flat);
-    }
-
-    #[test]
-    fn bind_special_ordinals_are_signed() {
-        assert_eq!(ImportInfo::from_bind(-1isize as usize, false).ordinal, LibraryOrdinal::MainExecutable);
-        assert_eq!(ImportInfo::from_bind(-2isize as usize, false).ordinal, LibraryOrdinal::Flat);
-        assert_eq!(ImportInfo::from_bind(0, false).ordinal, LibraryOrdinal::SelfImage);
-        assert_eq!(ImportInfo::from_bind(3, true).ordinal, LibraryOrdinal::Dependency(3));
-        assert!(ImportInfo::from_bind(3, true).weak);
     }
 
 }
