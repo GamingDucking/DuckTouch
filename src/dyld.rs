@@ -21,6 +21,7 @@
 
 mod dylib_list;
 mod swift_runtime;
+mod symbol_lookup;
 
 use crate::abi::{CallFromGuest, GuestFunction};
 use crate::bundle;
@@ -168,18 +169,16 @@ pub enum HostConstant {
 /// See also [FunctionExports], [ClassExports].
 pub type ConstantExports = &'static [(&'static str, HostConstant)];
 
-/// Search the list of [HostDylib]s for a class/constant/function by its symbol.
+/// Search the implementation catalogue for internal host runtime construction.
+/// Guest imports must use a process-local `LookupScope` instead.
 ///
-/// Example usage: `search_host_dylibs(|dylib| dylib.function_exports, "_foo")`
-pub fn search_host_dylibs<T, F>(get_exports: F, symbol: &str) -> Option<&'static (&'static str, T)>
+/// Example usage: `search_host_catalogue(|dylib| dylib.function_exports, "_foo")`
+pub(crate) fn search_host_catalogue<T, F>(get_exports: F, symbol: &str) -> Option<&'static (&'static str, T)>
 where
     F: Fn(&HostDylib) -> &'static [&'static [(&'static str, T)]],
 {
-    // TODO: In general, we should rarely if ever need to search the full set
-    //       of dylibs for a symbol. Now that we know which symbols belong to
-    //       which libraries, we should at least only search libraries that are
-    //       referenced by the app and currently "loaded". We probably should
-    //       also implement the Mach-O two-level symbol namespacing eventually.
+    // Catalogue-only lookup for internal host runtime construction (not guest
+    // bindings). Guest imports use LookupScope and the process's loaded images.
     DYLIB_LIST
         .iter()
         .copied()
@@ -393,6 +392,12 @@ fn write_return_to_host_routine(mem: &mut Mem, svc: u32) -> GuestFunction {
 }
 
 pub struct Dyld {
+    loaded_host_dylibs: Vec<&'static HostDylib>,
+    pinned_host_dylibs: std::collections::HashSet<&'static str>,
+    dynamic_host_refs: HashMap<&'static str, usize>,
+    library_handles: HashMap<u32, String>,
+    scoped_host_functions: HashMap<usize, GuestFunction>,
+    constant_addresses: HashMap<usize, ConstVoidPtr>,
     /// List of host functions that have been "linked" and had SVCs assigned.
     ///
     /// The `&'static str` part here is purely for debugging and could be
@@ -433,6 +438,12 @@ impl Dyld {
 
     pub fn new() -> Dyld {
         Dyld {
+            loaded_host_dylibs: Vec::new(),
+            pinned_host_dylibs: Default::default(),
+            dynamic_host_refs: HashMap::new(),
+            library_handles: HashMap::new(),
+            scoped_host_functions: HashMap::new(),
+            constant_addresses: HashMap::new(),
             linked_host_functions: Vec::new(),
             return_to_host_routine: None,
             thread_exit_routine: None,
@@ -468,6 +479,7 @@ impl Dyld {
         self.thread_exit_routine = Some(write_return_to_host_routine(mem, Self::SVC_THREAD_EXIT));
         // Currently assuming only the app binary contains Objective-C things.
 
+        self.register_loaded_images(bins);
         objc.register_bin_selectors(&bins[0], mem);
         objc.register_host_selectors(mem);
         for bin in bins {
@@ -611,22 +623,24 @@ impl Dyld {
             file,
             "{{\n    \"object\":\"lazy_symbols\",\n    \"symbols\": ["
         )?;
-        'sym: for (i, symbol) in info.indirect_undef_symbols.iter().enumerate() {
-            // Why doesn't json allow trailing commas...
-            let comma = if i == info.indirect_undef_symbols.len() - 1 {
+        let symbols: Vec<_> = info.indirect_undef_symbols.iter().enumerate()
+            .filter_map(|(i, symbol)| symbol.as_ref().map(|symbol| (i, symbol))).collect();
+        'sym: for (position, &(i, symbol)) in symbols.iter().enumerate() {
+            // Only named entries participate in comma placement.
+            let comma = if position == symbols.len() - 1 {
                 ""
             } else {
                 ","
             };
-            let symbol = symbol.as_ref().unwrap();
-            if let Some(&(_, _)) = search_host_dylibs(|dylib| dylib.function_exports, symbol) {
+            let scope = self.lookup_scope(&bins[0], bins, info.imports[i]);
+            if let Some(&(_, _)) = scope.search_host(|dylib| dylib.function_exports, symbol) {
                 writeln!(
                     file,
                     "        {{ \"symbol\": \"{symbol}\", \"linked_to\": \"host\"}}{comma}"
                 )?;
                 continue;
             }
-            for dylib in bins.iter() {
+            for dylib in &scope.guests {
                 if dylib.exported_symbols.contains_key(symbol) {
                     writeln!(
                         file,
@@ -819,19 +833,27 @@ impl Dyld {
         // identity checks in dynamic_cast work correctly.
         let mut cxxabi_vtable_addrs: HashMap<String, u32> = HashMap::new();
         for &(ptr_ptr, ref name) in &bin.external_relocations {
+            let import = bin.relocation_imports.get(&ptr_ptr).copied().unwrap_or_default();
+            let scope = self.lookup_scope(bin, bins, import);
             let ptr_ptr: MutPtr<ConstVoidPtr> = Ptr::from_bits(ptr_ptr);
+            if import.weak && !scope.has_symbol(name) {
+                mem.write(ptr_ptr, ConstVoidPtr::null());
+                continue;
+            }
             // There will be an existing value at the address, which is an
             // offset that should be applied to the external symbol's address.
             // It is often 0, but not always.
             let offset: u32 = mem.read(ptr_ptr).to_bits();
-            let target: ConstVoidPtr = if let Some(name) = name.strip_prefix("_OBJC_CLASS_$_") {
-                objc.link_class(name, /* is_metaclass: */ false, mem)
-                    .cast()
-                    .cast_const()
-            } else if let Some(name) = name.strip_prefix("_OBJC_METACLASS_$_") {
-                objc.link_class(name, /* is_metaclass: */ true, mem)
-                    .cast()
-                    .cast_const()
+            let target: ConstVoidPtr = if let Some((class_name, meta)) = symbol_lookup::objc_symbol(name) {
+                if let Some(addr) = scope.guest_address(name) {
+                    Ptr::from_bits(addr)
+                } else if scope.search_host(|d| d.class_exports, class_name).is_some() {
+                    objc.link_class(class_name, meta, mem).cast().cast_const()
+                } else {
+                    log!("Unresolved scoped Objective-C import {} in {}", name, bin.name);
+                    mem.write(ptr_ptr, ConstVoidPtr::null());
+                    continue;
+                }
             } else if name == "___CFConstantStringClassReference" {
                 // See ns_string::register_constant_strings
                 nil.cast().cast_const()
@@ -936,10 +958,10 @@ impl Dyld {
                     "_objc_msgSendSuper2_stret"
                 };
                 if let Some((sym, _)) =
-                    search_host_dylibs(|dylib| dylib.function_exports, target_name)
+                    scope.search_host(|dylib| dylib.function_exports, target_name)
                 {
                     let trampoline_ptr = self
-                        .create_proc_address_no_inval(mem, sym)
+                        .scoped_proc_address(mem, &scope, sym)
                         .unwrap()
                         .to_ptr();
                     log_dbg!("Linked {} -> {} at {:?}", name, target_name, trampoline_ptr);
@@ -1078,20 +1100,17 @@ impl Dyld {
                     }
                     swift_runtime::SwiftLink::Data(slot) => slot,
                 }
-            } else if let Some(&external_addr) = bins
-                .iter()
-                .flat_map(|other_bin| other_bin.exported_symbols.get(name))
-                .next()
+            } else if let Some(external_addr) = scope.guest_address(name)
             {
                 // Often used for C++ RTTI
                 Ptr::from_bits(external_addr)
             } else if let Some((symbol, _)) =
-                search_host_dylibs(|dylib| dylib.function_exports, name)
+                scope.search_host(|dylib| dylib.function_exports, name)
             {
                 // We want the same symbol name to always point to the same
                 // function.
                 let trampoline_ptr = self
-                    .create_proc_address_no_inval(mem, symbol)
+                    .scoped_proc_address(mem, &scope, symbol)
                     .unwrap()
                     .to_ptr();
                 log_dbg!(
@@ -1101,7 +1120,7 @@ impl Dyld {
                 );
                 trampoline_ptr
             } else if let Some((_, template)) =
-                search_host_dylibs(|dylib| dylib.constant_exports, name)
+                scope.search_host(|dylib| dylib.constant_exports, name)
             {
                 // Constants from host dylibs need late linking (they may
                 // require a full Environment to resolve, e.g. NSString
@@ -1155,12 +1174,27 @@ impl Dyld {
                 continue;
             };
 
+            let import = info.imports[i as usize];
+            let scope = self.lookup_scope(bin, bins, import);
             let ptr_ptr: MutPtr<ConstVoidPtr> = Ptr::from_bits(ptrs.addr + i * entry_size);
-            for other_bin in bins {
-                if let Some(&addr) = other_bin.exported_symbols.get(symbol) {
-                    mem.write(ptr_ptr, Ptr::from_bits(addr));
-                    continue 'ptr_loop;
-                }
+            if import.weak && !scope.has_symbol(symbol) {
+                mem.write(ptr_ptr, ConstVoidPtr::null());
+                continue;
+            }
+            if let Some(addr) = scope.guest_address(symbol) {
+                mem.write(ptr_ptr, Ptr::from_bits(addr));
+                continue 'ptr_loop;
+            }
+
+            if let Some((class_name, meta)) = symbol_lookup::objc_symbol(symbol) {
+                let address = if scope.search_host(|d| d.class_exports, class_name).is_some() {
+                    objc.link_class(class_name, meta, mem).cast().cast_const()
+                } else {
+                    log!("Unresolved scoped Objective-C import {} in {}", symbol, bin.name);
+                    ConstVoidPtr::null()
+                };
+                mem.write(ptr_ptr, address);
+                continue;
             }
 
             if symbol == "dyld_stub_binder" || symbol == "_dyld_stub_binder" {
@@ -1191,10 +1225,10 @@ impl Dyld {
                     "_objc_msgSendSuper2_stret"
                 };
                 if let Some((sym, _)) =
-                    search_host_dylibs(|dylib| dylib.function_exports, target_name)
+                    scope.search_host(|dylib| dylib.function_exports, target_name)
                 {
                     let trampoline_ptr = self
-                        .create_proc_address_no_inval(mem, sym)
+                        .scoped_proc_address(mem, &scope, sym)
                         .unwrap()
                         .to_ptr();
                     mem.write(ptr_ptr, trampoline_ptr);
@@ -1208,13 +1242,13 @@ impl Dyld {
                 }
             }
 
-            if let Some((symbol, _)) = search_host_dylibs(|dylib| dylib.function_exports, symbol) {
+            if let Some((symbol, _)) = scope.search_host(|dylib| dylib.function_exports, symbol) {
                 // We want the same symbol name to always point to the same
                 // function. It could point to a specific stub entry, but it's
                 // easier to just create a new function and point all the stub
                 // entries to it.
                 let trampoline_ptr = self
-                    .create_proc_address_no_inval(mem, symbol)
+                    .scoped_proc_address(mem, &scope, symbol)
                     .unwrap()
                     .to_ptr();
                 mem.write(ptr_ptr, trampoline_ptr);
@@ -1226,7 +1260,7 @@ impl Dyld {
                 log_dbg!("{:?}", self.non_lazy_host_functions);
                 continue;
             }
-            if let Some((_, template)) = search_host_dylibs(|dylib| dylib.constant_exports, symbol)
+            if let Some((_, template)) = scope.search_host(|dylib| dylib.constant_exports, symbol)
             {
                 // Delay linking of constant until we have a `&mut Environment`,
                 // that makes it much easier to build NSString objects etc.
@@ -1451,24 +1485,26 @@ impl Dyld {
     /// Do linking that can only be done once there is a full [Environment].
     /// Not to be confused with lazy linking.
     pub fn do_late_linking(env: &mut Environment) {
-        // TODO: do symbols ever appear in __nl_symbol_ptr multiple times?
         let to_link = std::mem::take(&mut env.dyld.constants_to_link_later);
         for (symbol_ptr_ptr, template) in to_link {
-            let symbol_ptr: ConstVoidPtr = match template {
-                HostConstant::NSString(static_str) => {
-                    let string_ptr = ns_string::get_static_str(env, static_str);
-                    let string_ptr_ptr = env.mem.alloc_and_write(string_ptr);
-                    string_ptr_ptr.cast().cast_const()
-                }
-                HostConstant::NullPtr => {
-                    let null_ptr: ConstVoidPtr = Ptr::null();
-                    let null_ptr_ptr = env.mem.alloc_and_write(null_ptr);
-                    null_ptr_ptr.cast().cast_const()
-                }
-                HostConstant::Custom(f) => f(env),
-            };
-            env.mem.write(symbol_ptr_ptr, symbol_ptr.cast());
+            let symbol_ptr = Self::materialize_constant(env, template);
+            env.mem.write(symbol_ptr_ptr, symbol_ptr);
         }
+    }
+
+    fn materialize_constant(env: &mut Environment, template: &'static HostConstant) -> ConstVoidPtr {
+        let key = template as *const _ as usize;
+        if let Some(&address) = env.dyld.constant_addresses.get(&key) { return address; }
+        let address = match template {
+            HostConstant::NSString(value) => {
+                let string = ns_string::get_static_str(env, value);
+                env.mem.alloc_and_write(string).cast().cast_const()
+            }
+            HostConstant::NullPtr => env.mem.alloc_and_write(ConstVoidPtr::null()).cast().cast_const(),
+            HostConstant::Custom(f) => f(env),
+        };
+        env.dyld.constant_addresses.insert(key, address);
+        address
     }
 
     /// Return a host function that can be called to handle an SVC instruction
@@ -1579,7 +1615,7 @@ impl Dyld {
             (stub_function_ptr, la_symbol_ptr)
         }
 
-        let (stubs, pic_offset) = bins
+        let (bin, stubs, pic_offset) = bins
             .iter()
             .find_map(|bin| {
                 let stubs = bin.get_section(SectionType::SymbolStubs)?;
@@ -1589,7 +1625,7 @@ impl Dyld {
                 let pic_offset = bin
                     .get_section(SectionType::LazySymbolPointers)
                     .map_or(0, |lazy_ptrs| lazy_ptrs.addr - stubs.addr);
-                Some((stubs, pic_offset))
+                Some((bin, stubs, pic_offset))
             })
             .unwrap();
         let info = stubs.dyld_indirect_symbol_info.as_ref().unwrap();
@@ -1599,7 +1635,11 @@ impl Dyld {
         let idx = (offset / info.entry_size) as usize;
         let symbol = info.indirect_undef_symbols[idx].as_deref().unwrap();
 
-        if let Some(&addr) = self.non_lazy_host_functions.get(symbol) {
+        let scope = self.lookup_scope(bin, bins, info.imports[idx]);
+        let cached = scope.search_host(|d| d.function_exports, symbol)
+            .and_then(|entry| self.scoped_host_functions.get(&(entry as *const _ as usize))).copied()
+            .filter(|_| scope.guest_address(symbol).is_none());
+        if let Some(addr) = cached {
             // The host function was already linked non-lazily, point the
             // stub and __la_symbol_ptr to the function.
             let (stub_function_ptr, la_symbol_ptr) = link_by_restoring_stub(
@@ -1652,24 +1692,12 @@ impl Dyld {
         // what `do_non_lazy_linking` already does for non-lazy bindings, and
         // matches iOS dyld's behaviour of preferring the app's own linked
         // dylibs over fallback implementations.
-        for dylib in bins.iter() {
-            if let Some(&addr) = dylib.exported_symbols.get(symbol) {
-                let (stub_function_ptr, la_symbol_ptr) =
-                    link_by_restoring_stub(mem, cpu, addr, svc_pc, info.entry_size, pic_offset);
-                log_dbg!(
-                    "Linked {} at {:?}/{:?} to {:#x} from {}",
-                    symbol,
-                    stub_function_ptr,
-                    la_symbol_ptr,
-                    addr,
-                    dylib.name
-                );
-                // Tell the caller it needs to restart execution at svc_pc.
-                return None;
-            }
+        if let Some(addr) = scope.guest_address(symbol) {
+            link_by_restoring_stub(mem, cpu, addr, svc_pc, info.entry_size, pic_offset);
+            return None;
         }
 
-        if let Some(&(symbol, f)) = search_host_dylibs(|dylib| dylib.function_exports, symbol) {
+        if let Some(&(symbol, f)) = scope.search_host(|dylib| dylib.function_exports, symbol) {
             // Allocate an SVC ID for this host function
             let idx: u32 = self.linked_host_functions.len().try_into().unwrap();
             let mut svc = idx + Self::SVC_LINKED_FUNCTIONS_BASE;
@@ -1729,10 +1757,10 @@ impl Dyld {
         Some(f)
     }
 
-    /// Creates a guest function that will call a host function with the name
-    /// `symbol`. This can be used to implement "get proc address" functions.
-    /// Note that no attempt is made to deduplicate or deallocate these, so
-    /// excessive use would create a memory leak.
+    /// Creates an internal HLE trampoline using the implementation catalogue.
+    /// This intentionally does not model guest library visibility: guest
+    /// `dlsym` must use `dynamic_symbol`, and imports use `LookupScope`.
+    /// Addresses are cached for the lifetime of the runtime.
     ///
     /// The name must be the mangled symbol name. Returns [Err] if there's no
     /// such function.
@@ -1776,7 +1804,7 @@ impl Dyld {
             return Ok(stub);
         }
 
-        let &(symbol, f) = search_host_dylibs(|dylib| dylib.function_exports, symbol).ok_or(())?;
+        let &(symbol, f) = search_host_catalogue(|dylib| dylib.function_exports, symbol).ok_or(())?;
         if let Some(&cached_fn) = self.non_lazy_host_functions.get(symbol) {
             return Ok(cached_fn);
         }
