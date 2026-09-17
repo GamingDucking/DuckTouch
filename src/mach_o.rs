@@ -301,7 +301,15 @@ fn validate_segment_file_range(
 fn validate_segment_ranges(commands: &[MachCommand], file_len: usize) -> Result<(), &'static str> {
     for MachCommand(command, _) in commands {
         if let LoadCommand::Segment { segname, fileoff, filesize, vmsize, .. } = command {
-            if let Err(error) = validate_segment_file_range((*fileoff).into(), (*filesize).into(), (*vmsize).into(), file_len) {
+            // mach_object exposes these fields as usize. Use checked
+            // conversions: usize does not implement Into<u64> in Rust.
+            let offset = u64::try_from(*fileoff)
+                .map_err(|_| "Segment file offset does not fit u64")?;
+            let size = u64::try_from(*filesize)
+                .map_err(|_| "Segment file size does not fit u64")?;
+            let virtual_size = u64::try_from(*vmsize)
+                .map_err(|_| "Segment virtual size does not fit u64")?;
+            if let Err(error) = validate_segment_file_range(offset, size, virtual_size, file_len) {
                 log!("Rejecting Mach-O: segment {} fileoff={:#x} filesize={:#x} vmsize={:#x}, file length={:#x}: {}",
                     segname, fileoff, filesize, vmsize, file_len, error);
                 return Err(error);
