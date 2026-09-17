@@ -16,7 +16,7 @@ const AL_REFERENCE_DISTANCE: i32 = 0x1020;
 const AL_ROLLOFF_FACTOR: i32 = 0x1021;
 const AL_MAX_DISTANCE: i32 = 0x1023;
 
-use crate::abi::CallFromHost;
+use crate::abi::{CallFromHost, GuestFunction};
 use crate::dyld::FunctionExports;
 use crate::environment::Environment;
 use crate::export_c_func;
@@ -39,6 +39,7 @@ type AudioUnitScope = u32;
 type AudioUnitElement = u32;
 type AudioUnitParameterID = u32;
 type AudioUnitParameterValue = f32;
+type AudioUnitPropertyListenerProc = GuestFunction;
 
 // =========================================================================
 // MARK: - Структуры
@@ -154,6 +155,128 @@ fn AudioUnitUninitialize(env: &mut Environment, in_unit: AudioUnit) -> OSStatus 
         Ok(_) => 0,
         Err(_) => paramErr,
     }
+}
+
+/// Notify listeners registered for one Audio Unit property.
+///
+/// Take a snapshot before entering guest code. A property listener is allowed
+/// to add or remove listeners (or even dispose the unit) re-entrantly, so the
+/// host-side state must not remain borrowed while the callback is running.
+fn notify_audio_unit_property(
+    env: &mut Environment,
+    in_unit: AudioUnit,
+    in_id: AudioUnitPropertyID,
+    in_scope: AudioUnitScope,
+    in_element: AudioUnitElement,
+) {
+    let listeners = audio_components::State::get(&mut env.framework_state)
+        .audio_component_instances
+        .get(&in_unit)
+        .map(|host_object| {
+            host_object
+                .property_listeners
+                .iter()
+                .filter(|(property_id, _, _)| *property_id == in_id)
+                .copied()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    for (_, callback, ref_con) in listeners {
+        let _: OSStatus = callback.call_from_host(
+            env,
+            (ref_con, in_unit, in_id, in_scope, in_element),
+        );
+    }
+}
+
+/// Notify the standard running-state property used by output units and
+/// AUGraph. Kept crate-visible so `au_graph` can report graph-driven stops too.
+pub(crate) fn notify_audio_unit_is_running(env: &mut Environment, in_unit: AudioUnit) {
+    notify_audio_unit_property(
+        env,
+        in_unit,
+        kAudioOutputUnitProperty_IsRunning,
+        kAudioUnitScope_Global,
+        0,
+    );
+}
+
+/// `AudioUnitAddPropertyListener` stores the guest callback instead of
+/// installing the generic return-0 stub. This is particularly important for
+/// `kAudioOutputUnitProperty_IsRunning`: many RemoteIO clients use this
+/// listener to observe a start/stop transition.
+fn AudioUnitAddPropertyListener(
+    env: &mut Environment,
+    in_unit: AudioUnit,
+    in_id: AudioUnitPropertyID,
+    in_proc: AudioUnitPropertyListenerProc,
+    in_proc_ref_con: MutVoidPtr,
+) -> OSStatus {
+    log_dbg!(
+        "AudioUnitAddPropertyListener(unit={:?}, property={}, proc={:?}, ref_con={:?})",
+        in_unit,
+        in_id,
+        in_proc,
+        in_proc_ref_con
+    );
+
+    if in_unit.is_null() || in_proc.to_ptr().is_null() {
+        return paramErr;
+    }
+
+    let Some(host_object) = audio_components::State::get(&mut env.framework_state)
+        .audio_component_instances
+        .get_mut(&in_unit)
+    else {
+        return paramErr;
+    };
+
+    host_object
+        .property_listeners
+        .push((in_id, in_proc, in_proc_ref_con));
+    0
+}
+
+fn AudioUnitRemovePropertyListener(
+    env: &mut Environment,
+    in_unit: AudioUnit,
+    in_id: AudioUnitPropertyID,
+    in_proc: AudioUnitPropertyListenerProc,
+    in_proc_ref_con: MutVoidPtr,
+) -> OSStatus {
+    log_dbg!(
+        "AudioUnitRemovePropertyListener(unit={:?}, property={}, proc={:?}, ref_con={:?})",
+        in_unit,
+        in_id,
+        in_proc,
+        in_proc_ref_con
+    );
+
+    if in_unit.is_null() {
+        return paramErr;
+    }
+
+    let Some(host_object) = audio_components::State::get(&mut env.framework_state)
+        .audio_component_instances
+        .get_mut(&in_unit)
+    else {
+        return paramErr;
+    };
+
+    // Remove only one matching registration, preserving the behaviour of the
+    // native API when the same callback is registered more than once.
+    if let Some(index) = host_object
+        .property_listeners
+        .iter()
+        .position(|&(property_id, callback, ref_con)| {
+            property_id == in_id && callback == in_proc && ref_con == in_proc_ref_con
+        })
+    {
+        host_object.property_listeners.remove(index);
+    }
+
+    0
 }
 
 // =========================================================================
@@ -416,6 +539,11 @@ fn AudioUnitSetProperty(
             context.Sourcef(source, AL_ROLLOFF_FACTOR, params.rolloff_factor);
         }
     }
+
+    // Audio Unit Services notifies property listeners synchronously after a
+    // successful property write. The listener snapshot is taken by the
+    // helper, so callbacks may safely re-enter Audio Unit Services.
+    notify_audio_unit_property(env, in_unit, in_id, in_scope, in_element);
 
     0
 }
@@ -738,6 +866,12 @@ pub fn setup_audio_unit_for_render(env: &mut Environment, ci: AudioUnit) {
             .collect()
     };
 
+    let was_started = audio_components::State::get(&mut env.framework_state)
+        .audio_component_instances
+        .get(&ci)
+        .map(|obj| obj.started)
+        .unwrap_or(false);
+
     let need_unit_source = {
         let state = audio_components::State::get(&mut env.framework_state);
         let Some(obj) = state.audio_component_instances.get(&ci) else {
@@ -775,49 +909,68 @@ pub fn setup_audio_unit_for_render(env: &mut Environment, ci: AudioUnit) {
     drop(context);
 
     let now = Instant::now();
-    let state = audio_components::State::get(&mut env.framework_state);
-    let Some(obj) = state.audio_component_instances.get_mut(&ci) else {
-        return;
-    };
-    if let Some(s) = unit_source {
-        obj.al_source = Some(s);
-    }
-    for (bus_id, src) in bus_sources {
-        if let Some(bus) = obj.mixer_buses.get_mut(&bus_id) {
-            bus.al_source = Some(src);
-            if bus.last_render_time.is_none() {
-                bus.last_render_time = Some(now);
+    {
+        let state = audio_components::State::get(&mut env.framework_state);
+        let Some(obj) = state.audio_component_instances.get_mut(&ci) else {
+            return;
+        };
+        if let Some(s) = unit_source {
+            obj.al_source = Some(s);
+        }
+        for (bus_id, src) in bus_sources {
+            if let Some(bus) = obj.mixer_buses.get_mut(&bus_id) {
+                bus.al_source = Some(src);
+                if bus.last_render_time.is_none() {
+                    bus.last_render_time = Some(now);
+                }
             }
         }
+        if obj.last_render_time.is_none() {
+            obj.last_render_time = Some(now);
+        }
+        obj.started = true;
     }
-    if obj.last_render_time.is_none() {
-        obj.last_render_time = Some(now);
+
+    if !was_started {
+        notify_audio_unit_is_running(env, ci);
     }
-    obj.started = true;
 }
 
 fn AudioOutputUnitStop(env: &mut Environment, ci: AudioUnit) -> OSStatus {
-    let at_state = &mut env.framework_state.audio_toolbox;
-    let context = at_state
-        .al_context
-        .make_al_context_current(&mut env.openal_manager);
-
-    if let Some(audio_unit_state) = at_state
-        .audio_components
+    let was_started = audio_components::State::get(&mut env.framework_state)
         .audio_component_instances
-        .get_mut(&ci)
-    {
-        audio_unit_state.started = false;
-        if let Some(al_source) = audio_unit_state.al_source {
-            unsafe {
-                context.DeleteSources(1, &al_source);
+        .get(&ci)
+        .map(|obj| obj.started)
+        .unwrap_or(false);
+
+    let result = {
+        let at_state = &mut env.framework_state.audio_toolbox;
+        let context = at_state
+            .al_context
+            .make_al_context_current(&mut env.openal_manager);
+
+        if let Some(audio_unit_state) = at_state
+            .audio_components
+            .audio_component_instances
+            .get_mut(&ci)
+        {
+            audio_unit_state.started = false;
+            if let Some(al_source) = audio_unit_state.al_source {
+                unsafe {
+                    context.DeleteSources(1, &al_source);
+                }
             }
+            audio_unit_state.al_source = None;
+            0
+        } else {
+            -1
         }
-        audio_unit_state.al_source = None;
-        0
-    } else {
-        -1
+    };
+
+    if result == 0 && was_started {
+        notify_audio_unit_is_running(env, ci);
     }
+    result
 }
 
 // =========================================================================
@@ -1618,6 +1771,8 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(AudioUnitInitialize(_)),
     export_c_func!(AudioUnitUninitialize(_)),
+    export_c_func!(AudioUnitAddPropertyListener(_, _, _, _)),
+    export_c_func!(AudioUnitRemovePropertyListener(_, _, _, _)),
     export_c_func!(AudioUnitSetProperty(_, _, _, _, _, _)),
     export_c_func!(AudioUnitGetProperty(_, _, _, _, _, _)),
     export_c_func!(AudioUnitGetPropertyInfo(_, _, _, _, _, _)),
