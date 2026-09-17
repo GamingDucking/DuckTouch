@@ -234,6 +234,27 @@ impl Reloc {
     }
 }
 
+/// Subtypes supported by the 32-bit iPhone OS ARM backend, in selection
+/// preference order. Keep generic ARMv7 ahead of specialized ARMv7 variants.
+/// ARM_ALL is a generic ARM image, not a wildcard accepting arbitrary ISAs.
+fn arm_subtype_priority(subtype: cpu_subtype_t) -> Option<u8> {
+    // Mach-O reserves the high byte for capability requirements. No such
+    // requirements are supported by this ARM32 backend (in particular LIB64
+    // is not valid here). Do not silently strip unknown required capabilities.
+    if (subtype as u32) & 0xff00_0000 != 0 {
+        return None;
+    }
+    match subtype {
+        mach_object::CPU_SUBTYPE_ARM_V7 => Some(4),
+        mach_object::CPU_SUBTYPE_ARM_V7S => Some(3),
+        mach_object::CPU_SUBTYPE_ARM_V7F => Some(2),
+        mach_object::CPU_SUBTYPE_ARM_V6 => Some(1),
+        mach_object::CPU_SUBTYPE_ARM_ALL => Some(0),
+        // Excludes older ARM/XScale, watchOS ARMv7k, ARMv8 and unknown values.
+        _ => None,
+    }
+}
+
 fn cpu_subtype_to_str(ty: cpu_subtype_t) -> &'static str {
     match ty {
         mach_object::CPU_SUBTYPE_ARM_ALL => "armv???",
@@ -310,12 +331,17 @@ impl MachO {
             OFile::MachFile { header, commands } => (header, commands),
             OFile::FatFile { files, .. } => {
                 let mut best_subslice: Option<&[u8]> = None;
-                let mut best_type = None;
+                let mut best_priority = None;
                 let mut had_invalid_slice = false;
                 for (arch, _) in files {
                     if arch.cputype != mach_object::CPU_TYPE_ARM {
                         continue;
                     }
+                    let Some(priority) = arm_subtype_priority(arch.cpusubtype) else {
+                        log!("Skipping unsupported ARM FAT subtype {:#x}", arch.cpusubtype);
+                        had_invalid_slice = true;
+                        continue;
+                    };
                     // Per Apple's Mach-O FAT documentation, each `fat_arch`
                     // gives an absolute offset and size into the wrapping FAT
                     // file. Some malformed / partially-downloaded IPAs (e.g.
@@ -349,6 +375,8 @@ impl MachO {
                     let usable = match OFile::parse(&mut Cursor::new(subslice)) {
                         Ok(OFile::MachFile { header, commands }) => {
                             header.cputype == mach_object::CPU_TYPE_ARM
+                                && header.cpusubtype == arch.cpusubtype
+                                && arm_subtype_priority(header.cpusubtype).is_some()
                                 && !header.is_64bit()
                                 && !header.is_bigend()
                                 && validate_segment_ranges(&commands, subslice.len()).is_ok()
@@ -360,13 +388,9 @@ impl MachO {
                         had_invalid_slice = true;
                         continue;
                     }
-                    if arch.cpusubtype == mach_object::CPU_SUBTYPE_ARM_V7
-                        || (arch.cpusubtype == mach_object::CPU_SUBTYPE_ARM_V6
-                            && best_type != Some(mach_object::CPU_SUBTYPE_ARM_V7))
-                        || best_type.is_none()
-                    {
-                        best_subslice = Some(&bytes[off..off + size]);
-                        best_type = Some(arch.cpusubtype);
+                    if best_priority.map_or(true, |best| priority > best) {
+                        best_subslice = Some(subslice);
+                        best_priority = Some(priority);
                     }
                 }
                 return if let Some(subslice) = best_subslice {
@@ -385,11 +409,6 @@ impl MachO {
         if header.cputype != mach_object::CPU_TYPE_ARM {
             return Err("Executable is not for an ARM CPU!");
         }
-        log!(
-            "Loading {} slice for {:?}",
-            cpu_subtype_to_str(header.cpusubtype),
-            name
-        );
 
         let is_bigend = header.is_bigend();
         if is_bigend {
@@ -399,7 +418,16 @@ impl MachO {
         if is_64bit {
             return Err("Executable is not 32-bit!");
         }
-        // TODO: Check cpusubtype (should be some flavour of ARMv6/ARMv7)
+        if arm_subtype_priority(header.cpusubtype).is_none() {
+            log!("Rejecting {:?}: unsupported ARM CPU subtype {:#x}", name, header.cpusubtype);
+            return Err("Unsupported ARM CPU subtype or capabilities (expected ARM_ALL, ARMv6, ARMv7, ARMv7f or ARMv7s)");
+        }
+
+        log!(
+            "Loading {} slice for {:?}",
+            cpu_subtype_to_str(header.cpusubtype),
+            name
+        );
 
         // Do not mutate guest memory until every file-backed segment, including
         // __LINKEDIT, is known to fit the selected thin image.
@@ -1100,4 +1128,80 @@ mod segment_validation_tests {
         assert_eq!(mem.bytes_at(Ptr::from_bits(0x9000), 84), &valid[..]);
         assert!(mem.bytes_at(Ptr::from_bits(0x9000 + 84), 16).iter().all(|&b| b == 0));
     }
+
+    #[test]
+    fn arm_subtype_allowlist_and_capabilities() {
+        for subtype in [0, 6, 9, 10, 11] {
+            assert!(arm_subtype_priority(subtype).is_some());
+        }
+        for subtype in [5u32, 7, 8, 12, 13, 14, 0x1234, 0x8000_0009, 0x0100_0006, u32::MAX] {
+            assert!(arm_subtype_priority(subtype as cpu_subtype_t).is_none());
+        }
+        let priorities: Vec<_> = [0, 6, 10, 11, 9].into_iter()
+            .map(|s| arm_subtype_priority(s).unwrap()).collect();
+        assert!(priorities.windows(2).all(|p| p[0] < p[1]));
+    }
+
+    #[test]
+    fn thin_loader_rejects_unsupported_cpu_subtype() {
+        for subtype in [12, 13, 0x1234, 0x8000_0009] {
+            let bytes = thin(subtype, 0x1000, 84);
+            let mut mem = Mem::new();
+            let result = MachO::load_from_bytes(&bytes, &mut mem, "unsupported".into(), 0);
+            assert!(matches!(result, Err(e) if e.contains("Unsupported ARM CPU subtype")));
+        }
+    }
+
+    fn fat_pair(first_type: u32, first: &[u8], second_type: u32, second: &[u8]) -> Vec<u8> {
+        assert_eq!((first.len(), second.len()), (84, 84));
+        let mut bytes = Vec::new();
+        for word in [0xcafebabeu32, 2, 12, first_type, 48, 84, 0, 12, second_type, 132, 84, 0] {
+            bytes.extend_from_slice(&word.to_be_bytes());
+        }
+        bytes.extend_from_slice(first);
+        bytes.extend_from_slice(second);
+        bytes
+    }
+
+    #[test]
+    fn fat_loader_skips_unsupported_and_mismatched_subtypes() {
+        for (table_subtype, header_subtype) in [(12, 12), (9, 6), (9, 13)] {
+            let bytes = fat_pair(table_subtype, &thin(header_subtype, 0x1000, 84),
+                6, &thin(6, 0x9000, 84));
+            let mut mem = Mem::new();
+            let image = MachO::load_from_bytes(&bytes, &mut mem, "subtypes".into(), 0).unwrap();
+            assert_eq!(image.text_base, 0x9000);
+        }
+    }
+
+    #[test]
+    fn fat_loader_prefers_armv7_regardless_of_slice_order() {
+        for reverse in [false, true] {
+            let v6 = thin(6, 0x1000, 84);
+            let v7 = thin(9, 0x9000, 84);
+            let bytes = if reverse { fat_pair(9, &v7, 6, &v6) } else { fat_pair(6, &v6, 9, &v7) };
+            let mut mem = Mem::new();
+            let image = MachO::load_from_bytes(&bytes, &mut mem, "preference".into(), 0).unwrap();
+            assert_eq!(image.text_base, 0x9000);
+        }
+    }
+
+    #[test]
+    fn fat_loader_rejects_images_with_no_supported_subtype() {
+        let bytes = fat_pair(12, &thin(12, 0x1000, 84), 13, &thin(13, 0x9000, 84));
+        let mut mem = Mem::new();
+        assert!(MachO::load_from_bytes(&bytes, &mut mem, "unsupported-fat".into(), 0).is_err());
+    }
+
+
+    #[test]
+    fn thin_loader_accepts_supported_cpu_subtypes() {
+        for subtype in [0, 6, 9, 10, 11] {
+            let bytes = thin(subtype, 0x9000, 84);
+            let mut mem = Mem::new();
+            let image = MachO::load_from_bytes(&bytes, &mut mem, "supported".into(), 0).unwrap();
+            assert_eq!(image.text_base, 0x9000);
+        }
+    }
+
 }
