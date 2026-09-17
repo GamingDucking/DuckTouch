@@ -1035,42 +1035,51 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, renderbuffer: GLuint, mut pixel
     let width_u32: u32 = width.try_into().unwrap();
     let height_u32: u32 = height.try_into().unwrap();
 
-    // To avoid confusing the guest app, we need to be able to undo any
-    // state changes we make.
+    // Keep the application's framebuffer bound whenever possible. This is
+    // not merely an optimisation: Adreno and other tile-based GLES drivers
+    // may discard unresolved tile data when an application FBO is unbound.
+    // The old implementation always switched to a temporary FBO, so
+    // glReadPixels() then saw a cleared/black renderbuffer on those drivers.
+    // Verify the attachment before trusting the current FBO: an app can leave
+    // a different or incomplete FBO bound, in which case using it would be
+    // just as wrong as the old unconditional temporary-FBO path.
     let old_framebuffer: GLuint = get_int(gles, gles11::FRAMEBUFFER_BINDING_OES) as _;
-
-    // Hardcoded GPU-driver safe path: ALWAYS attach the renderbuffer being
-    // presented to a dedicated FBO and read from that, regardless of what
-    // FRAMEBUFFER_BINDING the guest left behind.
-    //
-    // The old logic trusted `GL_FRAMEBUFFER_BINDING_OES != 0` as "the app's
-    // FBO has this renderbuffer attached". That's not guaranteed: apps
-    // (and some of our own fallback paths) can leave a *different* FBO
-    // bound at present time, or an FBO whose attachment points at a
-    // different renderbuffer. On desktop GL the read then returns stale or
-    // black pixels => black screen on many GLES1/GLES2 games, while the
-    // same games are fine on PCs running touchHLE upstream (where the
-    // read happens to hit the right attachment). iOS guarantees that
-    // presentRenderbuffer displays the *renderbuffer's own* storage, so
-    // mirror that by always re-attaching the renderbuffer to our
-    // presentation FBO before reading.
+    let (attached_renderbuffer, framebuffer_status) = if old_framebuffer != 0 {
+        let mut attached = 0;
+        gles.GetFramebufferAttachmentParameterivOES(
+            gles11::FRAMEBUFFER_OES,
+            gles11::COLOR_ATTACHMENT0_OES,
+            gles11::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME_OES,
+            &mut attached,
+        );
+        (
+            attached as GLuint,
+            gles.CheckFramebufferStatusOES(gles11::FRAMEBUFFER_OES),
+        )
+    } else {
+        (0, gles11::FRAMEBUFFER_COMPLETE_OES)
+    };
+    let use_bound_framebuffer = old_framebuffer != 0
+        && attached_renderbuffer == renderbuffer
+        && framebuffer_status == gles11::FRAMEBUFFER_COMPLETE_OES;
     let mut src_framebuffer: GLuint = 0;
-    gles.GenFramebuffersOES(1, &mut src_framebuffer);
-    gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, src_framebuffer);
-    gles.FramebufferRenderbufferOES(
-        gles11::FRAMEBUFFER_OES,
-        gles11::COLOR_ATTACHMENT0_OES,
-        gles11::RENDERBUFFER_OES,
-        renderbuffer,
-    );
-    let use_bound_framebuffer = false;
+    if !use_bound_framebuffer {
+        gles.GenFramebuffersOES(1, &mut src_framebuffer);
+        gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, src_framebuffer);
+        gles.FramebufferRenderbufferOES(
+            gles11::FRAMEBUFFER_OES,
+            gles11::COLOR_ATTACHMENT0_OES,
+            gles11::RENDERBUFFER_OES,
+            renderbuffer,
+        );
+    }
 
     // On tile-based GPUs (Mali, Adreno, PowerVR) the per-tile color buffer
     // isn't guaranteed to be resolved to the renderbuffer's main memory
     // until the driver decides to flush. glReadPixels is supposed to imply
     // a flush, but some drivers don't kick off the resolve aggressively
     // enough and we end up reading uninitialized (black) pixels. Force the
-    // tile resolve here so the slow-path composite gets the actual frame.
+    // tile resolve here while the application's FBO is still bound.
     gles.Finish();
 
     // Read the pixels
@@ -1163,22 +1172,64 @@ unsafe fn present_renderbuffer_es2(
 
     let present_objects = ensure_present_objects(gles);
     if width > 0 && height > 0 {
-        // Reuse one FBO as the copy source. Reattach only when the app
-        // creates a new EAGL renderbuffer.
-        let source_renderbuffer = PRESENT_SOURCE_RENDERBUFFER.with(|cell| cell.get());
-        gles.BindFramebuffer(gles2::FRAMEBUFFER, present_objects.framebuffer);
-        if source_renderbuffer != renderbuffer {
-            gles.FramebufferRenderbuffer(
+        // Prefer the application's already-bound FBO as the copy source.
+        // Switching away from it before CopyTexSubImage2D can discard
+        // unresolved tile data on Adreno, leaving the presentation texture
+        // black even though the guest just rendered a valid frame. This is
+        // the same rule used by the ES1 readback path below. Keep the cached
+        // source FBO only as a fallback for apps that present with framebuffer
+        // zero bound, or when its color attachment is not this drawable.
+        let (attached_renderbuffer, framebuffer_status) = if old_framebuffer != 0 {
+            let mut attached = 0;
+            gles.GetFramebufferAttachmentParameteriv(
                 gles2::FRAMEBUFFER,
                 gles2::COLOR_ATTACHMENT0,
-                gles2::RENDERBUFFER,
-                renderbuffer,
+                gles2::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
+                &mut attached,
             );
-            PRESENT_SOURCE_RENDERBUFFER.with(|cell| cell.set(renderbuffer));
+            (
+                attached as GLuint,
+                gles.CheckFramebufferStatus(gles2::FRAMEBUFFER),
+            )
+        } else {
+            (0, gles2::FRAMEBUFFER_COMPLETE)
+        };
+        let use_bound_framebuffer = old_framebuffer != 0
+            && attached_renderbuffer == renderbuffer
+            && framebuffer_status == gles2::FRAMEBUFFER_COMPLETE;
+        if !use_bound_framebuffer {
+            let source_renderbuffer = PRESENT_SOURCE_RENDERBUFFER.with(|cell| cell.get());
+            gles.BindFramebuffer(gles2::FRAMEBUFFER, present_objects.framebuffer);
+            if source_renderbuffer != renderbuffer {
+                gles.FramebufferRenderbuffer(
+                    gles2::FRAMEBUFFER,
+                    gles2::COLOR_ATTACHMENT0,
+                    gles2::RENDERBUFFER,
+                    renderbuffer,
+                );
+                PRESENT_SOURCE_RENDERBUFFER.with(|cell| cell.set(renderbuffer));
+            }
+            static LOGGED_FALLBACK: std::sync::Once = std::sync::Once::new();
+            LOGGED_FALLBACK.call_once(|| {
+                log!(
+                    "GLES2 presenter: no suitable guest FBO is bound; using cached source FBO fallback"
+                )
+            });
+        } else {
+            static LOGGED_APP_FBO: std::sync::Once = std::sync::Once::new();
+            LOGGED_APP_FBO.call_once(|| {
+                log!(
+                    "GLES2 presenter: copying from the guest's bound FBO to preserve Adreno tile contents"
+                )
+            });
         }
 
         // Copy into preallocated texture storage. CopyTexImage2D reallocates
         // that storage on every frame, while CopyTexSubImage2D does not.
+        // Finish while the guest FBO is still bound: on tile-based Adreno
+        // drivers this resolves the current frame before the copy without
+        // forcing an FBO switch (which is the operation that loses the tiles).
+        gles.Finish();
         gles.ActiveTexture(gles2::TEXTURE0);
         gles.BindTexture(gles2::TEXTURE_2D, present_objects.texture);
         let texture_size = PRESENT_TEXTURE_SIZE.with(|cell| cell.get());
