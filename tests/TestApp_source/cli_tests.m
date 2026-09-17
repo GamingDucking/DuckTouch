@@ -58,6 +58,94 @@ int test_Initialize(void);         // Initialize.m
 int test_cpp_virtual_inheritance(void); // CppVirtualInheritance.cpp
 #endif
 
+// Exercise the 32-bit Blocks ABI directly, without requiring -fblocks or
+// newer SDK headers. In particular, overwriting the stack literal must not
+// destroy a callback retained for a later timer invocation.
+extern void *_Block_copy(const void *);
+extern void _Block_release(const void *);
+extern void _Block_object_assign(void *, const void *, int);
+extern void _Block_object_dispose(const void *, int);
+
+struct TestBlock;
+struct TestBlockDescriptor {
+  unsigned long reserved, size;
+  void (*copy)(struct TestBlock *, const struct TestBlock *);
+  void (*dispose)(const struct TestBlock *);
+};
+struct TestBlock {
+  void *isa;
+  unsigned int flags, reserved;
+  int (*invoke)(const struct TestBlock *);
+  const struct TestBlockDescriptor *descriptor;
+  int captured;
+};
+static int block_copies, block_disposals;
+static int test_block_invoke(const struct TestBlock *block) {
+  return block->captured;
+}
+static void test_block_copy_helper(struct TestBlock *dst,
+                                   const struct TestBlock *src) {
+  block_copies++;
+  dst->captured = src->captured;
+}
+static void test_block_dispose_helper(const struct TestBlock *block) {
+  (void)block;
+  block_disposals++;
+}
+int test_Block_lifetime(void) {
+  const struct TestBlockDescriptor descriptor = {
+      0, sizeof(struct TestBlock), test_block_copy_helper,
+      test_block_dispose_helper};
+  struct TestBlock stack = {
+      NULL, 1u << 25, 0, test_block_invoke, &descriptor, 42};
+  block_copies = block_disposals = 0;
+  struct TestBlock *heap = _Block_copy(&stack);
+  if (heap == &stack || block_copies != 1) return 1;
+  memset(&stack, 0, sizeof(stack));
+  if (heap->invoke(heap) != 42) return 2;
+  void *second = _Block_copy(heap);
+  if (second != heap || block_copies != 1) return 3;
+  void *captured_block = NULL;
+  _Block_object_assign(&captured_block, heap, 7);
+  if (captured_block != heap || block_copies != 1) return 8;
+  _Block_object_dispose(captured_block, 7);
+  _Block_release(heap);
+  if (block_disposals != 0) return 4;
+  _Block_release(second);
+  if (block_disposals != 1) return 5;
+  struct TestBlock global = {
+      NULL, 1u << 28, 0, test_block_invoke, &descriptor, 7};
+  if (_Block_copy(&global) != &global) return 6;
+  _Block_release(&global);
+  if (_Block_copy(NULL) != NULL) return 7;
+  _Block_release(NULL);
+  return 0;
+}
+
+int test_Block_byref_lifetime(void) {
+  struct TestByref {
+    void *isa;
+    struct TestByref *forwarding;
+    unsigned int flags, size;
+    int value;
+  } stack = {NULL, NULL, 0, sizeof(struct TestByref), 42};
+  stack.forwarding = &stack;
+  struct TestByref *first = NULL, *second = NULL;
+  _Block_object_assign(&first, &stack, 8);
+  if (first == &stack || first->forwarding != first ||
+      stack.forwarding != first || first->value != 42) return 1;
+  _Block_object_assign(&second, &stack, 8);
+  if (second != first) return 2;
+  stack.forwarding->value = 77;
+  _Block_object_dispose(&stack, 8); // leave the originating stack scope
+  memset(&stack, 0, sizeof(stack));
+  if (second->value != 77) return 3;
+  _Block_object_dispose(first, 8);
+  if (second->value != 77) return 4;
+  _Block_object_dispose(second, 8);
+  return 0;
+}
+
 // === Main code ===
 
 int test_CGGeometry() {
@@ -6175,6 +6263,8 @@ struct {
     FUNC_DEF(test_NSInvocation_retainArguments),
     FUNC_DEF(test_NSInvocation_pointer),
     FUNC_DEF(test_Initialize),
+    FUNC_DEF(test_Block_lifetime),
+    FUNC_DEF(test_Block_byref_lifetime),
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName),
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName_withObject),
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName_removeObserver),

@@ -106,7 +106,7 @@ pub fn CGBitmapContextCreate(
         font: crate::mem::Ptr::null(),
         font_size: 17.0,
         state_stack: Vec::new(),
-        path_points: Vec::new(),
+        path_elements: Vec::new(),
         // Apple defaults: rendering intent unspecified = `kCGRenderingIntentDefault` (0).
         rendering_intent: 0,
         shadow: crate::frameworks::core_graphics::cg_context::CGShadowState::default(),
@@ -453,6 +453,28 @@ impl CGBitmapContextDrawer<'_> {
         blend: bool,
     ) {
         put_pixel(&self.bitmap_info, self.pixels, coords, color, blend)
+    }
+
+    /// Convert a straight sRGB source into the representation used by this
+    /// bitmap's existing pixel blender, just as rgb_fill_color does.
+    pub(super) fn put_srgba_pixel(
+        &mut self,
+        coords: (i32, i32),
+        color: (CGFloat, CGFloat, CGFloat, CGFloat),
+        blend: bool,
+    ) {
+        let (r, g, b, a) = color;
+        let a = a.clamp(0.0, 1.0);
+        let factor = match self.bitmap_info.alpha_info {
+            kCGImageAlphaPremultipliedLast | kCGImageAlphaPremultipliedFirst => a,
+            _ => 1.0,
+        };
+        self.put_pixel(coords, (
+            gamma_decode(r.clamp(0.0, 1.0) * factor),
+            gamma_decode(g.clamp(0.0, 1.0) * factor),
+            gamma_decode(b.clamp(0.0, 1.0) * factor),
+            a,
+        ), blend);
     }
 
     pub fn iter_transformed_pixels(

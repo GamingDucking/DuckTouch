@@ -3,14 +3,10 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
-//! Stub for `CoreImage.framework/CoreImage`.
-//!
-//! CoreImage is the GPU-accelerated image-processing framework. iOS 5+
-//! apps reach a handful of `CIContext` / `CIFilter` constants by Mach-O
-//! symbol lookup even when they don't actually run any filters (they're
-//! often referenced from defensive `if (kCISomething != nil)` guards).
-//! Without a [crate::dyld::HostDylib] entry for these names, the linker
-//! leaves them NULL and the first dereference takes down the emulator.
+//! `CoreImage.framework`: CIColor, constants and a finite-image CPU pipeline.
+//! See `pipeline` for the explicitly supported filter set.
+
+pub mod pipeline;
 
 use crate::dyld::{ConstantExports, FunctionExports, HostConstant};
 use crate::frameworks::core_graphics::CGFloat;

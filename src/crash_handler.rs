@@ -225,10 +225,15 @@ mod imp {
                 _ => (*(info as *const libc::siginfo_t)).si_addr() as usize,
             }
         };
+        let location = if sig == libc::SIGABRT {
+            " (abort; no fault address)".to_string()
+        } else {
+            format!(" at address {:#x}", addr)
+        };
         let msg = format!(
-            "touchHLE: FATAL: native host crash: {} at address {:#x} — NOT a guest/app error; this is a touchHLE or driver/JIT bug. The process will now terminate.\n",
+            "touchHLE: FATAL: native host crash: {}{} — the signal alone does not identify the root cause. Check preceding panic, loader and guest-fault messages. The process will now terminate.\n",
             std::str::from_utf8(&name[..name.len() - 1]).unwrap_or("SIGNAL"),
-            addr
+            location
         );
         let msg = format!(
             "{}last guest PC: {:#x}, LR: {:#x}\n",

@@ -181,5 +181,6 @@ pub struct State {
     clocale: clocale::State,
     mach_o: mach_o::State,
     mach_vm: mach::vm_map::State,
+    mach_ports: mach::mach_port::State,
     mmap: mmap::State,
 }
