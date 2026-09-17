@@ -762,7 +762,7 @@ pub const CLASSES: ClassExports = objc_classes! {
             );
             let options = env.options.clone();
             unsafe {
-                present_renderbuffer(env, renderbuffer, drawable, &options);
+                present_renderbuffer(env, renderbuffer, drawable, &options, this.to_bits() as usize);
             }
         }
     } else {
@@ -1035,42 +1035,56 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, renderbuffer: GLuint, mut pixel
     let width_u32: u32 = width.try_into().unwrap();
     let height_u32: u32 = height.try_into().unwrap();
 
-    // To avoid confusing the guest app, we need to be able to undo any
-    // state changes we make.
+    // Keep the application's framebuffer bound whenever possible. This is
+    // not merely an optimisation: Adreno and other tile-based GLES drivers
+    // may discard unresolved tile data when an application FBO is unbound.
+    // The old implementation always switched to a temporary FBO, so
+    // glReadPixels() then saw a cleared/black renderbuffer on those drivers.
+    // Verify the attachment before trusting the current FBO: an app can leave
+    // a different or incomplete FBO bound, in which case using it would be
+    // just as wrong as the old unconditional temporary-FBO path.
     let old_framebuffer: GLuint = get_int(gles, gles11::FRAMEBUFFER_BINDING_OES) as _;
-
-    // Hardcoded GPU-driver safe path: ALWAYS attach the renderbuffer being
-    // presented to a dedicated FBO and read from that, regardless of what
-    // FRAMEBUFFER_BINDING the guest left behind.
-    //
-    // The old logic trusted `GL_FRAMEBUFFER_BINDING_OES != 0` as "the app's
-    // FBO has this renderbuffer attached". That's not guaranteed: apps
-    // (and some of our own fallback paths) can leave a *different* FBO
-    // bound at present time, or an FBO whose attachment points at a
-    // different renderbuffer. On desktop GL the read then returns stale or
-    // black pixels => black screen on many GLES1/GLES2 games, while the
-    // same games are fine on PCs running touchHLE upstream (where the
-    // read happens to hit the right attachment). iOS guarantees that
-    // presentRenderbuffer displays the *renderbuffer's own* storage, so
-    // mirror that by always re-attaching the renderbuffer to our
-    // presentation FBO before reading.
+    let (attached_renderbuffer, framebuffer_status) = if old_framebuffer != 0 {
+        let mut attached = 0;
+        gles.GetFramebufferAttachmentParameterivOES(
+            gles11::FRAMEBUFFER_OES,
+            gles11::COLOR_ATTACHMENT0_OES,
+            gles11::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME_OES,
+            &mut attached,
+        );
+        (
+            attached as GLuint,
+            gles.CheckFramebufferStatusOES(gles11::FRAMEBUFFER_OES),
+        )
+    } else {
+        (0, gles11::FRAMEBUFFER_COMPLETE_OES)
+    };
+    let use_bound_framebuffer = old_framebuffer != 0
+        && attached_renderbuffer == renderbuffer
+        && framebuffer_status == gles11::FRAMEBUFFER_COMPLETE_OES;
     let mut src_framebuffer: GLuint = 0;
-    gles.GenFramebuffersOES(1, &mut src_framebuffer);
-    gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, src_framebuffer);
-    gles.FramebufferRenderbufferOES(
-        gles11::FRAMEBUFFER_OES,
-        gles11::COLOR_ATTACHMENT0_OES,
-        gles11::RENDERBUFFER_OES,
-        renderbuffer,
-    );
-    let use_bound_framebuffer = false;
+    if !use_bound_framebuffer {
+        // Resolve the guest's current draw target before any fallback bind.
+        // Binding another FBO first is exactly what can discard tile-local
+        // contents on Adreno/Mali when the guest left framebuffer zero (or a
+        // different FBO) bound.
+        gles.Finish();
+        gles.GenFramebuffersOES(1, &mut src_framebuffer);
+        gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, src_framebuffer);
+        gles.FramebufferRenderbufferOES(
+            gles11::FRAMEBUFFER_OES,
+            gles11::COLOR_ATTACHMENT0_OES,
+            gles11::RENDERBUFFER_OES,
+            renderbuffer,
+        );
+    }
 
     // On tile-based GPUs (Mali, Adreno, PowerVR) the per-tile color buffer
     // isn't guaranteed to be resolved to the renderbuffer's main memory
     // until the driver decides to flush. glReadPixels is supposed to imply
     // a flush, but some drivers don't kick off the resolve aggressively
     // enough and we end up reading uninitialized (black) pixels. Force the
-    // tile resolve here so the slow-path composite gets the actual frame.
+    // tile resolve here while the application's FBO is still bound.
     gles.Finish();
 
     // Read the pixels
@@ -1122,8 +1136,25 @@ unsafe fn present_renderbuffer_es2(
     rotation_matrix: crate::matrix::Matrix<2>,
     virtual_cursor_visible_at: Option<(f32, f32, bool)>,
     options: &crate::options::Options,
+    context_token: usize,
 ) {
     use crate::gles::gles2_raw as gles2;
+
+    // GL names are not globally valid across independent EAGL contexts. The
+    // presenter cache is per thread for speed, so explicitly invalidate it
+    // whenever presentation moves to a different EAGLContext.
+    let context_changed = PRESENT_CONTEXT_TOKEN.with(|cell| {
+        let changed = cell.get() != Some(context_token);
+        cell.set(Some(context_token));
+        changed
+    });
+    if context_changed {
+        PRESENT_PROGRAM.with(|cell| cell.set(None));
+        PRESENT_OBJECTS.with(|cell| cell.set(None));
+        PRESENT_SOURCE_RENDERBUFFER.with(|cell| cell.set(0));
+        PRESENT_TEXTURE_SIZE.with(|cell| cell.set(None));
+        log!("GLES2 presenter: invalidated cached GL objects after EAGL context switch");
+    }
 
     // Save state we are about to clobber
     let mut old_program: GLint = 0;
@@ -1146,7 +1177,14 @@ unsafe fn present_renderbuffer_es2(
     gles.GetIntegerv(gles2::VIEWPORT, old_viewport.as_mut_ptr());
     let mut old_clear_color = [0.0f32; 4];
     gles.GetFloatv(gles2::COLOR_CLEAR_VALUE, old_clear_color.as_mut_ptr());
+    let mut old_color_mask = [0u8; 4];
+    gles.GetBooleanv(gles2::COLOR_WRITEMASK, old_color_mask.as_mut_ptr());
+    let mut old_depth_mask = 0u8;
+    gles.GetBooleanv(gles2::DEPTH_WRITEMASK, &mut old_depth_mask);
+    let mut old_stencil_mask: GLint = 0;
+    gles.GetIntegerv(gles2::STENCIL_WRITEMASK, &mut old_stencil_mask);
     let depth_test_was_on = gles.IsEnabled(gles2::DEPTH_TEST) != 0;
+    let stencil_test_was_on = gles.IsEnabled(gles2::STENCIL_TEST) != 0;
     let cull_was_on = gles.IsEnabled(gles2::CULL_FACE) != 0;
     let blend_was_on = gles.IsEnabled(gles2::BLEND) != 0;
     let scissor_was_on = gles.IsEnabled(gles2::SCISSOR_TEST) != 0;
@@ -1163,22 +1201,68 @@ unsafe fn present_renderbuffer_es2(
 
     let present_objects = ensure_present_objects(gles);
     if width > 0 && height > 0 {
-        // Reuse one FBO as the copy source. Reattach only when the app
-        // creates a new EAGL renderbuffer.
-        let source_renderbuffer = PRESENT_SOURCE_RENDERBUFFER.with(|cell| cell.get());
-        gles.BindFramebuffer(gles2::FRAMEBUFFER, present_objects.framebuffer);
-        if source_renderbuffer != renderbuffer {
-            gles.FramebufferRenderbuffer(
+        // Prefer the application's already-bound FBO as the copy source.
+        // Switching away from it before CopyTexSubImage2D can discard
+        // unresolved tile data on Adreno, leaving the presentation texture
+        // black even though the guest just rendered a valid frame. This is
+        // the same rule used by the ES1 readback path below. Keep the cached
+        // source FBO only as a fallback for apps that present with framebuffer
+        // zero bound, or when its color attachment is not this drawable.
+        let (attached_renderbuffer, framebuffer_status) = if old_framebuffer != 0 {
+            let mut attached = 0;
+            gles.GetFramebufferAttachmentParameteriv(
                 gles2::FRAMEBUFFER,
                 gles2::COLOR_ATTACHMENT0,
-                gles2::RENDERBUFFER,
-                renderbuffer,
+                gles2::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
+                &mut attached,
             );
-            PRESENT_SOURCE_RENDERBUFFER.with(|cell| cell.set(renderbuffer));
+            (
+                attached as GLuint,
+                gles.CheckFramebufferStatus(gles2::FRAMEBUFFER),
+            )
+        } else {
+            (0, gles2::FRAMEBUFFER_COMPLETE)
+        };
+        let use_bound_framebuffer = old_framebuffer != 0
+            && attached_renderbuffer == renderbuffer
+            && framebuffer_status == gles2::FRAMEBUFFER_COMPLETE;
+        if !use_bound_framebuffer {
+            // Resolve the guest's current draw target before switching to the
+            // cached source FBO. Otherwise a tile-based driver can discard
+            // the frame while the fallback FBO is being bound.
+            gles.Finish();
+            let source_renderbuffer = PRESENT_SOURCE_RENDERBUFFER.with(|cell| cell.get());
+            gles.BindFramebuffer(gles2::FRAMEBUFFER, present_objects.framebuffer);
+            if source_renderbuffer != renderbuffer {
+                gles.FramebufferRenderbuffer(
+                    gles2::FRAMEBUFFER,
+                    gles2::COLOR_ATTACHMENT0,
+                    gles2::RENDERBUFFER,
+                    renderbuffer,
+                );
+                PRESENT_SOURCE_RENDERBUFFER.with(|cell| cell.set(renderbuffer));
+            }
+            static LOGGED_FALLBACK: std::sync::Once = std::sync::Once::new();
+            LOGGED_FALLBACK.call_once(|| {
+                log!(
+                    "GLES2 presenter: no suitable guest FBO is bound; using cached source FBO fallback"
+                )
+            });
+        } else {
+            static LOGGED_APP_FBO: std::sync::Once = std::sync::Once::new();
+            LOGGED_APP_FBO.call_once(|| {
+                log!(
+                    "GLES2 presenter: copying from the guest's bound FBO to preserve Adreno tile contents"
+                )
+            });
         }
 
         // Copy into preallocated texture storage. CopyTexImage2D reallocates
         // that storage on every frame, while CopyTexSubImage2D does not.
+        // Finish while the guest FBO is still bound: on tile-based Adreno
+        // drivers this resolves the current frame before the copy without
+        // forcing an FBO switch (which is the operation that loses the tiles).
+        gles.Finish();
         gles.ActiveTexture(gles2::TEXTURE0);
         gles.BindTexture(gles2::TEXTURE_2D, present_objects.texture);
         let texture_size = PRESENT_TEXTURE_SIZE.with(|cell| cell.get());
@@ -1227,9 +1311,13 @@ unsafe fn present_renderbuffer_es2(
     );
     gles.ClearColor(0.0, 0.0, 0.0, 1.0);
     gles.Disable(gles2::DEPTH_TEST);
+    gles.Disable(gles2::STENCIL_TEST);
     gles.Disable(gles2::CULL_FACE);
     gles.Disable(gles2::BLEND);
     gles.Disable(gles2::SCISSOR_TEST);
+    gles.ColorMask(gles2::TRUE, gles2::TRUE, gles2::TRUE, gles2::TRUE);
+    gles.DepthMask(gles2::TRUE);
+    gles.StencilMask(!0);
     gles.Clear(gles2::COLOR_BUFFER_BIT | gles2::DEPTH_BUFFER_BIT | gles2::STENCIL_BUFFER_BIT);
 
     // Compile the present shader program once and cache it. If the shader
@@ -1262,8 +1350,19 @@ unsafe fn present_renderbuffer_es2(
             old_clear_color[2],
             old_clear_color[3],
         );
+        gles.ColorMask(
+            old_color_mask[0],
+            old_color_mask[1],
+            old_color_mask[2],
+            old_color_mask[3],
+        );
+        gles.DepthMask(old_depth_mask);
+        gles.StencilMask(old_stencil_mask as _);
         if depth_test_was_on {
             gles.Enable(gles2::DEPTH_TEST);
+        }
+        if stencil_test_was_on {
+            gles.Enable(gles2::STENCIL_TEST);
         }
         if cull_was_on {
             gles.Enable(gles2::CULL_FACE);
@@ -1289,7 +1388,14 @@ unsafe fn present_renderbuffer_es2(
 
     gles.UseProgram(program.program);
     gles.Uniform1i(program.u_tex, 0);
-    let m = crate::matrix::Matrix::<4>::from(&rotation_matrix);
+    // Keep rotation around the center of the texture. Applying a raw
+    // 0..1-space rotation sends one or both axes negative for landscape
+    // orientations; with CLAMP_TO_EDGE that samples only the border texel and
+    // is indistinguishable from a black frame on strict Adreno drivers.
+    let r = crate::matrix::Matrix::<4>::from(&rotation_matrix);
+    let to_center = crate::matrix::Matrix::<4>::translate_3d(-0.5, -0.5, 0.0);
+    let from_center = crate::matrix::Matrix::<4>::translate_3d(0.5, 0.5, 0.0);
+    let m = to_center.multiply(&r).multiply(&from_center);
     let cols = m.columns();
     gles.UniformMatrix4fv(
         program.u_tex_mat,
@@ -1379,8 +1485,19 @@ unsafe fn present_renderbuffer_es2(
         old_clear_color[2],
         old_clear_color[3],
     );
+    gles.ColorMask(
+        old_color_mask[0],
+        old_color_mask[1],
+        old_color_mask[2],
+        old_color_mask[3],
+    );
+    gles.DepthMask(old_depth_mask);
+    gles.StencilMask(old_stencil_mask as _);
     if depth_test_was_on {
         gles.Enable(gles2::DEPTH_TEST);
+    }
+    if stencil_test_was_on {
+        gles.Enable(gles2::STENCIL_TEST);
     }
     if cull_was_on {
         gles.Enable(gles2::CULL_FACE);
@@ -1441,6 +1558,12 @@ thread_local! {
     static PRESENT_SOURCE_RENDERBUFFER: std::cell::Cell<GLuint> =
         const { std::cell::Cell::new(0) };
     static PRESENT_TEXTURE_SIZE: std::cell::Cell<Option<(GLint, GLint)>> =
+        const { std::cell::Cell::new(None) };
+    /// GL object names are context-local unless contexts share a sharegroup.
+    /// Keep the presenter cache tied to the EAGLContext host object so a game
+    /// switching between EAGL contexts cannot make us draw with another
+    /// context's program/FBO/texture names.
+    static PRESENT_CONTEXT_TOKEN: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -1627,7 +1750,13 @@ unsafe fn ensure_present_objects(gles: &mut dyn GLES) -> PresentObjects {
 /// (which should be provided by the app) to a texture and presents it with
 /// [present_frame], trying to avoid noticeably modifying OpenGL ES state while
 /// doing so. The front and back buffers are then swapped.
-unsafe fn present_renderbuffer(env: &mut Environment, renderbuffer: GLuint, drawable: id, options: &crate::options::Options) {
+unsafe fn present_renderbuffer(
+    env: &mut Environment,
+    renderbuffer: GLuint,
+    drawable: id,
+    options: &crate::options::Options,
+    context_token: usize,
+) {
     // Capture this up front because the env borrow is moved into the GL
     // context machinery below.
     let trace_gl_errors = options.trace_gl_errors;
@@ -1757,7 +1886,15 @@ unsafe fn present_renderbuffer(env: &mut Environment, renderbuffer: GLuint, draw
             std::mem::drop(gles_boxed);
             present_renderbuffer_readback(env, renderbuffer, drawable);
         } else {
-            present_renderbuffer_es2(gles, renderbuffer, viewport, rotation_matrix, virtual_cursor_visible_at, options);
+            present_renderbuffer_es2(
+                gles,
+                renderbuffer,
+                viewport,
+                rotation_matrix,
+                virtual_cursor_visible_at,
+                options,
+                context_token,
+            );
             std::mem::drop(gles_boxed);
             env.window.as_mut().unwrap().swap_window();
         }
@@ -1846,16 +1983,35 @@ unsafe fn present_renderbuffer(env: &mut Environment, renderbuffer: GLuint, draw
     // way Mali never has a reason to discard the tile data: the same
     // FBO that the draws went into is the FBO we're now reading from.
     //
-    // The standard iPhone EAGL pattern guarantees old_framebuffer != 0
-    // at this point (the app must bind its own FBO before drawing into
-    // a renderbuffer-attached attachment, since FBO 0 has no such
-    // attachment). Out of paranoia we still keep a fallback for
-    // old_framebuffer == 0 that creates a temporary FBO and attaches
-    // the renderbuffer to it — this matches the pre-fix behaviour and
-    // lets weird non-iOS-pattern apps still present *something*.
+    // The standard iPhone EAGL pattern guarantees that the app's FBO has
+    // the drawable attached at COLOR_ATTACHMENT0. Verify that assumption
+    // instead of treating every non-zero FBO as a valid source: some engines
+    // bind a temporary depth/post-processing FBO immediately before present.
+    // Out of paranoia we keep a fallback that creates a temporary FBO and
+    // attaches the renderbuffer when no suitable app FBO is bound.
+    let (attached_renderbuffer, framebuffer_status) = if old_framebuffer != 0 {
+        let mut attached = 0;
+        gles.GetFramebufferAttachmentParameterivOES(
+            gles11::FRAMEBUFFER_OES,
+            gles11::COLOR_ATTACHMENT0_OES,
+            gles11::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME_OES,
+            &mut attached,
+        );
+        (
+            attached as GLuint,
+            gles.CheckFramebufferStatusOES(gles11::FRAMEBUFFER_OES),
+        )
+    } else {
+        (0, gles11::FRAMEBUFFER_COMPLETE_OES)
+    };
+    let used_app_fbo = old_framebuffer != 0
+        && attached_renderbuffer == renderbuffer
+        && framebuffer_status == gles11::FRAMEBUFFER_COMPLETE_OES;
     let mut src_framebuffer: GLuint = 0;
-    let used_app_fbo = old_framebuffer != 0;
     if !used_app_fbo {
+        // Resolve before the fallback bind; switching FBOs first can discard
+        // tile-local contents on mobile drivers.
+        gles.Finish();
         gles.GenFramebuffersOES(1, &mut src_framebuffer);
         gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, src_framebuffer);
         gles.FramebufferRenderbufferOES(
@@ -2345,6 +2501,10 @@ unsafe fn present_renderbuffer(env: &mut Environment, renderbuffer: GLuint, draw
         (x, y, width as _, height as _)
     };
     let old_clear_color: [GLfloat; 4] = get_floats(gles, gles11::COLOR_CLEAR_VALUE);
+    let old_color_mask: [GLboolean; 4] =
+        get_ints::<4>(gles, gles11::COLOR_WRITEMASK).map(|value| value as _);
+    let old_depth_mask: GLboolean = get_int(gles, gles11::DEPTH_WRITEMASK) as _;
+    let old_stencil_mask: GLuint = get_int(gles, gles11::STENCIL_WRITEMASK) as _;
     let old_array_buffer: GLuint = get_int(gles, gles11::ARRAY_BUFFER_BINDING) as _;
     let old_vertex_array_binding: GLuint = get_int(gles, gles11::VERTEX_ARRAY_BUFFER_BINDING) as _;
     let old_vertex_array_size: GLint = get_int(gles, gles11::VERTEX_ARRAY_SIZE);
@@ -2385,6 +2545,14 @@ unsafe fn present_renderbuffer(env: &mut Environment, renderbuffer: GLuint, draw
 
         present_check(gles, trace_gl_errors, &SEEN, "after TexEnviv setup");
     }
+
+    // A guest can leave a write mask, stencil test, or depth mask that rejects
+    // the compositor quad. The presentation pass must always be able to write
+    // every destination color channel.
+    gles.ColorMask(gles11::TRUE, gles11::TRUE, gles11::TRUE, gles11::TRUE);
+    gles.DepthMask(gles11::TRUE);
+    gles.StencilMask(!0);
+    gles.Disable(gles11::STENCIL_TEST);
 
     // Draw the quad
     present_frame(gles, viewport, rotation_matrix, virtual_cursor_visible_at);
@@ -2457,6 +2625,16 @@ unsafe fn present_renderbuffer(env: &mut Environment, renderbuffer: GLuint, draw
         old_clear_color[2],
         old_clear_color[3],
     );
+    gles.ColorMask(
+        old_color_mask[0],
+        old_color_mask[1],
+        old_color_mask[2],
+        old_color_mask[3],
+    );
+    gles.DepthMask(old_depth_mask);
+    gles.StencilMask(old_stencil_mask);
+    // STENCIL_TEST is part of old_capabilities and is restored above; this
+    // only restores the masks needed by the next guest draw.
     // GL_ARRAY_BUFFER is implicitly used by the Pointer functions but is also
     // an independent binding.
     gles.BindBuffer(gles11::ARRAY_BUFFER, old_vertex_array_binding);
