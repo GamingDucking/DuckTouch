@@ -1079,6 +1079,82 @@ pub fn CGContextDrawTiledImage(
     }
 }
 
+/// Solve |p - (c0 + t*(c1-c0))| = r0 + t*(r1-r0). The largest
+/// admissible root is the last circle painted when the circles overlap.
+fn radial_gradient_parameter(
+    point: CGPoint,
+    start: CGPoint,
+    start_radius: CGFloat,
+    end: CGPoint,
+    end_radius: CGFloat,
+    options: u32,
+) -> Option<CGFloat> {
+    let px = f64::from(point.x) - f64::from(start.x);
+    let py = f64::from(point.y) - f64::from(start.y);
+    let dx = f64::from(end.x) - f64::from(start.x);
+    let dy = f64::from(end.y) - f64::from(start.y);
+    let r = f64::from(start_radius);
+    let dr = f64::from(end_radius) - r;
+    let a = dx * dx + dy * dy - dr * dr;
+    let b = -2.0 * (px * dx + py * dy + r * dr);
+    let c = px * px + py * py - r * r;
+    let roots = if a.abs() <= f64::EPSILON * (dx * dx + dy * dy + dr * dr).max(1.0) {
+        if b == 0.0 { return None; }
+        [-c / b, -c / b]
+    } else {
+        let discriminant = b * b - 4.0 * a * c;
+        if discriminant < 0.0 { return None; }
+        // Stable quadratic formula avoids cancellation near either circle.
+        let q = -0.5 * (b + discriminant.sqrt().copysign(b));
+        if q == 0.0 { [0.0, 0.0] } else { [q / a, c / q] }
+    };
+    roots.into_iter()
+        .filter(|t| t.is_finite() && r + t * dr >= 0.0)
+        .filter(|t| (*t >= 0.0 || options & 1 != 0) && (*t <= 1.0 || options & 2 != 0))
+        .max_by(|a, b| a.partial_cmp(b).unwrap())
+        .map(|t| t.clamp(0.0, 1.0) as CGFloat)
+}
+
+/// Software radial shading in user space. Uses the existing bitmap context
+/// blender; arbitrary path clipping and unsupported blend modes retain the
+/// same limitations as the other software CGContext drawing operations.
+#[allow(clippy::too_many_arguments)]
+pub fn CGContextDrawRadialGradient(
+    env: &mut Environment,
+    context: CGContextRef,
+    gradient: super::cg_gradient::CGGradientRef,
+    start_center: CGPoint,
+    start_radius: CGFloat,
+    end_center: CGPoint,
+    end_radius: CGFloat,
+    options: u32,
+) {
+    if context.is_null() || gradient.is_null() { return; }
+    if ![start_center.x, start_center.y, end_center.x, end_center.y,
+        start_radius, end_radius].iter().all(|v| v.is_finite())
+        || start_radius < 0.0 || end_radius < 0.0 {
+        return;
+    }
+    let host = env.objc.borrow::<CGContextHostObject>(context);
+    let transform = host.transform;
+    let alpha = host.alpha;
+    let blend = host.blend_mode != 17; // kCGBlendModeCopy
+    let determinant = transform.a * transform.d - transform.b * transform.c;
+    if !determinant.is_finite() || determinant == 0.0 { return; }
+    let inverse = transform.invert();
+    let sample = super::cg_gradient::color_sampler(env, gradient);
+    let mut drawer = CGBitmapContextDrawer::new(&env.objc, &mut env.mem, context);
+    for y in 0..drawer.height() {
+        for x in 0..drawer.width() {
+            let point = inverse.apply_to_point(CGPoint { x: x as f32 + 0.5, y: y as f32 + 0.5 });
+            if let Some(t) = radial_gradient_parameter(point, start_center, start_radius, end_center, end_radius, options) {
+                let (r, g, b, a) = sample(t);
+                drawer.put_srgba_pixel((x as i32, y as i32), (r, g, b, a * alpha), blend);
+            }
+        }
+    }
+}
+
 pub fn CGContextDrawLinearGradient(
     _env: &mut Environment,
     _context: CGContextRef,
@@ -1593,6 +1669,40 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGContextSetStrokeColorSpace(_, _)),
     export_c_func!(CGContextSetRenderingIntent(_, _)),
     export_c_func!(CGContextDrawLinearGradient(_, _, _, _, _)),
+    export_c_func!(CGContextDrawRadialGradient(_, _, _, _, _, _, _)),
     export_c_func!(CGContextSetAllowsFontSubpixelPositioning(_, _)),
     export_c_func!(CGContextSetShouldSubpixelQuantizeFonts(_, _)),
 ];
+
+#[cfg(test)]
+mod radial_gradient_tests {
+    use super::*;
+
+    fn concentric(x: f32, r0: f32, r1: f32, options: u32) -> Option<f32> {
+        radial_gradient_parameter(CGPoint { x, y: 0.0 }, CGPointZero, r0, CGPointZero, r1, options)
+    }
+
+    #[test]
+    fn concentric_and_reversed_radii() {
+        assert_eq!(concentric(0.0, 0.0, 10.0, 0), Some(0.0));
+        assert_eq!(concentric(5.0, 0.0, 10.0, 0), Some(0.5));
+        assert_eq!(concentric(10.0, 0.0, 10.0, 0), Some(1.0));
+        assert_eq!(concentric(2.5, 10.0, 0.0, 0), Some(0.75));
+    }
+
+    #[test]
+    fn extension_flags_and_degenerate_circles() {
+        assert_eq!(concentric(2.0, 4.0, 10.0, 0), None);
+        assert_eq!(concentric(2.0, 4.0, 10.0, 1), Some(0.0));
+        assert_eq!(concentric(12.0, 4.0, 10.0, 0), None);
+        assert_eq!(concentric(12.0, 4.0, 10.0, 2), Some(1.0));
+        assert_eq!(concentric(5.0, 5.0, 5.0, 3), None);
+    }
+
+    #[test]
+    fn offset_centres_and_linear_case() {
+        let end = CGPoint { x: 10.0, y: 0.0 };
+        assert_eq!(radial_gradient_parameter(end, CGPointZero, 0.0, end, 10.0, 0), Some(0.5));
+        assert_eq!(radial_gradient_parameter(CGPoint { x: 5.0, y: 9.0 }, CGPointZero, 2.0, end, 2.0, 0), None);
+    }
+}
