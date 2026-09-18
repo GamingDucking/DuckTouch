@@ -29,7 +29,11 @@ use std::time::{Duration, Instant};
 
 #[derive(Default)]
 pub(super) struct State {
-    texture_framebuffer: Option<(GLuint, GLuint)>,
+    /// (texture, framebuffer, width, height). Keeping the dimensions here is
+    /// important because Android can recreate/resize the SDL surface while the
+    /// compositor state survives; reusing the old-sized texture otherwise
+    /// makes the compositor sample undefined texels (often a black screen).
+    texture_framebuffer: Option<(GLuint, GLuint, u32, u32)>,
     recomposite_next: Option<Instant>,
     fps_counter: Option<FpsCounter>,
     misc_gl_objects: Option<MiscGlObjects>,
@@ -190,14 +194,46 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     // Set up GL objects needed for render-to-texture. We could draw directly
     // to the screen instead, but this way we can reuse the code for scaling and
     // rotating the screen and drawing the virtual cursor.
-    let texture = if let Some((texture, framebuffer)) = env
+    let cached_texture_framebuffer = env
         .framework_state
         .core_animation
         .composition
-        .texture_framebuffer
+        .texture_framebuffer;
+    let cached_target_was_resized = cached_texture_framebuffer
+        .map(|(_, _, old_width, old_height)| (old_width, old_height) != (fb_width, fb_height))
+        .unwrap_or(false);
+    let texture = if let Some((texture, framebuffer, old_width, old_height)) =
+        cached_texture_framebuffer
     {
         unsafe {
             gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, framebuffer);
+            if (old_width, old_height) != (fb_width, fb_height) {
+                // Reallocate the compositor target when the Android surface or
+                // scale changes. Sampling an old-sized texture is undefined on
+                // strict native GLES1 drivers and commonly presents as black.
+                gles.BindTexture(gles11::TEXTURE_2D, texture);
+                gles.TexImage2D(
+                    gles11::TEXTURE_2D,
+                    0,
+                    gles11::RGBA as _,
+                    fb_width as _,
+                    fb_height as _,
+                    0,
+                    gles11::RGBA,
+                    gles11::UNSIGNED_BYTE,
+                    std::ptr::null(),
+                );
+                gles.TexParameteri(
+                    gles11::TEXTURE_2D,
+                    gles11::TEXTURE_WRAP_S,
+                    gles11::CLAMP_TO_EDGE as _,
+                );
+                gles.TexParameteri(
+                    gles11::TEXTURE_2D,
+                    gles11::TEXTURE_WRAP_T,
+                    gles11::CLAMP_TO_EDGE as _,
+                );
+            }
         };
         texture
     } else {
@@ -227,6 +263,19 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
                 gles11::TEXTURE_MAG_FILTER,
                 gles11::LINEAR as _,
             );
+            // This texture is the compositor's final frame. It is frequently
+            // NPOT on phones, and GL_REPEAT makes strict GLES1 drivers mark it
+            // incomplete and sample black.
+            gles.TexParameteri(
+                gles11::TEXTURE_2D,
+                gles11::TEXTURE_WRAP_S,
+                gles11::CLAMP_TO_EDGE as _,
+            );
+            gles.TexParameteri(
+                gles11::TEXTURE_2D,
+                gles11::TEXTURE_WRAP_T,
+                gles11::CLAMP_TO_EDGE as _,
+            );
 
             gles.GenFramebuffersOES(1, &mut framebuffer);
             gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, framebuffer);
@@ -241,14 +290,30 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
             // ХАК: Убраны вызовы assert_eq!, которые убивали приложение
             // при ошибках GL (типа GL_OUT_OF_MEMORY = 1285)
             let _ = gles.GetError(); // Просто сбрасываем флаг текущей ошибки, чтобы он не висел
-            let _ = gles.CheckFramebufferStatusOES(gles11::FRAMEBUFFER_OES); // Проверяем, но не крашимся
+            let status = gles.CheckFramebufferStatusOES(gles11::FRAMEBUFFER_OES);
+            if status != gles11::FRAMEBUFFER_COMPLETE_OES {
+                log!(
+                    "Warning: Core Animation compositor framebuffer is incomplete: {status:#x} ({fb_width}x{fb_height})"
+                );
+            }
         }
         env.framework_state
             .core_animation
             .composition
-            .texture_framebuffer = Some((texture, framebuffer));
+            .texture_framebuffer = Some((texture, framebuffer, fb_width, fb_height));
         texture
     };
+    if cached_target_was_resized {
+        env.framework_state
+            .core_animation
+            .composition
+            .texture_framebuffer = Some((
+                texture,
+                cached_texture_framebuffer.unwrap().1,
+                fb_width,
+                fb_height,
+            ));
+    }
 
     // Set up various other GL objects that will be reused on every frame.
     let misc_gl_objects = env
@@ -333,6 +398,17 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     // Clear the framebuffer and set up state to prepare for rendering
     unsafe {
         gles.Viewport(0, 0, fb_width as _, fb_height as _);
+        // The compositor owns this internal context, but its state persists
+        // across frames. Reset the tests/masks that can make every fragment
+        // fail or every color channel unwritable after a previous layer or
+        // presentation pass. Native Adreno GLES1 is particularly strict here.
+        gles.Disable(gles11::DEPTH_TEST);
+        gles.Disable(gles11::STENCIL_TEST);
+        gles.Disable(gles11::SCISSOR_TEST);
+        gles.Disable(gles11::CULL_FACE);
+        gles.ColorMask(gles11::TRUE, gles11::TRUE, gles11::TRUE, gles11::TRUE);
+        gles.DepthMask(gles11::TRUE);
+        gles.StencilMask(!0);
         gles.ClearColor(0.0, 0.0, 0.0, 1.0);
         gles.Clear(gles11::COLOR_BUFFER_BIT);
         gles.Color4f(1.0, 1.0, 1.0, 1.0);

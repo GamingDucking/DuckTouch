@@ -21,7 +21,9 @@ use crate::export_c_func;
 use crate::frameworks::audio_toolbox::audio_components::{
     self, AURenderCallbackStruct, AudioComponentInstance,
 };
-use crate::frameworks::audio_toolbox::audio_unit::{setup_audio_unit_for_render, AudioUnit};
+use crate::frameworks::audio_toolbox::audio_unit::{
+    notify_audio_unit_is_running, setup_audio_unit_for_render, AudioUnit,
+};
 use crate::frameworks::carbon_core::{paramErr, OSStatus};
 use crate::frameworks::core_foundation::cf_run_loop::CFRunLoopGetMain;
 use crate::frameworks::foundation::ns_run_loop;
@@ -318,11 +320,21 @@ fn AUGraphStop(env: &mut Environment, graph: AUGraph) -> OSStatus {
     };
 
     for unit in units {
+        let was_started = audio_components::State::get(&mut env.framework_state)
+            .audio_component_instances
+            .get(&unit)
+            .map(|obj| obj.started)
+            .unwrap_or(false);
+
         if let Some(obj) = audio_components::State::get(&mut env.framework_state)
             .audio_component_instances
             .get_mut(&unit)
         {
             obj.started = false;
+        }
+
+        if was_started {
+            notify_audio_unit_is_running(env, unit);
         }
     }
 
