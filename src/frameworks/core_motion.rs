@@ -986,7 +986,7 @@ const CLASSES: ClassExports = objc_classes! {
     // upright (gaming) holds — tiny tilts then snap the camera to full
     // deflection.
     let now = Instant::now();
-    let (_attitude_q, gravity_g, user_g) = {
+    let (attitude_q, gravity_g, user_g) = {
         let accel_t = (accel.x, accel.y, accel.z);
         let gyro_t = (rotation_rate.x, rotation_rate.y, rotation_rate.z);
         let host = env.objc.borrow_mut::<CMMotionManagerHostObject>(this);
@@ -1006,21 +1006,18 @@ const CLASSES: ClassExports = objc_classes! {
         (q, gravity_g, user_g)
     };
 
-    // Report angles from the *fused* gravity vector using the same
-    // conventions as before: pitch = atan2(-gy, -gz), roll = atan2(gx, -gz).
-    // Fused gravity is well-behaved in upright holds because the gyroscope
-    // integration carries the estimate smoothly through the |gz|≈0 poses
-    // where raw-gravity atan2() blew up.
-    let pitch = (-gravity_g.1).atan2(-gravity_g.2);
-    let roll = gravity_g.0.atan2(-gravity_g.2);
-    let yaw = 0.0;
-    let (sp, cp) = (pitch / 2.0).sin_cos();
-    let (sr, cr) = (roll / 2.0).sin_cos();
+    // Deliver the *filter's* continuous attitude quaternion and the angles
+    // decomposed from it. Previously the quaternion was rebuilt from the two
+    // atan2() gravity angles (yaw forced to 0): that object has seams in
+    // exactly the poses people game in, and near a seam a tiny physical
+    // twist produced a huge frame-to-frame quaternion delta — camera code
+    // consuming the attitude/quaternion then spun the view to maximum.
+    let (pitch, roll, yaw) = quat_to_apple_angles(attitude_q);
     let quaternion = CMQuaternion {
-        x: sp * cr,
-        y: cp * sr,
-        z: -sp * sr,
-        w: cp * cr,
+        x: attitude_q.0,
+        y: attitude_q.1,
+        z: attitude_q.2,
+        w: attitude_q.3,
     };
 
     let data: id = msg_class![env; CMDeviceMotion new];
