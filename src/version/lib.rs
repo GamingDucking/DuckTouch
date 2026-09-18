@@ -5,6 +5,11 @@
 /// Current version. See `build.rs` for how this is generated.
 pub const VERSION: &str = include_str!(concat!(env!("OUT_DIR"), "/version.txt"));
 
+/// Short Git commit hash for this build.
+/// It omits the display version and dirty suffix.
+/// Falls back to `"git rev. unknown"` outside a Git checkout.
+pub const COMMIT_HASH: &str = include_str!(concat!(env!("OUT_DIR"), "/commit_hash.txt"));
+
 // Environment variables set by GitHub Actions
 pub const GITHUB_REPOSITORY: Option<&str> = option_env!("GITHUB_REPOSITORY");
 pub const GITHUB_SERVER_URL: Option<&str> = option_env!("GITHUB_SERVER_URL");

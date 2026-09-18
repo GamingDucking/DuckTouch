@@ -431,32 +431,23 @@ fn app_picker_inner(
         );
     }
 
-    // Version label
+    // Build label
     {
         let label_frame = CGRect {
             origin: CGPoint {
                 x: 0.0,
-                y: app_frame.size.height - 20.0,
+                y: app_picker_version_label_top(app_frame.size.height),
             },
             size: CGSize {
                 width: app_frame.size.width - 5.0,
-                height: 15.0,
+                height: APP_PICKER_VERSION_LABEL_HEIGHT,
             },
         };
         let label: id = msg_class![env; UILabel alloc];
         let label: id = msg![env; label initWithFrame:label_frame];
         let text = ns_string::from_rust_string(
             env,
-            format!(
-                "touchHLE {}{}{}",
-                crate::branding(),
-                if crate::branding().is_empty() {
-                    ""
-                } else {
-                    " "
-                },
-                crate::VERSION
-            ),
+            format!("{HYPERHLE_FORK_NAME} ({})", crate::COMMIT_HASH),
         );
         () = msg![env; label setText:text];
         () = msg![env; label setTextAlignment:UITextAlignmentRight];
@@ -489,7 +480,7 @@ fn app_picker_inner(
     };
     let title: id = msg_class![env; UILabel alloc];
     let title: id = msg![env; title initWithFrame:title_frame];
-    let text = ns_string::from_rust_string(env, "HyperHLE-Fork".to_string());
+    let text = ns_string::from_rust_string(env, HYPERHLE_FORK_NAME.to_string());
     () = msg![env; title setText:text];
     () = msg![env; title setTextAlignment:UITextAlignmentCenter];
     let font_size: CGFloat = 28.0;
@@ -500,7 +491,7 @@ fn app_picker_inner(
     () = msg![env; title setBackgroundColor:bg_color];
     () = msg![env; main_view addSubview:title];
 
-    let divider = app_frame.size.height - 124.0;
+    let quick_options_button_top = app_picker_quick_options_button_top(app_frame.size.height);
 
     let mut icon_grid_stuff = match &mut apps {
         Ok(ref mut apps) => {
@@ -520,7 +511,7 @@ fn app_picker_inner(
                 origin: CGPoint { x: 10.0, y: 10.0 },
                 size: CGSize {
                     width: app_frame.size.width - 20.0,
-                    height: divider - 20.0,
+                    height: quick_options_button_top - 20.0,
                 },
             };
             let label: id = msg_class![env; UILabel alloc];
@@ -538,9 +529,9 @@ fn app_picker_inner(
         }
     };
 
-    // With upstream's copyright panel removed, centre the single footer action
-    // in its remaining upper footer slot.
-    let buttons_row_center = divider + (app_frame.size.height - divider) / 4.0;
+    // Keep the sole footer action directly above the build label, leaving the
+    // space above it available for a fourth row of app icons.
+    let buttons_row_center = app_picker_quick_options_button_center(app_frame.size.height);
     make_button_row(
         env,
         delegate,
@@ -909,11 +900,57 @@ fn app_picker_inner(
     (app_path, option_args)
 }
 
+const HYPERHLE_FORK_NAME: &str = "HyperHLE-Fork";
+
+const APP_PICKER_VERSION_LABEL_HEIGHT: CGFloat = 15.0;
+const APP_PICKER_VERSION_LABEL_BOTTOM_INSET: CGFloat = 5.0;
+const APP_PICKER_FOOTER_GAP: CGFloat = 10.0;
+const APP_PICKER_BUTTON_ROW_HEIGHT: CGFloat = 30.0;
+const APP_PICKER_GRID_TOP: CGFloat = 44.0;
+const APP_PICKER_GRID_TO_BUTTON_GAP: CGFloat = 6.0;
+const APP_PICKER_ICON_ROWS: usize = 4;
+
 const ICON_SIZE: CGSize = CGSize {
-    width: 76.0,
-    height: 76.0,
+    width: 72.0,
+    height: 72.0,
 };
-const ICON_IMAGE_INSET: CGFloat = 10.0;
+const ICON_IMAGE_INSET: CGFloat = 9.0;
+const ICON_LABEL_TOP_GAP: CGFloat = 2.0;
+const ICON_ROW_GAP: CGFloat = 2.0;
+
+fn app_picker_version_label_top(app_height: CGFloat) -> CGFloat {
+    app_height - APP_PICKER_VERSION_LABEL_HEIGHT - APP_PICKER_VERSION_LABEL_BOTTOM_INSET
+}
+
+fn app_picker_quick_options_button_center(app_height: CGFloat) -> CGFloat {
+    app_picker_version_label_top(app_height)
+        - APP_PICKER_FOOTER_GAP
+        - APP_PICKER_BUTTON_ROW_HEIGHT / 2.0
+}
+
+fn app_picker_quick_options_button_top(app_height: CGFloat) -> CGFloat {
+    app_picker_quick_options_button_center(app_height) - APP_PICKER_BUTTON_ROW_HEIGHT / 2.0
+}
+
+fn app_picker_icon_grid_num_rows(app_height: CGFloat, label_height: CGFloat) -> usize {
+    let grid_bottom = app_picker_quick_options_button_top(app_height)
+        - APP_PICKER_GRID_TO_BUTTON_GAP;
+    let cell_content_height = ICON_SIZE.height + ICON_LABEL_TOP_GAP + label_height;
+    let cell_step_y = cell_content_height + ICON_ROW_GAP;
+    let available_height = (grid_bottom - APP_PICKER_GRID_TOP - cell_content_height).max(0.0);
+    ((available_height / cell_step_y).floor() as usize + 1).clamp(1, APP_PICKER_ICON_ROWS)
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn classic_phone_picker_has_four_icon_rows() {
+        // A visible status bar leaves `UIScreen.applicationFrame` at 320x460.
+        assert_eq!(app_picker_icon_grid_num_rows(460.0, 12.0), APP_PICKER_ICON_ROWS);
+    }
+}
 
 enum TappedIcon {
     App(usize),
@@ -949,14 +986,12 @@ fn make_icon_grid(
     let num_cols_f = num_cols as CGFloat;
     let label_size = CGSize {
         width: 74.0,
-        height: 13.0,
+        height: 12.0,
     };
     let icon_gap_x: CGFloat = 19.0;
-    let icon_gap_y: CGFloat = 4.0 + label_size.height + 14.0;
-    let grid_top = 40.0;
-    let footer_top = app_frame.size.height - 124.0;
-    let cell_step_y = ICON_SIZE.height + icon_gap_y;
-    let num_rows = (((footer_top - grid_top - 8.0) / cell_step_y).floor() as usize + 1).clamp(1, 4);
+    let icon_gap_y = ICON_LABEL_TOP_GAP + label_size.height + ICON_ROW_GAP;
+    let grid_top = APP_PICKER_GRID_TOP;
+    let num_rows = app_picker_icon_grid_num_rows(app_frame.size.height, label_size.height);
     let icon_grid_width = (ICON_SIZE.width * num_cols_f) + icon_gap_x * (num_cols_f - 1.0);
     let icon_grid_origin = CGPoint {
         x: (app_frame.size.width - icon_grid_width) / 2.0,
@@ -1004,7 +1039,7 @@ fn make_icon_grid(
         let label_frame = CGRect {
             origin: CGPoint {
                 x: (icon_frame.origin.x - (label_size.width - ICON_SIZE.width) / 2.0).round(),
-                y: (icon_frame.origin.y + ICON_SIZE.height + 4.0).round(),
+                y: (icon_frame.origin.y + ICON_SIZE.height + ICON_LABEL_TOP_GAP).round(),
             },
             size: label_size,
         };
@@ -1250,7 +1285,7 @@ fn make_button_row(
 
     let button_size = CGSize {
         width: (super_view_size.width - margin) / (buttons.len() as CGFloat) - margin,
-        height: 30.0,
+        height: APP_PICKER_BUTTON_ROW_HEIGHT,
     };
     let mut button_frame = CGRect {
         origin: CGPoint {
