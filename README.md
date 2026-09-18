@@ -68,7 +68,7 @@ Thank you for reading and understanding the situation.
 
 ## Community
 
-Join the [HyperHLE Discord server](https://discord.gg/taNP4aTvd) to discuss the project and get involved.
+Join the [HyperHLE Discord server](discord.gg/ZpEkAV47H9) to discuss the project and get involved.
 
 ---
 
