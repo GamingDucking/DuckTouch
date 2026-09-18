@@ -1832,11 +1832,10 @@ impl Dyld {
 /// walk ends in `std::terminate` → guest `exit(0)` (observed with CSR Racing:
 /// PlayHaven init threw, unwinder bailed, app exited during startup).
 ///
-/// Instead of letting the throw reach the unwinder, we log the exception type
-/// (and `what()` when readable) and simply RETURN. The caller continues after
-/// the throw point — the same trade-off as the `std::__throw_*` `BX LR` patch
-/// above, but for direct throws. The log line makes the root cause of each
-/// suppressed exception visible.
+/// Instead of letting the throw reach the unwinder, first use the shared,
+/// validated frame-pointer recovery to return to an app caller. If there is no
+/// safe frame, retain the old no-op return as a last resort. The log line makes
+/// the root cause of each suppressed exception visible.
 fn cxxabi_throw_intercept(
     env: &mut Environment,
     exception: MutVoidPtr,
@@ -1848,7 +1847,8 @@ fn cxxabi_throw_intercept(
 
     // type_info layout (Itanium, 32-bit): +0 vptr, +4 `char const* name`.
     let type_name = if !tinfo.is_null() {
-        let name_ptr: ConstPtr<u8> = env.mem.read(tinfo.cast());
+        let type_info: ConstPtr<ConstPtr<u8>> = tinfo.cast_const().cast();
+        let name_ptr: ConstPtr<u8> = env.mem.read(type_info + 1);
         read_printable_guest_string(env, name_ptr, 64)
     } else {
         String::new()
@@ -1868,15 +1868,27 @@ fn cxxabi_throw_intercept(
         String::new()
     };
 
+    let continuation = crate::libc::cxxabi::unwind_to_app_frame(env);
     let n = LOGGED.fetch_add(1, Ordering::Relaxed);
     if n < 8 {
-        log!(
-            "Suppressed guest C++ exception (no unwinder): type={} what={} at exception={:?}; \
-             execution continues after the throw point.",
-            if type_name.is_empty() { "?" } else { &type_name[..] },
-            if what.is_empty() { "?" } else { &what[..] },
-            exception
-        );
+        if let Some(continuation) = continuation {
+            log!(
+                "Suppressed guest C++ exception (no unwinder): type={} what={} at \
+                 exception={:?}; unwound to app frame {:#010x}.",
+                if type_name.is_empty() { "?" } else { &type_name[..] },
+                if what.is_empty() { "?" } else { &what[..] },
+                exception,
+                continuation.addr_with_thumb_bit()
+            );
+        } else {
+            log!(
+                "Suppressed guest C++ exception (no unwinder): type={} what={} at \
+                 exception={:?}; no safe frame, returning after the throw point.",
+                if type_name.is_empty() { "?" } else { &type_name[..] },
+                if what.is_empty() { "?" } else { &what[..] },
+                exception
+            );
+        }
     }
 }
 

@@ -145,19 +145,16 @@ fn access(env: &mut Environment, path: ConstPtr<u8>, mode: i32) -> i32 {
             return -1;
         }
     };
-    let resolved_binding = if !binding.starts_with('/') && !env.fs.exists(GuestPath::new(&binding))
-    {
-        let bundle_root = env.bundle.bundle_path().as_str().trim_end_matches('/');
-        let relative = binding.strip_prefix("Data/").unwrap_or(&binding);
-        let relative = relative.strip_prefix("Data/").unwrap_or(relative);
-        let candidate = format!("{bundle_root}/Data/{relative}");
-        if env.fs.exists(GuestPath::new(&candidate)) {
-            candidate
-        } else {
-            binding.clone()
-        }
-    } else {
-        binding.clone()
+    // Keep `access` in lockstep with stat/open.  Unity uses access() as an
+    // existence probe for Data/data.unity3d on some player versions, so a
+    // case-only or stale-bundle-path mismatch must not make it reject a file
+    // that open() would successfully load.
+    let Some(resolved_binding) =
+        crate::libc::posix_io::resolve_existing_guest_path(env, &binding)
+    else {
+        env.note_missing_unity_player_archive(&binding);
+        set_errno(env, ENOENT);
+        return -1;
     };
     let guest_path = GuestPath::new(&resolved_binding);
     let (exists, read, write, execute) = env.fs.access(guest_path);

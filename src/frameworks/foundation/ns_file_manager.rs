@@ -950,7 +950,9 @@ pub const CLASSES: ClassExports = objc_classes! {
         return false;
     }
     let path = ns_string::to_rust_string(env, path);
-    env.fs.exists(GuestPath::new(&path))
+    env.fs
+        .resolve_case_insensitive_path(GuestPath::new(&path))
+        .is_some()
 }
 
 - (bool)fileExistsAtPath:(id)path
@@ -963,11 +965,12 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 
     let path_str = ns_string::to_rust_string(env, path);
-    let guest_path = GuestPath::new(&path_str);
-
-    if env.fs.exists(guest_path) {
+    if let Some(guest_path) = env
+        .fs
+        .resolve_case_insensitive_path(GuestPath::new(&path_str))
+    {
         if !is_dir_ptr.is_null() {
-            let is_dir = env.fs.is_dir(guest_path);
+            let is_dir = env.fs.is_dir(&guest_path);
             env.mem.write(is_dir_ptr, is_dir);
         }
         true
@@ -984,7 +987,9 @@ pub const CLASSES: ClassExports = objc_classes! {
         return false;
     }
     let path = ns_string::to_rust_string(env, path);
-    env.fs.exists(GuestPath::new(&path)) // All existing files are readable
+    env.fs
+        .resolve_case_insensitive_path(GuestPath::new(&path))
+        .is_some() // All existing files are readable
 }
 
 - (bool)isWritableFileAtPath:(id)path {
@@ -992,7 +997,9 @@ pub const CLASSES: ClassExports = objc_classes! {
         return false;
     }
     let path = ns_string::to_rust_string(env, path);
-    env.fs.exists(GuestPath::new(&path)) // All existing files are writable
+    env.fs
+        .resolve_case_insensitive_path(GuestPath::new(&path))
+        .is_some() // All existing files are writable
 }
 
 - (bool)isExecutableFileAtPath:(id)path {
@@ -1002,7 +1009,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     // We don't support execution right now, but for compatibility might want to
     // return true for certain files
     let path = ns_string::to_rust_string(env, path);
-    env.fs.exists(GuestPath::new(&path))
+    env.fs
+        .resolve_case_insensitive_path(GuestPath::new(&path))
+        .is_some()
 }
 
 - (bool)isDeletableFileAtPath:(id)path {
@@ -1010,7 +1019,9 @@ pub const CLASSES: ClassExports = objc_classes! {
         return false;
     }
     let path = ns_string::to_rust_string(env, path);
-    env.fs.exists(GuestPath::new(&path)) // All existing files are deletable
+    env.fs
+        .resolve_case_insensitive_path(GuestPath::new(&path))
+        .is_some() // All existing files are deletable
 }
 
 // MARK: - Getting and Setting Attributes
@@ -1028,9 +1039,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 
     let path_str = ns_string::to_rust_string(env, path);
-    let guest_path = GuestPath::new(&path_str);
-
-    if !env.fs.exists(guest_path) {
+    let Some(guest_path) = env
+        .fs
+        .resolve_case_insensitive_path(GuestPath::new(&path_str))
+    else {
         if !error.is_null() {
             let domain = get_static_str(env, NSCocoaErrorDomain);
             let ns_error = msg_class![env; NSError alloc];
@@ -1038,10 +1050,14 @@ pub const CLASSES: ClassExports = objc_classes! {
             env.mem.write(error, ns_error);
         }
         return nil;
-    }
+    };
 
-    let is_dir = env.fs.is_dir(guest_path);
-    let file_size = if is_dir { 0 } else { env.fs.read(guest_path).map(|d| d.len()).unwrap_or(0) };
+    let is_dir = env.fs.is_dir(&guest_path);
+    let file_size = if is_dir {
+        0
+    } else {
+        env.fs.read(&guest_path).map(|d| d.len()).unwrap_or(0)
+    };
 
     let dict: id = msg_class![env; NSMutableDictionary dictionary];
 
@@ -1148,8 +1164,20 @@ pub const CLASSES: ClassExports = objc_classes! {
         return true;
     }
 
-    let Ok(d1) = env.fs.read(GuestPath::new(&p1)) else { return false };
-    let Ok(d2) = env.fs.read(GuestPath::new(&p2)) else { return false };
+    let Some(p1) = env
+        .fs
+        .resolve_case_insensitive_path(GuestPath::new(&p1))
+    else {
+        return false;
+    };
+    let Some(p2) = env
+        .fs
+        .resolve_case_insensitive_path(GuestPath::new(&p2))
+    else {
+        return false;
+    };
+    let Ok(d1) = env.fs.read(&p1) else { return false };
+    let Ok(d2) = env.fs.read(&p2) else { return false };
 
     d1 == d2
 }

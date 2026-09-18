@@ -207,6 +207,85 @@ fn creat(env: &mut Environment, path: ConstPtr<u8>, _mode: u32) -> i32 {
     open_direct(env, path, flags)
 }
 
+/// Return the part of an absolute path after its first `.app` component.
+///
+/// The component comparison deliberately follows the app-volume's
+/// case-insensitive semantics.  This lets a player preserve a stale bundle name
+/// (or spelling such as `GRANNY.APP`) without accidentally treating a filename
+/// like `something.app.backup` as an app bundle.
+fn path_after_app_bundle_component(path: &str) -> Option<&str> {
+    let mut component_start = 0;
+    for component in path.split('/') {
+        let component_end = component_start + component.len();
+        if component
+            .get(component.len().saturating_sub(".app".len())..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".app"))
+        {
+            return path
+                .get(component_end..)
+                .map(|relative| relative.trim_start_matches('/'));
+        }
+        // `split('/')` advances past exactly one slash between components.
+        component_start = component_end + 1;
+    }
+    None
+}
+
+/// Resolve an existing file path as iPhone OS would see it.
+///
+/// Bundle files live on a case-insensitive volume on the devices this emulator
+/// targets.  In addition, several Unity players use a stale absolute bundle
+/// path or omit the `Data/` prefix when probing their player archive.  Keep the
+/// compatibility search in one place so `open`, `stat`, and `access` agree
+/// about whether a resource is mounted.
+pub(crate) fn resolve_existing_guest_path(env: &Environment, path: &str) -> Option<String> {
+    let resolve = |candidate: &str| {
+        env.fs
+            .resolve_case_insensitive_path(GuestPath::new(candidate))
+            .map(Into::<String>::into)
+    };
+
+    if let Some(resolved) = resolve(path) {
+        return Some(resolved);
+    }
+
+    let bundle_root = env.bundle.bundle_path().as_str().trim_end_matches('/');
+    let relative_path = if path == bundle_root {
+        Some("")
+    } else if let Some(relative) = path
+        .strip_prefix(bundle_root)
+        .filter(|relative| relative.starts_with('/'))
+    {
+        Some(relative.trim_start_matches('/'))
+    } else if path.starts_with('/') {
+        // A few engines preserve the original `.app` directory in a saved
+        // path, even though the VFS names the mounted bundle from
+        // CFBundleName. Only remap a complete app-bundle component; never
+        // redirect arbitrary absolute filesystem paths.
+        path_after_app_bundle_component(path)
+    } else {
+        Some(path.trim_start_matches("./"))
+    }?;
+
+    let data_relative_path = relative_path
+        .split_once('/')
+        .and_then(|(component, remainder)| {
+            component.eq_ignore_ascii_case("Data").then_some(remainder)
+        })
+        .unwrap_or(relative_path);
+    let mut candidates = vec![
+        format!("{bundle_root}/{relative_path}"),
+        format!("{bundle_root}/Data/{data_relative_path}"),
+    ];
+    // A few repackaged Unity players place the archive at the bundle root
+    // while their executable still probes Data/data.unity3d. Prefer the real
+    // Data path above, then accept that layout as a last resource-only alias.
+    if data_relative_path != relative_path {
+        candidates.push(format!("{bundle_root}/{data_relative_path}"));
+    }
+    candidates.iter().find_map(|candidate| resolve(candidate))
+}
+
 pub fn open_direct(env: &mut Environment, path: ConstPtr<u8>, flags: i32) -> FileDescriptor {
     let known_flags = O_ACCMODE
         | O_NONBLOCK
@@ -312,71 +391,17 @@ pub fn open_direct(env: &mut Environment, path: ConstPtr<u8>, flags: i32) -> Fil
         return fd;
     }
 
-    fn case_insensitive_path(env: &Environment, path: &str) -> Option<String> {
-        if env.fs.exists(GuestPath::new(path)) {
-            return Some(path.to_string());
-        }
-
-        let is_absolute = path.starts_with('/');
-        let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
-        let mut current_path = if is_absolute {
-            String::from("/")
-        } else {
-            String::new()
-        };
-
-        for part in parts {
-            let parent_to_search = if current_path.is_empty() {
-                ".".to_string()
-            } else {
-                current_path.clone()
-            };
-            let target_lower = part.to_lowercase();
-            let found = {
-                let mut entries = env.fs.enumerate(GuestPath::new(&parent_to_search)).ok()?;
-                entries
-                    .find(|entry| entry.to_lowercase() == target_lower)
-                    .map(str::to_string)?
-            };
-
-            if !current_path.is_empty() && !current_path.ends_with('/') {
-                current_path.push('/');
-            }
-            current_path.push_str(&found);
-        }
-
-        if env.fs.exists(GuestPath::new(&current_path)) {
-            Some(current_path)
-        } else {
-            None
-        }
+    let actual_path_string = if (flags & O_CREAT) == 0 {
+        resolve_existing_guest_path(env, &path_string)
+    } else {
+        // O_CREAT still needs case-insensitive matching for an existing file
+        // (notably O_CREAT|O_EXCL), but must not redirect a new file into the
+        // app bundle's read-only resource tree.
+        env.fs
+            .resolve_case_insensitive_path(GuestPath::new(&path_string))
+            .map(Into::<String>::into)
     }
-
-    let actual_path_string = case_insensitive_path(env, &path_string)
-        .or_else(|| {
-            if (flags & O_CREAT) != 0 {
-                return None;
-            }
-
-            let bundle_root = env.bundle.bundle_path().as_str().trim_end_matches('/');
-            let relative_path = path_string.trim_start_matches("./");
-            let data_relative_path = relative_path.strip_prefix("Data/").unwrap_or(relative_path);
-            let bundle_relative_path = format!("{bundle_root}/{relative_path}");
-            let bundle_data_path = format!("{bundle_root}/Data/{data_relative_path}");
-            let candidates = [bundle_relative_path, bundle_data_path];
-            let result = candidates
-                .iter()
-                .find_map(|candidate| case_insensitive_path(env, candidate));
-            if let Some(ref resolved) = result {
-                log_dbg!(
-                    "Resolved app resource path {:?} to {:?}",
-                    path_string,
-                    resolved
-                );
-            }
-            result
-        })
-        .unwrap_or_else(|| path_string.clone());
+    .unwrap_or_else(|| path_string.clone());
 
     // ИСПРАВЛЕНИЕ 2: корректная реализация O_EXCL.
     // O_CREAT|O_EXCL означает «создать файл, но вернуть ошибку, если он уже
@@ -417,6 +442,9 @@ pub fn open_direct(env: &mut Environment, path: ConstPtr<u8>, flags: i32) -> Fil
         }
         Err(()) => -1,
     };
+    if res == -1 && (flags & O_CREAT) == 0 {
+        env.note_missing_unity_player_archive(&path_string);
+    }
     if res != -1 && (flags & O_SHLOCK) != 0 {
         flock(env, res, LOCK_SH);
     }
@@ -441,34 +469,58 @@ pub fn read(
         return -1;
     }
 
-    let Some(file) = env.libc_state.posix_io.file_for_fd(fd) else {
-        log!(
-            "Warning: read({:?}, {:?}, {:#x}) called with unknown fd, returning -1",
-            fd,
-            buffer,
-            size
-        );
-        set_errno(env, EBADF);
-        return -1;
-    };
+    // Keep the descriptor borrow inside this block: after an unreadable Unity
+    // archive is detected, we need the whole Environment to record it before
+    // the guest can reach its fatal exit path.
+    let (read_result, unusable_player_archive) = {
+        let Some(file) = env.libc_state.posix_io.file_for_fd(fd) else {
+            log!(
+                "Warning: read({:?}, {:?}, {:#x}) called with unknown fd, returning -1",
+                fd,
+                buffer,
+                size
+            );
+            set_errno(env, EBADF);
+            return -1;
+        };
 
-    let buffer_slice = env.mem.bytes_at_mut(buffer.cast(), size);
-    match file.file.read(buffer_slice) {
-        Ok(bytes_read) => {
-            if bytes_read == 0 && size != 0 {
+        // A zero-length first read of Unity's mandatory archive means that a
+        // ZIP entry was registered but could not be decompressed. Do not treat
+        // a normal EOF after valid data as a mount failure.
+        let starts_at_beginning = file.file.stream_position().ok() == Some(0);
+        let archive_path = file.path.clone();
+        let read_result = {
+            let buffer_slice = env.mem.bytes_at_mut(buffer.cast(), size);
+            file.file.read(buffer_slice)
+        };
+        if let Ok(bytes_read) = &read_result {
+            if *bytes_read == 0 && size != 0 {
                 file.reached_eof = true;
             }
-            // ИСПРАВЛЕНИЕ 3: не выдавать Warning при нормальном EOF (bytes_read
-            // == 0).
-            // Многие приложения читают файлы побайтово до конца — это штатное
-            // поведение, не ошибка. Warning остаётся только для частичного
-            // чтения
-            // (когда прочитано больше 0 байт, но меньше запрошенного).
+        }
+        let unusable_player_archive = match &read_result {
+            Ok(bytes_read) if *bytes_read == 0 && size != 0 && starts_at_beginning => archive_path,
+            // An I/O error at any offset makes this required archive unusable;
+            // note it even when the caller has already read its header.
+            Err(_) => archive_path,
+            _ => None,
+        };
+        (read_result, unusable_player_archive)
+    };
+
+    if let Some(path) = unusable_player_archive {
+        env.note_missing_unity_player_archive(&path);
+    }
+
+    match read_result {
+        Ok(bytes_read) => {
+            // Do not emit a warning for normal EOF. Many apps read files one
+            // byte at a time until the end; that is routine POSIX behavior.
             if bytes_read == 0 {
                 log_dbg!("read({:?}, {:?}, {:#x}) => 0 (EOF)", fd, buffer, size);
-            } else if bytes_read < buffer_slice.len() {
+            } else if bytes_read < size as usize {
                 // POSIX read(2) returning fewer bytes than requested is normal
-                // (e.g., near EOF or for non-regular files). Demote to debug log.
+                // (e.g. near EOF or for non-regular files). Demote to debug log.
                 log_dbg!(
                     "read({:?}, {:?}, {:#x}) read only {:#x} bytes",
                     fd,
@@ -1565,4 +1617,29 @@ fn release_range_from_locks(locks: &mut Vec<LockRange>, release: &LockRange) {
         }
     }
     *locks = new_locks;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::path_after_app_bundle_component;
+
+    #[test]
+    fn finds_case_insensitive_complete_app_bundle_components() {
+        assert_eq!(
+            path_after_app_bundle_component(
+                "/var/mobile/Applications/old-id/GRANNY.APP/Data/data.unity3d"
+            ),
+            Some("Data/data.unity3d")
+        );
+        assert_eq!(
+            path_after_app_bundle_component("/var/mobile/Applications/old-id/Granny.app"),
+            Some("")
+        );
+        assert_eq!(
+            path_after_app_bundle_component(
+                "/var/mobile/Applications/old-id/Granny.app.backup/Data/data.unity3d"
+            ),
+            None
+        );
+    }
 }

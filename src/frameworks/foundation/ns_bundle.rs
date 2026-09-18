@@ -1045,8 +1045,28 @@ fn path_for_resource_helper(
     // NSBundle's normal lookup remains first; this fallback only applies when
     // the requested resource is not found there.
     let data_component = ns_string::get_static_str(env, "Data");
-    let data_path: id = msg![env; path stringByAppendingPathComponent:data_component];
+    // `path` already includes the requested filename, so appending `Data` to
+    // it produces `<bundle>/file/Data/file` rather than Unity's
+    // `<bundle>/Data/file`.  Start again from the bundle resource root and
+    // apply the request components in their original order.
+    let data_path: id = msg![env; bundle resourcePath];
+    let data_path: id = msg![env; data_path stringByAppendingPathComponent:data_component];
+    let data_path: id = if directory != nil {
+        msg![env; data_path stringByAppendingPathComponent:directory]
+    } else {
+        data_path
+    };
     let data_path: id = msg![env; data_path stringByAppendingPathComponent:name];
+    let data_path: id = if extension != nil {
+        let ext_str = ns_string::to_rust_string(env, extension);
+        if ext_str.is_empty() {
+            data_path
+        } else {
+            msg![env; data_path stringByAppendingPathExtension:extension]
+        }
+    } else {
+        data_path
+    };
     let data_path_exists: bool = msg![env; file_manager fileExistsAtPath:data_path];
     // This fires hundreds of times per app launch for games that probe many
     // resource names; keep it out of the user-facing log.

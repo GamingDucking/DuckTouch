@@ -1157,26 +1157,8 @@ unsafe fn present_renderbuffer_es2(
     viewport: (u32, u32, u32, u32),
     rotation_matrix: crate::matrix::Matrix<2>,
     virtual_cursor_visible_at: Option<(f32, f32, bool)>,
-    options: &crate::options::Options,
-    context_token: usize,
 ) {
     use crate::gles::gles2_raw as gles2;
-
-    // GL names are not globally valid across independent EAGL contexts. The
-    // presenter cache is per thread for speed, so explicitly invalidate it
-    // whenever presentation moves to a different EAGLContext.
-    let context_changed = PRESENT_CONTEXT_TOKEN.with(|cell| {
-        let changed = cell.get() != Some(context_token);
-        cell.set(Some(context_token));
-        changed
-    });
-    if context_changed {
-        PRESENT_PROGRAM.with(|cell| cell.set(None));
-        PRESENT_OBJECTS.with(|cell| cell.set(None));
-        PRESENT_SOURCE_RENDERBUFFER.with(|cell| cell.set(0));
-        PRESENT_TEXTURE_SIZE.with(|cell| cell.set(None));
-        log!("GLES2 presenter: invalidated cached GL objects after EAGL context switch");
-    }
 
     // Save state we are about to clobber
     let mut old_program: GLint = 0;
@@ -1211,8 +1193,9 @@ unsafe fn present_renderbuffer_es2(
     let blend_was_on = gles.IsEnabled(gles2::BLEND) != 0;
     let scissor_was_on = gles.IsEnabled(gles2::SCISSOR_TEST) != 0;
 
-    // Resolve renderbuffer → texture with cached GL objects and the ES 2.0
-    // entry points.
+    // Resolve the renderbuffer supplied by `-presentRenderbuffer:` into a
+    // texture with cached ES 2.0 objects. Passing this explicit object avoids
+    // trusting a guest's later renderbuffer binding.
     let (width, height) = {
         let mut w: GLint = 0;
         let mut h: GLint = 0;
@@ -1226,10 +1209,9 @@ unsafe fn present_renderbuffer_es2(
         // Prefer the application's already-bound FBO as the copy source.
         // Switching away from it before CopyTexSubImage2D can discard
         // unresolved tile data on Adreno, leaving the presentation texture
-        // black even though the guest just rendered a valid frame. This is
-        // the same rule used by the ES1 readback path below. Keep the cached
-        // source FBO only as a fallback for apps that present with framebuffer
-        // zero bound, or when its color attachment is not this drawable.
+        // black even though the guest just rendered a valid frame. Keep the
+        // cached source FBO as a fallback only when the bound FBO cannot be
+        // verified to contain this drawable.
         let (attached_renderbuffer, framebuffer_status) = if old_framebuffer != 0 {
             let mut attached = 0;
             gles.GetFramebufferAttachmentParameteriv(
@@ -1250,8 +1232,8 @@ unsafe fn present_renderbuffer_es2(
             && framebuffer_status == gles2::FRAMEBUFFER_COMPLETE;
         if !use_bound_framebuffer {
             // Resolve the guest's current draw target before switching to the
-            // cached source FBO. Otherwise a tile-based driver can discard
-            // the frame while the fallback FBO is being bound.
+            // cached source FBO. Otherwise a tile-based driver can discard the
+            // frame while the fallback FBO is being bound.
             gles.Finish();
             let source_renderbuffer = PRESENT_SOURCE_RENDERBUFFER.with(|cell| cell.get());
             gles.BindFramebuffer(gles2::FRAMEBUFFER, present_objects.framebuffer);
@@ -1563,8 +1545,8 @@ struct PresentProgram {
 /// the driver's ability to pipeline frames, which shows up as severe stutter
 /// in 60 FPS games (notably Unity titles, which present through this path).
 /// Caching the objects and reusing them across frames removes that per-frame
-/// churn entirely. The texture's storage is redefined each frame by
-/// `glCopyTexImage2D`, so a resolution change needs no special handling.
+/// churn entirely. Texture storage is allocated only when its dimensions
+/// change; steady-state frames use `glCopyTexSubImage2D`.
 #[derive(Copy, Clone)]
 struct PresentObjects {
     framebuffer: GLuint,
@@ -1581,12 +1563,34 @@ thread_local! {
         const { std::cell::Cell::new(0) };
     static PRESENT_TEXTURE_SIZE: std::cell::Cell<Option<(GLint, GLint)>> =
         const { std::cell::Cell::new(None) };
+    // Cached texture for the ES 1.1 (fixed-function) present path. Keeping it
+    // alive avoids per-frame allocation and storage redefinition.
+    static PRESENT_ES1_TEXTURE: std::cell::Cell<Option<(GLuint, GLint, GLint)>> =
+        const { std::cell::Cell::new(None) };
     /// GL object names are context-local unless contexts share a sharegroup.
-    /// Keep the presenter cache tied to the EAGLContext host object so a game
-    /// switching between EAGL contexts cannot make us draw with another
-    /// context's program/FBO/texture names.
+    /// Keep every presenter cache tied to the EAGLContext host object so a game
+    /// switching contexts cannot use another context's program/FBO/texture.
     static PRESENT_CONTEXT_TOKEN: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
+}
+
+/// Drop presenter object names whenever the current EAGL context changes.
+/// The caches are thread-local for the normal fast path, but OpenGL names are
+/// only valid in the context (or sharegroup) that created them.
+fn invalidate_present_cache_for_context(context_token: usize) {
+    let changed = PRESENT_CONTEXT_TOKEN.with(|cell| {
+        let changed = cell.get() != Some(context_token);
+        cell.set(Some(context_token));
+        changed
+    });
+    if changed {
+        PRESENT_PROGRAM.with(|cell| cell.set(None));
+        PRESENT_OBJECTS.with(|cell| cell.set(None));
+        PRESENT_SOURCE_RENDERBUFFER.with(|cell| cell.set(0));
+        PRESENT_TEXTURE_SIZE.with(|cell| cell.set(None));
+        PRESENT_ES1_TEXTURE.with(|cell| cell.set(None));
+        log!("EAGL presenter: invalidated cached GL objects after EAGL context switch");
+    }
 }
 
 unsafe fn ensure_present_program(gles: &mut dyn GLES) -> Option<PresentProgram> {
@@ -1850,6 +1854,8 @@ unsafe fn present_renderbuffer(
     let mut gles_boxed = gles_ctx.make_current(env.window.as_mut().unwrap());
     let gles = gles_boxed.as_mut();
 
+    invalidate_present_cache_for_context(context_token);
+
     // Per-section diagnostic checkpoint helper. When --trace-gl-errors is
     // on, this drains GL errors after each named section of
     // present_renderbuffer and logs the *first* time each named section
@@ -1914,8 +1920,6 @@ unsafe fn present_renderbuffer(
                 viewport,
                 rotation_matrix,
                 virtual_cursor_visible_at,
-                options,
-                context_token,
             );
             std::mem::drop(gles_boxed);
             env.window.as_mut().unwrap().swap_window();
@@ -2058,35 +2062,45 @@ unsafe fn present_renderbuffer(
         );
     }
 
-    // Create a texture with a copy of the pixels in the framebuffer
-    let mut texture: GLuint = 0;
-    gles.GenTextures(1, &mut texture);
-    gles.BindTexture(gles11::TEXTURE_2D, texture);
-    // Set the texture parameters BEFORE the copy: the renderbuffer is
-    // typically non-power-of-two (e.g. 640x1136), and on strict ES 1.1
-    // drivers (ANGLE's GLES1 front-end, Mali) a CopyTexImage2D into a
-    // texture whose wrap mode is still the GL_REPEAT default fails with
-    // GL_INVALID_ENUM, leaving an incomplete texture and a black frame.
-    gles.TexParameteri(
-        gles11::TEXTURE_2D,
-        gles11::TEXTURE_MIN_FILTER,
-        gles11::LINEAR as _,
-    );
-    gles.TexParameteri(
-        gles11::TEXTURE_2D,
-        gles11::TEXTURE_MAG_FILTER,
-        gles11::LINEAR as _,
-    );
-    gles.TexParameteri(
-        gles11::TEXTURE_2D,
-        gles11::TEXTURE_WRAP_S,
-        gles11::CLAMP_TO_EDGE as _,
-    );
-    gles.TexParameteri(
-        gles11::TEXTURE_2D,
-        gles11::TEXTURE_WRAP_T,
-        gles11::CLAMP_TO_EDGE as _,
-    );
+    // Cache the ES1 texture across frames (but the context helper above
+    // drops it before it could be used by another EAGLContext). Steady-state
+    // frames can then use CopyTexSubImage2D without object churn or storage
+    // reallocation.
+    let (texture, storage_valid) =
+        if let Some((texture, cached_width, cached_height)) = PRESENT_ES1_TEXTURE.with(|c| c.get()) {
+            gles.BindTexture(gles11::TEXTURE_2D, texture);
+            (texture, cached_width == width && cached_height == height)
+        } else {
+            let mut texture = 0;
+            gles.GenTextures(1, &mut texture);
+            gles.BindTexture(gles11::TEXTURE_2D, texture);
+
+            // Set the texture parameters before the first copy: the
+            // renderbuffer is typically non-power-of-two, and strict ES 1.1
+            // drivers reject CopyTexImage2D into a texture that still uses the
+            // GL_REPEAT default wrap mode.
+            gles.TexParameteri(
+                gles11::TEXTURE_2D,
+                gles11::TEXTURE_MIN_FILTER,
+                gles11::LINEAR as _,
+            );
+            gles.TexParameteri(
+                gles11::TEXTURE_2D,
+                gles11::TEXTURE_MAG_FILTER,
+                gles11::LINEAR as _,
+            );
+            gles.TexParameteri(
+                gles11::TEXTURE_2D,
+                gles11::TEXTURE_WRAP_S,
+                gles11::CLAMP_TO_EDGE as _,
+            );
+            gles.TexParameteri(
+                gles11::TEXTURE_2D,
+                gles11::TEXTURE_WRAP_T,
+                gles11::CLAMP_TO_EDGE as _,
+            );
+            (texture, false)
+        };
     // Force completion of any pending draws targeting the renderbuffer
     // BEFORE we copy from it. On a spec-conformant driver glCopyTexImage2D
     // implicitly syncs, but on ARM Mali r32p1 (Mali-G57 MC2 OpenGL ES-CM
@@ -2105,16 +2119,32 @@ unsafe fn present_renderbuffer(
     // ensuring correctness is fine. (And on lenient drivers glFinish on
     // an already-flushed pipeline is essentially free.)
     gles.Finish();
-    gles.CopyTexImage2D(
-        gles11::TEXTURE_2D,
-        0,
-        gles11::RGB as _,
-        0,
-        0,
-        width,
-        height,
-        0,
-    );
+    if storage_valid {
+        // Steady state: copy into the preallocated storage without
+        // redefining it.
+        gles.CopyTexSubImage2D(
+            gles11::TEXTURE_2D,
+            0,
+            0,
+            0,
+            0,
+            0,
+            width,
+            height,
+        );
+    } else {
+        gles.CopyTexImage2D(
+            gles11::TEXTURE_2D,
+            0,
+            gles11::RGBA as _,
+            0,
+            0,
+            width,
+            height,
+            0,
+        );
+        PRESENT_ES1_TEXTURE.with(|c| c.set(Some((texture, width, height))));
+    }
     {
         static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -2291,35 +2321,9 @@ unsafe fn present_renderbuffer(
             );
         }
     }
-    // The texture will not have any mip levels so we must ensure the filter
-    // does not use them, else rendering will fail. Also force
-    // GL_CLAMP_TO_EDGE wrap because the renderbuffer is typically a
-    // non-power-of-two size (e.g. 480x320 for an iPhone landscape app)
-    // and many ES 1.1 implementations only allow GL_CLAMP_TO_EDGE for
-    // NPOT textures; without an explicit wrap the texture would inherit
-    // GL_REPEAT and render as black on strict drivers. Set both
-    // MIN_FILTER and MAG_FILTER explicitly so neither falls back to a
-    // mipmap-using default.
-    gles.TexParameteri(
-        gles11::TEXTURE_2D,
-        gles11::TEXTURE_MIN_FILTER,
-        gles11::LINEAR as _,
-    );
-    gles.TexParameteri(
-        gles11::TEXTURE_2D,
-        gles11::TEXTURE_MAG_FILTER,
-        gles11::LINEAR as _,
-    );
-    gles.TexParameteri(
-        gles11::TEXTURE_2D,
-        gles11::TEXTURE_WRAP_S,
-        gles11::CLAMP_TO_EDGE as _,
-    );
-    gles.TexParameteri(
-        gles11::TEXTURE_2D,
-        gles11::TEXTURE_WRAP_T,
-        gles11::CLAMP_TO_EDGE as _,
-    );
+    // Texture filter/wrap parameters were set once at creation (see the
+    // comment in the cold path above); re-issuing them every frame is
+    // unnecessary driver work.
     {
         static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -2589,13 +2593,9 @@ unsafe fn present_renderbuffer(
         );
     }
 
-    // Clean up the texture
-    gles.DeleteTextures(1, &texture);
-    {
-        static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-        present_check(gles, trace_gl_errors, &SEEN, "after DeleteTextures");
-    }
+    // PERF: the present texture is cached across frames
+    // (PRESENT_ES1_TEXTURE); do not delete it here. The restore below binds
+    // the app's previous texture, which also unbinds ours.
 
     // Restore all the state saved before rendering
     for (&is_enabled, info) in old_arrays.iter().zip(gles1_on_gl2::ARRAYS.iter()) {
