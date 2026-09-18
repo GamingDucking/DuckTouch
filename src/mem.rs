@@ -587,6 +587,7 @@ impl Mem {
     /// 0. This may be inconvenient in some cases, but it makes the behavior
     /// when deriving a pointer from the slice consistent (though you should use
     /// [Self::ptr_at] for that).
+    #[inline]
     pub fn bytes_at<const MUT: bool>(&self, ptr: Ptr<u8, MUT>, count: GuestUSize) -> &[u8] {
         // ХАК: Вместо паники логируем и возвращаем данные из stub-страницы
         if ptr.to_bits() < self.null_segment_size {
@@ -652,6 +653,7 @@ impl Mem {
     /// 0. This may be inconvenient in some cases, but it makes the behavior
     /// when deriving a pointer from the slice consistent (though you should use
     /// [Self::ptr_at_mut] for that).
+    #[inline]
     pub fn bytes_at_mut(&mut self, ptr: MutPtr<u8>, count: GuestUSize) -> &mut [u8] {
         // ХАК: Вместо паники логируем и возвращаем данные из stub-страницы
         if ptr.to_bits() < self.null_segment_size {
@@ -696,6 +698,7 @@ impl Mem {
     /// Rust strictly requires pointers to be
     /// well-aligned when dereferencing them, or when constructing references or
     /// slices from them, so **be very careful**.
+    #[inline]
     pub fn ptr_at<T, const MUT: bool>(&self, ptr: Ptr<T, MUT>, count: GuestUSize) -> *const T
     where
         T: SafeRead,
@@ -732,6 +735,7 @@ impl Mem {
     /// Rust strictly requires pointers to be
     /// well-aligned when dereferencing them, or when constructing references or
     /// slices from them, so **be very careful**.
+    #[inline]
     pub fn ptr_at_mut<T>(&mut self, ptr: MutPtr<T>, count: GuestUSize) -> *mut T
     where
         T: SafeRead + SafeWrite,
@@ -769,6 +773,7 @@ impl Mem {
     /// Read a value for memory.
     /// This is the preferred way to read memory in
     /// most cases.
+    #[inline]
     pub fn read<T, const MUT: bool>(&self, ptr: Ptr<T, MUT>) -> T
     where
         T: SafeRead,
@@ -781,6 +786,7 @@ impl Mem {
     /// Write a value to memory.
     /// This is the preferred way to write memory in
     /// most cases.
+    #[inline]
     pub fn write<T>(&mut self, ptr: MutPtr<T>, value: T)
     where
         T: SafeWrite,

@@ -27,6 +27,7 @@
 #[macro_use]
 mod log;
 mod env_flags;
+mod fastmap;
 mod abi;
 mod android_media;
 mod android_web_view;
