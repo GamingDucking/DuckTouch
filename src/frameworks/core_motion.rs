@@ -120,6 +120,10 @@ struct CMMotionManagerHostObject {
     /// fallback created via `Default::default()`; real motion managers
     /// allocated through `+alloc` always populate this with `Instant::now()`.
     start_time: Option<Instant>,
+    /// Attitude quaternion (x, y, z, w) from the complementary filter, and
+    /// the timestamp of the last filter step. `None` until initialised on
+    /// the first device-motion read.
+    attitude_state: Option<((f64, f64, f64, f64), Instant)>,
 }
 impl HostObject for CMMotionManagerHostObject {}
 
@@ -146,6 +150,9 @@ struct CMDeviceMotionHostObject {
     /// Rotation rate
     rotation_rate: CMRotationRate,
     timestamp: f64,
+    /// Attitude from the sensor-fusion filter (pitch/roll/yaw + quaternion).
+    attitude: CMAttitude,
+    quaternion: CMQuaternion,
 }
 impl HostObject for CMDeviceMotionHostObject {}
 
@@ -229,6 +236,172 @@ fn read_sdl_gyroscope(env: &Environment) -> Option<CMRotationRate> {
         y: y as f64,
         z: z as f64,
     })
+}
+
+// =============================================================================
+// Attitude estimation (complementary gyroscope + accelerometer filter)
+//
+// Earlier versions derived roll/pitch with atan2() directly from the raw
+// gravity vector. That is mathematically correct, but ill-conditioned exactly
+// in the way phones are held while gaming (held upright in landscape, where
+// gravity's z component is near zero and tiny tilts swing the estimated
+// angles up to the full +/-90 degrees — the camera "snaps to max" symptom).
+// Apple's own deviceMotion comes from sensor fusion and behaves smoothly in
+// those holds, so we do a miniature version of the same: integrate the
+// gyroscope and continuously correct the estimate towards the measured
+// gravity vector. Without a host gyroscope the correction alone applies,
+// which still smooths the old atan2-behaviour.
+// =============================================================================
+
+/// Smallest angular step worth applying, to avoid normalising ~zero vectors.
+const ATTITUDE_EPSILON: f64 = 1.0e-9;
+/// Gain [0..1] of the gravity correction applied per second of elapsed time.
+const ATTITUDE_CORRECTION_PER_SEC: f64 = 8.0;
+/// Gyroscope integration is skipped for steps larger than this: beyond it a
+/// stale rate sample would integrate garbage (e.g. after a suspended frame).
+const ATTITUDE_MAX_GYRO_DT: f64 = 0.1;
+
+/// Rotate world-frame vector `v` into the device frame expressed by
+/// attitude quaternion `q` (q maps device orientation -> world; applying the
+/// conjugate gives world->device).
+fn quat_world_to_device(q: (f64, f64, f64, f64), v: (f64, f64, f64)) -> (f64, f64, f64) {
+    let (qx, qy, qz, qw) = q;
+    // v' = q^-1 * v * q, expanded without building intermediate quaternions.
+    let (vx, vy, vz) = v;
+    // t = 2 * q_vec x v
+    let tx = 2.0 * (qy * vz - qz * vy);
+    let ty = 2.0 * (qz * vx - qx * vz);
+    let tz = 2.0 * (qx * vy - qy * vx);
+    // v' = v - qw * t + q_vec x t ... (conjugate form of q v q*)
+    (
+        vx - qw * tx + (qy * tz - qz * ty),
+        vy - qw * ty + (qz * tx - qx * tz),
+        vz - qw * tz + (qx * ty - qy * tx),
+    )
+}
+
+/// Compute the shortest-arc quaternion rotating vector `from` onto `to`
+/// (both need not be normalised). Used for gravity-vector corrections.
+fn quat_shortest_arc(from: (f64, f64, f64), to: (f64, f64, f64)) -> (f64, f64, f64, f64) {
+    let (fx, fy, fz) = from;
+    let (tx, ty, tz) = to;
+    let cross = (fy * tz - fz * ty, fz * tx - fx * tz, fx * ty - fy * tx);
+    let dot = fx * tx + fy * ty + fz * tz;
+    let w = ((fx * fx + fy * fy + fz * fz) * (tx * tx + ty * ty + tz * tz)).sqrt() + dot;
+    let mut q = (cross.0, cross.1, cross.2, w);
+    let norm = (q.0 * q.0 + q.1 * q.1 + q.2 * q.2 + q.3 * q.3).sqrt();
+    if norm < ATTITUDE_EPSILON {
+        // Vectors are opposite; pick any perpendicular axis.
+        return (
+            1.0, 0.0, 0.0, 0.0,
+        );
+    }
+    q.0 /= norm;
+    q.1 /= norm;
+    q.2 /= norm;
+    q.3 /= norm;
+    q
+}
+
+/// Slerp-style attenuation of a corrective quaternion: scale its rotation
+/// angle by `gain` in [0, 1].
+fn quat_scale_angle(q: (f64, f64, f64, f64), gain: f64) -> (f64, f64, f64, f64) {
+    let (qx, qy, qz, qw) = q;
+    let half_angle = qw.clamp(-1.0, 1.0).acos();
+    let scaled = half_angle * gain;
+    let sin_scaled = scaled.sin();
+    let sin_half = half_angle.sin();
+    if sin_half.abs() < ATTITUDE_EPSILON {
+        return (0.0, 0.0, 0.0, 1.0);
+    }
+    let factor = sin_scaled / sin_half;
+    (
+        qx * factor,
+        qy * factor,
+        qz * factor,
+        scaled.cos(),
+    )
+}
+
+/// One step of the complementary attitude filter.
+///
+/// - `q`: attitude quaternion (x, y, z, w) expressing device orientation.
+/// - `gyro`: rotation rate about the device axes, rad/s.
+/// - `accel`: total acceleration in g units (gravity + user), device frame.
+/// - `dt`: elapsed time in seconds since the previous step.
+///
+/// Returns the updated quaternion, the gravity estimate (device frame) and
+/// the user acceleration (device frame).
+fn attitude_filter_step(
+    q: (f64, f64, f64, f64),
+    gyro: (f64, f64, f64),
+    accel: (f64, f64, f64),
+    dt: f64,
+) -> ((f64, f64, f64, f64), (f64, f64, f64), (f64, f64, f64)) {
+    let mut q = q;
+
+    // 1. Integrate the gyroscope (body-frame rate => multiply on the right).
+    if dt > 0.0 && dt <= ATTITUDE_MAX_GYRO_DT {
+        let half_dt_angle_scale = dt * 0.5;
+        let dq = (
+            gyro.0 * half_dt_angle_scale,
+            gyro.1 * half_dt_angle_scale,
+            gyro.2 * half_dt_angle_scale,
+            1.0,
+        );
+        q = quat_mul(q, dq);
+        q = quat_normalized(q);
+    }
+
+    // 2. Correct towards the measured gravity vector (when sane).
+    let accel_len = (accel.0 * accel.0 + accel.1 * accel.1 + accel.2 * accel.2).sqrt();
+    if accel_len > 1.0e-3 {
+        let measured_g = (accel.0 / accel_len, accel.1 / accel_len, accel.2 / accel_len);
+        let predicted_g = quat_world_to_device(q, (0.0, 0.0, -1.0));
+        let correction = quat_shortest_arc(predicted_g, measured_g);
+        // Gain must be "per second" so behaviour doesn't depend on the
+        // polling rate of the game.
+        let gain = (dt * ATTITUDE_CORRECTION_PER_SEC).clamp(0.0, 1.0);
+        let correction = quat_scale_angle(correction, gain);
+        q = quat_mul(q, correction);
+        q = quat_normalized(q);
+    }
+
+    // 3. Derived outputs.
+    let gravity = quat_world_to_device(q, (0.0, 0.0, -1.0));
+    let user = (accel.0 - gravity.0, accel.1 - gravity.1, accel.2 - gravity.2);
+    (q, gravity, user)
+}
+
+fn quat_mul(a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)) -> (f64, f64, f64, f64) {
+    let (ax, ay, az, aw) = a;
+    let (bx, by, bz, bw) = b;
+    (
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    )
+}
+
+fn quat_normalized(q: (f64, f64, f64, f64)) -> (f64, f64, f64, f64) {
+    let norm = (q.0 * q.0 + q.1 * q.1 + q.2 * q.2 + q.3 * q.3).sqrt();
+    if norm < ATTITUDE_EPSILON {
+        (0.0, 0.0, 0.0, 1.0)
+    } else {
+        (q.0 / norm, q.1 / norm, q.2 / norm, q.3 / norm)
+    }
+}
+
+/// Normalise a 3-vector, returning the unit vector (or (0, 0, -1) for
+/// degenerate input).
+fn attitude_normalize_vec(v: (f64, f64, f64)) -> (f64, f64, f64) {
+    let len = (v.0 * v.0 + v.1 * v.1 + v.2 * v.2).sqrt();
+    if len < ATTITUDE_EPSILON {
+        (0.0, 0.0, -1.0)
+    } else {
+        (v.0 / len, v.1 / len, v.2 / len)
+    }
 }
 
 const CLASSES: ClassExports = objc_classes! {
@@ -363,50 +536,21 @@ const CLASSES: ClassExports = objc_classes! {
         user_acceleration: CMAcceleration { x: 0.0, y: 0.0, z: 0.0 },
         rotation_rate: CMRotationRate { x: 0.0, y: 0.0, z: 0.0 },
         timestamp: 0.0,
+        attitude: CMAttitude::default(),
+        quaternion: CMQuaternion { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
 
 - (id)attitude {
-    let gravity = env.objc.borrow::<CMDeviceMotionHostObject>(this).gravity;
-    let (gx, gy, gz) = (gravity.x, gravity.y, gravity.z);
-    // Per Apple's CMAttitude convention: pitch is the rotation about the
-    // device's lateral (x) axis and roll the rotation about its
-    // longitudinal (y) axis; both are zero when the device lies flat
-    // face-up (gravity = (0, 0, -1)).
-    // Rotating about +y by `roll` moves the gravity vector to
-    // (sin(roll), 0, -cos(roll)), and rotating about +x by `pitch` moves
-    // it to (0, -sin(pitch), -cos(pitch)).
-    // The previous implementation effectively swapped the two axes
-    // (pitch from gx, roll from gy), so games reading attitude (e.g. to
-    // swing a 3D camera with device tilt, like Asphalt 7's) saw the
-    // device rotate about the wrong axis: tilting left/right moved the
-    // view forward/backward and vice versa.
-    let pitch = (-gy).atan2(-gz);
-    let roll = gx.atan2(-gz);
+    let (attitude_angles, quaternion) = {
+        let host = env.objc.borrow::<CMDeviceMotionHostObject>(this);
+        (host.attitude, host.quaternion)
+    };
     let attitude: id = msg_class![env; CMAttitude new];
     {
-        // Derive the orientation quaternion from the roll/pitch angles
-        // (yaw = 0). For Apple's Z-Y-X convention with pitch about x and
-        // roll about y and zero yaw:
-        //   q = q_roll(y) * q_pitch(x)
-        //     = (0,sin(r/2),0,cos(r/2)) * (sin(p/2),0,0,cos(p/2))
-        //     = (sin(p/2)cos(r/2), cos(p/2)sin(r/2), -sin(p/2)sin(r/2),
-        //        cos(p/2)cos(r/2)).
-        let (sp, cp) = (pitch / 2.0).sin_cos();
-        let (sr, cr) = (roll / 2.0).sin_cos();
-        let quaternion = CMQuaternion {
-            x: sp * cr,
-            y: cp * sr,
-            z: -sp * sr,
-            w: cp * cr,
-        };
         let attitude_host = env.objc.borrow_mut::<CMAttitudeHostObject>(attitude);
-        attitude_host.attitude = CMAttitude {
-            roll,
-            pitch,
-            yaw: 0.0,
-        };
+        attitude_host.attitude = attitude_angles;
         attitude_host.quaternion = quaternion;
     }
     autorelease(env, attitude)
@@ -484,6 +628,7 @@ const CLASSES: ClassExports = objc_classes! {
         last_acceleration: CMAcceleration { x: 0.0, y: 0.0, z: -1.0 },
         last_accel_timestamp: 0.0,
         start_time: Some(Instant::now()),
+        attitude_state: None,
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
@@ -714,11 +859,6 @@ const CLASSES: ClassExports = objc_classes! {
         return nil;
     }
 
-    // Without a magnetometer we cannot do full sensor fusion. We approximate:
-    // - gravity = raw accelerometer reading (accurate when device is still)
-    // - userAcceleration = zero (can't separate without additional filtering)
-    // - rotationRate = host gyroscope reading via SDL, or zero (stub) if the
-    //   host has no gyroscope
     let accel = read_sdl_accelerometer(env)
         .unwrap_or(CMAcceleration { x: 0.0, y: 0.0, z: -1.0 });
     let rotation_rate = read_sdl_gyroscope(env)
@@ -726,13 +866,65 @@ const CLASSES: ClassExports = objc_classes! {
     let timestamp = env.objc.borrow::<CMMotionManagerHostObject>(this)
         .start_time.unwrap_or_else(std::time::Instant::now).elapsed().as_secs_f64();
 
+    // Sensor fusion: gyro-integrated attitude corrected towards gravity.
+    // Without the fusion the gravity-only roll/pitch are ill-conditioned in
+    // upright (gaming) holds — tiny tilts then snap the camera to full
+    // deflection.
+    let now = Instant::now();
+    let (_attitude_q, gravity_g, user_g) = {
+        let accel_t = (accel.x, accel.y, accel.z);
+        let gyro_t = (rotation_rate.x, rotation_rate.y, rotation_rate.z);
+        let host = env.objc.borrow_mut::<CMMotionManagerHostObject>(this);
+        let (q, dt) = match host.attitude_state {
+            Some((q, last)) => (q, now.duration_since(last).as_secs_f64()),
+            None => {
+                // Initialise so the implied gravity matches the current
+                // accelerometer reading (yaw arbitrary = 0, matching the
+                // XArbitraryZVertical reference frame Apple uses without a
+                // magnetometer).
+                let g_measured = attitude_normalize_vec(accel_t);
+                (quat_shortest_arc(g_measured, (0.0, 0.0, -1.0)), 0.0)
+            }
+        };
+        let (q, gravity_g, user_g) = attitude_filter_step(q, gyro_t, accel_t, dt);
+        host.attitude_state = Some((q, now));
+        (q, gravity_g, user_g)
+    };
+
+    // Report angles from the *fused* gravity vector using the same
+    // conventions as before: pitch = atan2(-gy, -gz), roll = atan2(gx, -gz).
+    // Fused gravity is well-behaved in upright holds because the gyroscope
+    // integration carries the estimate smoothly through the |gz|≈0 poses
+    // where raw-gravity atan2() blew up.
+    let pitch = (-gravity_g.1).atan2(-gravity_g.2);
+    let roll = gravity_g.0.atan2(-gravity_g.2);
+    let yaw = 0.0;
+    let (sp, cp) = (pitch / 2.0).sin_cos();
+    let (sr, cr) = (roll / 2.0).sin_cos();
+    let quaternion = CMQuaternion {
+        x: sp * cr,
+        y: cp * sr,
+        z: -sp * sr,
+        w: cp * cr,
+    };
+
     let data: id = msg_class![env; CMDeviceMotion new];
     {
         let data_host = env.objc.borrow_mut::<CMDeviceMotionHostObject>(data);
-        data_host.gravity = accel;
-        data_host.user_acceleration = CMAcceleration { x: 0.0, y: 0.0, z: 0.0 };
+        data_host.gravity = CMAcceleration {
+            x: gravity_g.0,
+            y: gravity_g.1,
+            z: gravity_g.2,
+        };
+        data_host.user_acceleration = CMAcceleration {
+            x: user_g.0,
+            y: user_g.1,
+            z: user_g.2,
+        };
         data_host.rotation_rate = rotation_rate;
         data_host.timestamp = timestamp;
+        data_host.attitude = CMAttitude { roll, pitch, yaw };
+        data_host.quaternion = quaternion;
     }
     autorelease(env, data)
 }
