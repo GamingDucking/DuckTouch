@@ -149,6 +149,11 @@ pub struct Environment {
     /// at the existing return-to-host boundary so it cannot terminate the host
     /// process from inside a linked libc function.
     guest_termination_requested: bool,
+    /// A required Unity player archive could not be resolved or read from the
+    /// mounted bundle. Continuing after Unity calls its fatal exit would
+    /// execute a half-initialized engine, so termination recovery is disabled
+    /// for this guest session.
+    missing_unity_player_archive: Option<String>,
     /// A linked host function deliberately redirected the guest PC. This skips
     /// the normal post-SVC return, which would overwrite the new continuation
     /// for compact four-byte stubs.
@@ -834,6 +839,7 @@ impl Environment {
             udf_bypass_last_lr: None,
             udf_bypass_lr_count: 0,
             guest_termination_requested: false,
+            missing_unity_player_archive: None,
             guest_control_flow_redirected: false,
             host_to_guest_stack_frames: Vec::new(),
             corruptor: crate::corrupt::Corruptor::default(),
@@ -997,6 +1003,7 @@ impl Environment {
             udf_bypass_last_lr: None,
             udf_bypass_lr_count: 0,
             guest_termination_requested: false,
+            missing_unity_player_archive: None,
             guest_control_flow_redirected: false,
             host_to_guest_stack_frames: Vec::new(),
             corruptor: crate::corrupt::Corruptor::default(),
@@ -1064,6 +1071,7 @@ impl Environment {
             udf_bypass_last_lr: None,
             udf_bypass_lr_count: 0,
             guest_termination_requested: false,
+            missing_unity_player_archive: None,
             guest_control_flow_redirected: false,
             host_to_guest_stack_frames: Vec::new(),
             corruptor: crate::corrupt::Corruptor::default(),
@@ -1829,6 +1837,41 @@ impl Environment {
     /// Whether a linked guest termination function has requested session end.
     pub(crate) fn is_guest_termination_requested(&self) -> bool {
         self.guest_termination_requested
+    }
+
+    /// Remember that Unity's mandatory serialized player archive is unavailable.
+    ///
+    /// This records both a missing VFS node and an unreadable/empty archive
+    /// entry. The archive is not optional: once Unity has reported this failure
+    /// it calls `exit(1)` after partially initializing global state. Treating
+    /// that exit as a recoverable DRM-style exit leads to use-after-null and
+    /// bogus multi-gigabyte allocations, as the engine's cleanup path was not
+    /// designed to return to the app.
+    pub(crate) fn note_missing_unity_player_archive(&mut self, path: &str) {
+        let is_player_archive = path.rsplit_once('/').is_some_and(|(parent, file)| {
+            file.eq_ignore_ascii_case("data.unity3d")
+                && parent
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|component| component.eq_ignore_ascii_case("Data"))
+        });
+        if !is_player_archive || self.missing_unity_player_archive.is_some() {
+            return;
+        }
+
+        self.missing_unity_player_archive = Some(path.to_owned());
+        log!(
+            "Required Unity player archive {:?} is unavailable from the mounted \
+             bundle. A following guest termination will return to the host instead \
+             of resuming a \
+             half-initialized Unity engine.",
+            path
+        );
+    }
+
+    /// The unavailable Unity player archive, if a resource probe found one.
+    pub(crate) fn missing_unity_player_archive(&self) -> Option<&str> {
+        self.missing_unity_player_archive.as_deref()
     }
 
     /// Preserve a deliberate guest-PC redirect across linked-stub dispatch.

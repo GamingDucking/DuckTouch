@@ -231,24 +231,16 @@ fn stat(env: &mut Environment, path: ConstPtr<u8>, buf: MutPtr<stat>) -> i32 {
         }
     };
 
-    let resolved_path = if !path_str.starts_with('/') && !env.fs.exists(GuestPath::new(&path_str)) {
-        let bundle_root = env.bundle.bundle_path().as_str().trim_end_matches('/');
-        let relative = path_str.strip_prefix("Data/").unwrap_or(&path_str);
-        let relative = relative.strip_prefix("Data/").unwrap_or(relative);
-        let candidate = format!("{bundle_root}/Data/{relative}");
-        if env.fs.exists(GuestPath::new(&candidate)) {
-            candidate
-        } else {
-            path_str.clone()
-        }
-    } else {
-        path_str.clone()
-    };
-    let guest_path = GuestPath::new(&resolved_path);
-    if !env.fs.exists(guest_path) {
+    // Unity normally probes its player archive with `stat` before it calls
+    // `open`.  Use the same case-insensitive and bundle-relative resolution as
+    // open(), including stale absolute .app paths, so a successful probe cannot
+    // disagree with the later file open.
+    let Some(resolved_path) = super::resolve_existing_guest_path(env, &path_str) else {
+        env.note_missing_unity_player_archive(&path_str);
         set_errno(env, ENOENT);
         return -1;
-    }
+    };
+    let guest_path = GuestPath::new(&resolved_path);
 
     let mut st = stat::default();
 
@@ -260,10 +252,23 @@ fn stat(env: &mut Environment, path: ConstPtr<u8>, buf: MutPtr<stat>) -> i32 {
         st.st_nlink = 1;
     }
 
-    if let Ok(size) = env.fs.size(guest_path) {
-        st.st_size = size as off_t;
-        st.st_blksize = 4096;
-        st.st_blocks = size.div_ceil(512) as blkcnt_t;
+    match env.fs.size(guest_path) {
+        Ok(size) => {
+            // A zero-byte data.unity3d is just as unusable as a missing one.
+            // This happens when a corrupt IPA entry could be listed but not
+            // decompressed. Record it before Unity reaches fatal exit().
+            if size == 0 {
+                env.note_missing_unity_player_archive(&path_str);
+            }
+            st.st_size = size as off_t;
+            st.st_blksize = 4096;
+            st.st_blocks = size.div_ceil(512) as blkcnt_t;
+        }
+        Err(()) => {
+            // Preserve the historical best-effort stat result while ensuring
+            // an unreadable mandatory Unity archive cannot be frame-recovered.
+            env.note_missing_unity_player_archive(&path_str);
+        }
     }
 
     if let Ok(mtime) = env.fs.modified(guest_path) {

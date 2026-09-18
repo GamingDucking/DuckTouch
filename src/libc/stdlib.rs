@@ -804,6 +804,16 @@ fn unsetenv(env: &mut Environment, name: ConstPtr<u8>) -> i32 {
 /// unreachable instruction in the guest. The shared C++ recovery helper instead
 /// validates the frame chain and resumes the nearest caller in the main app.
 pub(crate) fn recover_guest_termination(env: &mut Environment, termination: &str) -> bool {
+    if let Some(path) = env.missing_unity_player_archive() {
+        echo!(
+            "Guest {} follows unavailable Unity player archive {:?}; refusing \
+             unsafe frame recovery.",
+            termination,
+            path
+        );
+        return false;
+    }
+
     log!(
         "Guest {} on emulated thread {}; attempting validated frame recovery.",
         termination,
@@ -829,8 +839,8 @@ pub(crate) fn recover_guest_termination(env: &mut Environment, termination: &str
 /// or panics the emulator process directly.
 pub(crate) fn end_guest_termination(env: &mut Environment, termination: &str) {
     echo!(
-        "App called {}; no valid app frame was available for recovery. \
-         Ending the guest session through the return-to-host path.",
+        "App called {}; ending the guest session through the return-to-host \
+         path.",
         termination
     );
     env.request_guest_termination();
@@ -853,6 +863,19 @@ pub(crate) fn recover_or_end_guest_termination(env: &mut Environment, terminatio
 fn exit(env: &mut Environment, exit_code: i32) {
     set_errno(env, 0);
     let termination = format!("exit({exit_code})");
+    if let Some(path) = env.missing_unity_player_archive().map(str::to_owned) {
+        // Unity has already declared engine initialization unrecoverable. Do
+        // not invoke atexit handlers or splice control flow into the caller:
+        // both paths run against partially initialized Unity global state.
+        echo!(
+            "Guest {} follows unavailable Unity player archive {:?}; ending the \
+             guest session without running atexit handlers.",
+            termination,
+            path
+        );
+        end_guest_termination(env, &termination);
+        return;
+    }
     if recover_guest_termination(env, &termination) {
         return;
     }

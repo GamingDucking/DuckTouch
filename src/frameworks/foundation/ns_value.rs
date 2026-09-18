@@ -248,6 +248,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg_class![env; NSNumber numberWithUnsignedInt:(object.to_bits())]
 }
 
+// Older Foundation binaries use this private spelling for the same raw-bytes
+// constructor as `+valueWithBytes:objCType:`.  Keep it as a forwarding alias
+// so the wrapped scalar/struct preserves its type rather than becoming nil.
++ (id)value:(ConstVoidPtr)value withObjCType:(ConstVoidPtr)type_ptr {
+    msg![env; this valueWithBytes:value objCType:type_ptr]
+}
+
 + (id)valueWithBytes:(ConstVoidPtr)value objCType:(ConstVoidPtr)_type {
     // Decode the common struct encodings into proper NSValue host objects
     // (keyed unarchiving routes struct values through here). Scalars are
