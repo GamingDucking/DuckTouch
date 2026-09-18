@@ -421,6 +421,50 @@ fn set_sdl2_orientation(orientation: DeviceOrientation) {
     );
 }
 
+/// COMPAT: per-game accelerometer axis remap, applied to real-sensor data in
+/// the hardware path of [Window::get_acceleration].
+///
+/// The values delivered to the guest are always in the device's portrait
+/// frame (iOS semantics), which is correct for games that honour their
+/// declared interface orientation. Some games, however, hard-code their
+/// tilt math for one particular way of holding the phone — or the host
+/// device reports sensors in a natural-orientation frame some games don't
+/// expect (e.g. tablets) — and then steering/camera controls come out
+/// mirrored or sideways (seen with e.g. Asphalt 7's tilt camera).
+///
+/// `TOUCHHLE_ACCELEROMETER_AXES` accepts a comma-separated list of:
+/// - "swap": transpose x and y (sideways behaviour on some devices)
+/// - "flipx": negate x (left/right inversion)
+/// - "flipy": negate y (forward/backward inversion)
+/// Both flips together make a 180-degree fix; all three together swap and
+/// flip. Example: TOUCHHLE_ACCELEROMETER_AXES=swap,flipy
+///
+/// The knob is read once and cached. Gyroscope readings are NOT remapped.
+fn accelerometer_compat_remap(x: f32, y: f32, z: f32) -> (f32, f32, f32) {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<(bool, bool, bool)> = OnceLock::new();
+    let (swap, flipx, flipy) = *CACHE.get_or_init(|| {
+        let var = std::env::var("TOUCHHLE_ACCELEROMETER_AXES").unwrap_or_default();
+        let var = var.to_ascii_lowercase();
+        (
+            var.contains("swap"),
+            var.contains("flipx"),
+            var.contains("flipy"),
+        )
+    });
+    let (mut x, mut y) = (x, y);
+    if swap {
+        std::mem::swap(&mut x, &mut y);
+    }
+    if flipx {
+        x = -x;
+    }
+    if flipy {
+        y = -y;
+    }
+    (x, y, z)
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum FingerId {
     Mouse,
@@ -1745,7 +1789,7 @@ impl Window {
                 // SDL2 reports acceleration in units of m/s^2.
                 let gravity: f32 = 9.80665; // SDL_STANDARD_GRAVITY
                 let (x, y, z) = (x / gravity, y / gravity, z / gravity);
-                return (x, y, z);
+                return accelerometer_compat_remap(x, y, z);
             }
         }
 

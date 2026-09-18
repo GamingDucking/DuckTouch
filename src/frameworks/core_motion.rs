@@ -370,20 +370,34 @@ const CLASSES: ClassExports = objc_classes! {
 - (id)attitude {
     let gravity = env.objc.borrow::<CMDeviceMotionHostObject>(this).gravity;
     let (gx, gy, gz) = (gravity.x, gravity.y, gravity.z);
-    let pitch = gx.atan2((gy * gy + gz * gz).sqrt());
-    let roll = gy.atan2((gx * gx + gz * gz).sqrt());
+    // Per Apple's CMAttitude convention: pitch is the rotation about the
+    // device's lateral (x) axis and roll the rotation about its
+    // longitudinal (y) axis; both are zero when the device lies flat
+    // face-up (gravity = (0, 0, -1)).
+    // Rotating about +y by `roll` moves the gravity vector to
+    // (sin(roll), 0, -cos(roll)), and rotating about +x by `pitch` moves
+    // it to (0, -sin(pitch), -cos(pitch)).
+    // The previous implementation effectively swapped the two axes
+    // (pitch from gx, roll from gy), so games reading attitude (e.g. to
+    // swing a 3D camera with device tilt, like Asphalt 7's) saw the
+    // device rotate about the wrong axis: tilting left/right moved the
+    // view forward/backward and vice versa.
+    let pitch = (-gy).atan2(-gz);
+    let roll = gx.atan2(-gz);
     let attitude: id = msg_class![env; CMAttitude new];
     {
-        // Derive the orientation quaternion from roll/pitch (yaw = 0):
-        // q = q_pitch * q_roll, with yaw rotation about the device z axis.
-        let hp = pitch / 2.0;
-        let hr = roll / 2.0;
-        let (sp, cp) = hp.sin_cos();
-        let (sr, cr) = hr.sin_cos();
+        // Derive the orientation quaternion from the roll/pitch angles
+        // (yaw = 0). For Apple's Z-Y-X convention with pitch about x and
+        // roll about y and zero yaw:
+        //   q = q_roll(y) * q_pitch(x)
+        //     = (0,sin(r/2),0,cos(r/2)) * (sin(p/2),0,0,cos(p/2))
+        //     = (sin(p/2)cos(r/2), cos(p/2)sin(r/2), -sin(p/2)sin(r/2),
+        //        cos(p/2)cos(r/2)).
+        let (sp, cp) = (pitch / 2.0).sin_cos();
+        let (sr, cr) = (roll / 2.0).sin_cos();
         let quaternion = CMQuaternion {
-            // q = (1,0,0,cp) * (0,0,1,cr) rotated into the device frame
-            x: cp * sr,
-            y: sp * cr,
+            x: sp * cr,
+            y: cp * sr,
             z: -sp * sr,
             w: cp * cr,
         };

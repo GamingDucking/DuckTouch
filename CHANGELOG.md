@@ -61,6 +61,8 @@ Compatibility:
 
 Quality and performance:
 
+- Fixed `CMDeviceMotion.attitude` reporting pitch and roll about the wrong device axes (they were effectively swapped, with mismatched signs, and inconsistent with the returned quaternion). Games that tilt-steer or swing a 3D camera using Core Motion device motion (e.g. Asphalt 7's tilt camera) should now move the view in the correct direction for the actual device rotation. (@KlugKlugTG)
+- Added a per-game accelerometer escape hatch for games whose tilt controls come out mirrored or sideways on the host device: set the environment variable `TOUCHHLE_ACCELEROMETER_AXES` to a comma-separated list choosing any of `swap`, `flipx`, `flipy` (e.g. `TOUCHHLE_ACCELEROMETER_AXES=swap,flipy`). It applies to real hardware-sensor data only and is read once at startup.
 - Implemented true frame pacing in the EAGL presentation path, making the picture noticeably smoother: the frame limiter now paces the guest to an exact frame deadline using a hybrid timer — a cooperative `env.sleep()` until shortly before the deadline (other guest threads still run) followed by a short spin-wait for the last ~2ms. Previously the pacing sleep was a plain timer sleep that could wake several ms late, starting the guest's next frame late and visibly wobbling the frame cadence (micro-stutter). The wake-up now lands within tens of microseconds of the deadline.
 - The CPU scheduler batch is now adaptive: 1,000,000 ticks during long busy stretches, automatically reduced to 100,000 whenever any guest thread has an imminent wake deadline (<10ms), so frame pacing, run-loop timers and audio callbacks stay millisecond-precise.
 - Major performance optimisation pass, focused on game FPS on Android devices:
