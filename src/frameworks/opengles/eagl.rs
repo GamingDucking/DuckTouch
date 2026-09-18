@@ -455,10 +455,32 @@ pub const CLASSES: ClassExports = objc_classes! {
                 );
                 (fallback_width, fallback_height)
             };
+            // A full-screen EAGL layer sized in points gets its backing
+            // pixel resolution from the layer's `contentsScale` (which
+            // init_common in ui_view.rs seeds with UIScreen.scale, and which
+            // apps may override via setContentsScale:). Without honouring it,
+            // retina devices (iPhone 4/5/5c, iPad 3/4/5, iPad mini 2/3,
+            // iPod touch 4/5) would allocate a half-size renderbuffer and the
+            // app would render zoomed-in and cropped. `scale_hack` is a
+            // user-facing multiplier applied on top, as before.
+            let contents_scale = {
+                let layer_contents_scale: crate::frameworks::core_graphics::CGFloat =
+                    env.objc
+                        .borrow::<crate::frameworks::core_animation::ca_layer::CALayerHostObject>(
+                            drawable,
+                        )
+                        .contents_scale;
+                if layer_contents_scale.is_finite() && layer_contents_scale > 0.0 {
+                    layer_contents_scale
+                } else {
+                    1.0
+                }
+            };
+
             let scale_hack = env.options.scale_hack.get();
 
-            let mut width = width.round() as u32 * scale_hack;
-            let mut height = height.round() as u32 * scale_hack;
+            let mut width = (width * contents_scale).round() as u32 * scale_hack;
+            let mut height = (height * contents_scale).round() as u32 * scale_hack;
 
             // If even the fallback produced a degenerate size, clamp to a
             // minimum 1x1 so the GL call below cannot receive a zero extent.

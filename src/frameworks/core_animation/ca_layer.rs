@@ -113,6 +113,13 @@ pub(crate) struct CALayerHostObject {
     /// Whether implicit animations are enabled for property changes on this
     /// layer. UIView-backing layers disable this; standalone CALayers enable
     /// it. TODO: Remove once CAActions are implemented.
+    /// `-[CALayer contentsScale]` — multiplier from layer points to backing
+    /// pixels. Real iOS defaults a layer backing a view to the view's
+    /// `contentScaleFactor`, which in turn defaults to the screen's scale.
+    /// EAGL (`renderbufferStorage:fromDrawable:`) derives the renderbuffer
+    /// size from `bounds * contentsScale`, so this must round-trip for
+    /// retina-aware apps to allocate correctly-sized buffers.
+    pub(crate) contents_scale: CGFloat,
     pub(super) use_implicit_animations: bool,
 }
 impl HostObject for CALayerHostObject {}
@@ -412,6 +419,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         magnification_filter: kCAFilterLinear.to_owned(),
         minification_filter_bias: 0.0,
         use_implicit_animations: true,
+        contents_scale: 1.0,
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
@@ -616,6 +624,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // --- ДОБАВЛЕНЫ МЕТОДЫ ДЛЯ Z-POSITION ---
 - (CGFloat)zPosition { env.objc.borrow::<CALayerHostObject>(this).z_position }
+
+- (CGFloat)contentsScale {
+    env.objc.borrow::<CALayerHostObject>(this).contents_scale
+}
+- (())setContentsScale:(CGFloat)scale {
+    let safe_scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+    env.objc.borrow_mut::<CALayerHostObject>(this).contents_scale = safe_scale;
+}
 - (())setZPosition:(CGFloat)z_position { env.objc.borrow_mut::<CALayerHostObject>(this).z_position = z_position; }
 // ---------------------------------------
 

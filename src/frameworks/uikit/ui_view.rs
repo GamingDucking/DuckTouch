@@ -191,6 +191,21 @@ fn init_common(env: &mut Environment, this: id) -> id {
     let layer: id = msg![env; layer_class layer];
     () = msg![env; layer setDelegate:this];
     () = msg![env; layer setOpaque:true];
+    // A view's backing layer inherits the view's contentScaleFactor, which
+    // defaults to the main screen's scale (1.0 on non-retina devices, 2.0 on
+    // retina ones). EAGL derives the renderbuffer size from the layer's
+    // bounds * contentsScale, so without this retina-aware apps would
+    // allocate a half-size framebuffer and render zoomed / cropped.
+    let screen_scale: crate::frameworks::core_graphics::CGFloat = {
+        let screen: id = msg_class![env; UIScreen mainScreen];
+        msg![env; screen scale]
+    };
+    env.objc
+        .borrow_mut::<UIViewHostObject>(this)
+        .content_scale_factor = screen_scale;
+    env.objc
+        .borrow_mut::<crate::frameworks::core_animation::ca_layer::CALayerHostObject>(layer)
+        .contents_scale = screen_scale;
     crate::frameworks::core_animation::ca_layer::set_use_implicit_animations(env, layer, false);
 
     // A view's backing layer is not retained by the view.

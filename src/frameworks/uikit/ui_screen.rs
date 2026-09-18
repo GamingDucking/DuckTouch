@@ -123,8 +123,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (CGFloat)nativeScale {
-    // Physical pixels == points for our purposes.
-    1.0
+    // On real iOS devices nativeScale equals scale (the point-to-pixel
+    // ratio of the physical display). Games use it to detect Retina and
+    // size their framebuffers; reporting 1.0 while `scale` reports 2.0
+    // made such games allocate a half-resolution framebuffer and draw
+    // zoomed / cropped.
+    env.window().screen_scale() as CGFloat
 }
 
 // MARK: - Brightness

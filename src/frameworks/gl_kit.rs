@@ -21,7 +21,7 @@
 //! of GLKit import.
 
 use crate::dyld::{ConstantExports, FunctionExports, HostConstant};
-use crate::frameworks::core_graphics::CGRect;
+use crate::frameworks::core_graphics::{CGFloat, CGRect};
 use crate::frameworks::foundation::{NSInteger, NSTimeInterval};
 use crate::frameworks::uikit::ui_view::UIViewHostObject;
 use crate::frameworks::uikit::ui_view_controller::UIViewControllerHostObject;
@@ -192,11 +192,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (NSInteger)drawableWidth {
     let bounds: CGRect = msg![env; this bounds];
-    bounds.size.width as NSInteger
+    let scale: CGFloat = msg![env; this contentScaleFactor];
+    (bounds.size.width * scale) as NSInteger
 }
 - (NSInteger)drawableHeight {
     let bounds: CGRect = msg![env; this bounds];
-    bounds.size.height as NSInteger
+    let scale: CGFloat = msg![env; this contentScaleFactor];
+    (bounds.size.height * scale) as NSInteger
 }
 
 - (bool)enableSetNeedsDisplay {
