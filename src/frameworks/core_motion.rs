@@ -202,6 +202,77 @@ struct CMAttitudeHostObject {
 }
 impl HostObject for CMAttitudeHostObject {}
 
+/// Per Apple docs: CMRotationMatrix is the device attitude expressed as a 3x3
+/// rotation matrix of IEEE doubles (row-major m11..m33).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C, packed)]
+struct CMRotationMatrix {
+    m11: f64,
+    m12: f64,
+    m13: f64,
+    m21: f64,
+    m22: f64,
+    m23: f64,
+    m31: f64,
+    m32: f64,
+    m33: f64,
+}
+unsafe impl crate::mem::SafeRead for CMRotationMatrix {}
+impl_GuestRet_for_large_struct!(CMRotationMatrix);
+impl GuestArg for CMRotationMatrix {
+    const REG_COUNT: usize = 18;
+    fn from_regs(regs: &[u32]) -> Self {
+        CMRotationMatrix {
+            m11: f64::from_regs(&regs[0..2]),
+            m12: f64::from_regs(&regs[2..4]),
+            m13: f64::from_regs(&regs[4..6]),
+            m21: f64::from_regs(&regs[6..8]),
+            m22: f64::from_regs(&regs[8..10]),
+            m23: f64::from_regs(&regs[10..12]),
+            m31: f64::from_regs(&regs[12..14]),
+            m32: f64::from_regs(&regs[14..16]),
+            m33: f64::from_regs(&regs[16..18]),
+        }
+    }
+    fn to_regs(self, regs: &mut [u32]) {
+        self.m11.to_regs(&mut regs[0..2]);
+        self.m12.to_regs(&mut regs[2..4]);
+        self.m13.to_regs(&mut regs[4..6]);
+        self.m21.to_regs(&mut regs[6..8]);
+        self.m22.to_regs(&mut regs[8..10]);
+        self.m23.to_regs(&mut regs[10..12]);
+        self.m31.to_regs(&mut regs[12..14]);
+        self.m32.to_regs(&mut regs[14..16]);
+        self.m33.to_regs(&mut regs[16..18]);
+    }
+}
+
+/// Standard quaternion -> rotation matrix conversion.
+fn quat_to_rotation_matrix(q: (f64, f64, f64, f64)) -> CMRotationMatrix {
+    let (x, y, z, w) = q;
+    CMRotationMatrix {
+        m11: 1.0 - 2.0 * (y * y + z * z),
+        m12: 2.0 * (x * y - w * z),
+        m13: 2.0 * (x * z + w * y),
+        m21: 2.0 * (x * y + w * z),
+        m22: 1.0 - 2.0 * (x * x + z * z),
+        m23: 2.0 * (y * z - w * x),
+        m31: 2.0 * (x * z - w * y),
+        m32: 2.0 * (y * z + w * x),
+        m33: 1.0 - 2.0 * (x * x + y * y),
+    }
+}
+
+/// Tait-Bryan Z-Y-X decomposition with Apple's axis mapping (pitch about the
+/// device x-axis, roll about the y-axis, yaw about the z-axis).
+fn quat_to_apple_angles(q: (f64, f64, f64, f64)) -> (f64, f64, f64) {
+    let (x, y, z, w) = q;
+    let pitch = (2.0 * (w * x + y * z)).atan2(1.0 - 2.0 * (x * x + y * y));
+    let roll = (2.0 * (w * y - z * x)).clamp(-1.0, 1.0).asin();
+    let yaw = (2.0 * (w * z + x * y)).atan2(1.0 - 2.0 * (y * y + z * z));
+    (pitch, roll, yaw)
+}
+
 // =============================================================================
 // Helper: read real accelerometer data from SDL sensor via window
 // =============================================================================
@@ -527,6 +598,43 @@ const CLASSES: ClassExports = objc_classes! {
 
 - (CMQuaternion)quaternion {
     env.objc.borrow::<CMAttitudeHostObject>(this).quaternion
+}
+
+- (CMRotationMatrix)rotationMatrix {
+    let q = env.objc.borrow::<CMAttitudeHostObject>(this).quaternion;
+    quat_to_rotation_matrix((q.x, q.y, q.z, q.w))
+}
+
+// Per Apple docs, this is how apps turn the absolute world-frame attitude
+// into one relative to a stored reference attitude (i.e. "calibrate" the
+// neutral pose when a camera mode starts). Games' 3D tilt cameras rely on
+// this — without it they fall back to the absolute attitude, which in the
+// upright gaming hold sits near its extremes and makes a tiny tilt swing
+// the camera wildly. In-place per Apple's signature.
+- (())multiplyByInverseOfAttitude:(id)other {
+    let q_ref = {
+        let CMQuaternion { x, y, z, w } =
+            env.objc.borrow::<CMAttitudeHostObject>(other).quaternion;
+        (x, y, z, w)
+    };
+    let q_self = {
+        let CMQuaternion { x, y, z, w } =
+            env.objc.borrow::<CMAttitudeHostObject>(this).quaternion;
+        (x, y, z, w)
+    };
+    // q_out = q_self * inverse(q_ref), and the inverse of a unit quaternion
+    // is its conjugate.
+    let q_ref_inv = (-q_ref.0, -q_ref.1, -q_ref.2, q_ref.3);
+    let q_out = quat_normalized(quat_mul(q_self, q_ref_inv));
+    let (pitch, roll, yaw) = quat_to_apple_angles(q_out);
+    let host = env.objc.borrow_mut::<CMAttitudeHostObject>(this);
+    host.quaternion = CMQuaternion {
+        x: q_out.0,
+        y: q_out.1,
+        z: q_out.2,
+        w: q_out.3,
+    };
+    host.attitude = CMAttitude { roll, pitch, yaw };
 }
 
 @end
