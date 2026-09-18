@@ -145,6 +145,17 @@ pub struct Environment {
     /// through a nil/garbage function pointer. See `debug_cpu_error`.
     udf_bypass_last_lr: Option<u32>,
     udf_bypass_lr_count: u32,
+    /// A guest `exit`/`abort` had no safe frame to recover to. This is consumed
+    /// at the existing return-to-host boundary so it cannot terminate the host
+    /// process from inside a linked libc function.
+    guest_termination_requested: bool,
+    /// A linked host function deliberately redirected the guest PC. This skips
+    /// the normal post-SVC return, which would overwrite the new continuation
+    /// for compact four-byte stubs.
+    guest_control_flow_redirected: bool,
+    /// Synthetic guest frames installed by `GuestFunction::call_from_host`.
+    /// They are host-call boundaries, not safe recovery targets.
+    host_to_guest_stack_frames: Vec<(usize, u32)>,
     /// Optional RTCV-style game-corruption engine. Always present, but only
     /// does anything when enabled via the `--corrupt*` options.
     corruptor: crate::corrupt::Corruptor,
@@ -765,7 +776,13 @@ impl Environment {
 
                         env.run_call();
 
-                        panic!("Main function exited unexpectedly!");
+                        if env.guest_termination_requested {
+                            echo!(
+                                "Guest requested controlled termination; returning to the host."
+                            );
+                        } else {
+                            panic!("Main function exited unexpectedly!");
+                        }
                     })
                 }));
 
@@ -816,6 +833,9 @@ impl Environment {
             udf_bypass_count: 0,
             udf_bypass_last_lr: None,
             udf_bypass_lr_count: 0,
+            guest_termination_requested: false,
+            guest_control_flow_redirected: false,
+            host_to_guest_stack_frames: Vec::new(),
             corruptor: crate::corrupt::Corruptor::default(),
         };
 
@@ -976,6 +996,9 @@ impl Environment {
             udf_bypass_count: 0,
             udf_bypass_last_lr: None,
             udf_bypass_lr_count: 0,
+            guest_termination_requested: false,
+            guest_control_flow_redirected: false,
+            host_to_guest_stack_frames: Vec::new(),
             corruptor: crate::corrupt::Corruptor::default(),
         };
 
@@ -1040,6 +1063,9 @@ impl Environment {
             udf_bypass_count: 0,
             udf_bypass_last_lr: None,
             udf_bypass_lr_count: 0,
+            guest_termination_requested: false,
+            guest_control_flow_redirected: false,
+            host_to_guest_stack_frames: Vec::new(),
             corruptor: crate::corrupt::Corruptor::default(),
         }
     }
@@ -1208,15 +1234,30 @@ impl Environment {
         } else {
             echo_no_panic!(" 1. {:#x} (LR)", lr);
         }
+        // A corrupted guest frame chain used to make diagnostics loop forever
+        // before a recovery path could reject it. Keep stack traces
+        // best-effort: only read complete, aligned records inside the current
+        // thread's stack; require older frames to be higher on ARM's
+        // descending stack; and bound the walk even if guest memory cycles.
+        const MAX_STACK_TRACE_FRAMES: usize = 64;
         let mut i = 2;
-        let mut fp: mem::ConstPtr<u8> = mem::Ptr::from_bits(regs[abi::FRAME_POINTER]);
-        loop {
-            if !stack_range.contains(&fp.to_bits()) {
-                echo_no_panic!("Next FP ({:?}) is outside the stack.", fp);
+        let mut fp = regs[abi::FRAME_POINTER];
+        for _ in 0..MAX_STACK_TRACE_FRAMES {
+            if fp == 0 || !fp.is_multiple_of(4) {
+                echo_no_panic!("Next FP ({:#x}) is null or unaligned.", fp);
                 break;
             }
-            lr = self.mem.read((fp + 4).cast());
-            fp = self.mem.read(fp.cast());
+            let Some(saved_lr_addr) = fp.checked_add(4) else {
+                echo_no_panic!("Next FP ({:#x}) overflows its frame record.", fp);
+                break;
+            };
+            if !stack_range.contains(&fp) || !stack_range.contains(&saved_lr_addr) {
+                echo_no_panic!("Next FP ({:#x}) is outside the stack.", fp);
+                break;
+            }
+
+            lr = self.mem.read(mem::ConstPtr::<u32>::from_bits(saved_lr_addr));
+            let previous_fp: u32 = self.mem.read(mem::ConstPtr::<u32>::from_bits(fp));
             if lr == return_to_host_routine_addr {
                 echo_no_panic!("{:2}. [host function]", i);
             } else if lr == thread_exit_routine_addr {
@@ -1225,6 +1266,19 @@ impl Environment {
             } else {
                 echo_no_panic!("{:2}. {:#x}", i, lr);
             }
+
+            if previous_fp == 0 {
+                echo_no_panic!("Next FP is null.");
+                break;
+            }
+            if previous_fp <= fp || !previous_fp.is_multiple_of(4) {
+                echo_no_panic!(
+                    "Next FP ({:#x}) does not advance toward an older frame.",
+                    previous_fp
+                );
+                break;
+            }
+            fp = previous_fp;
             i += 1;
         }
     }
@@ -1627,6 +1681,7 @@ impl Environment {
                     std::process::exit(-1)
                 };
                 self = env;
+                self.threads[self.current_thread].active = false;
                 let stack = self.threads[self.current_thread].stack.take().unwrap();
                 let stack: mem::MutVoidPtr = mem::Ptr::from_bits(*stack.start());
                 log_dbg!("Freeing thread {} stack {:?}", self.current_thread, stack);
@@ -1637,6 +1692,20 @@ impl Environment {
             };
             if let Some(w) = self.window.as_mut() {
                 w.on_main_stack = true;
+            }
+
+            if kill_current_thread && self.guest_termination_requested {
+                echo!("Guest session ended through the controlled return-to-host path.");
+                return;
+            }
+            if self.guest_termination_requested {
+                // A host callback may have yielded before its linked-function
+                // dispatch reached the return-to-host check. Put this live
+                // context back so `Environment::drop` can unwind it safely,
+                // then stop before the scheduler resumes another guest thread.
+                self.threads[self.current_thread].host_context = old_context.take();
+                echo!("Guest session ended while returning from a host callback.");
+                return;
             }
 
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1746,6 +1815,58 @@ impl Environment {
             }
             curr_host_context = old_context.unwrap();
         }
+    }
+
+    /// Request that active guest execution returns through its host boundary.
+    ///
+    /// Linked libc functions use this when an `exit`/`abort` cannot be safely
+    /// unwound. The request is observed by the CPU loop after the host function
+    /// returns, so no guest instruction after a `noreturn` call is executed.
+    pub(crate) fn request_guest_termination(&mut self) {
+        self.guest_termination_requested = true;
+    }
+
+    /// Whether a linked guest termination function has requested session end.
+    pub(crate) fn is_guest_termination_requested(&self) -> bool {
+        self.guest_termination_requested
+    }
+
+    /// Preserve a deliberate guest-PC redirect across linked-stub dispatch.
+    pub(crate) fn note_guest_control_flow_redirect(&mut self) {
+        self.guest_control_flow_redirected = true;
+    }
+
+    /// Mark a synthetic frame installed for a host-to-guest call.
+    pub(crate) fn push_host_to_guest_stack_frame(
+        &mut self,
+        frame_pointer: u32,
+    ) -> (ThreadId, u32) {
+        let frame = (self.current_thread, frame_pointer);
+        self.host_to_guest_stack_frames.push(frame);
+        frame
+    }
+
+    /// Remove a synthetic frame after its host-to-guest call has returned.
+    pub(crate) fn pop_host_to_guest_stack_frame(&mut self, frame: (ThreadId, u32)) {
+        if let Some(index) = self
+            .host_to_guest_stack_frames
+            .iter()
+            .rposition(|&candidate| candidate == frame)
+        {
+            self.host_to_guest_stack_frames.remove(index);
+        } else {
+            log_no_panic!(
+                "Warning: synthetic host-to-guest frame {:?} was not tracked.",
+                frame
+            );
+        }
+    }
+
+    /// Whether the current frame is a synthetic host-to-guest call boundary.
+    pub(crate) fn is_host_to_guest_stack_frame(&self, frame_pointer: u32) -> bool {
+        self.host_to_guest_stack_frames
+            .iter()
+            .any(|&(thread, fp)| thread == self.current_thread && fp == frame_pointer)
     }
 
     /// Run the emulator until the app returns control to the host. This is for
@@ -2202,6 +2323,24 @@ impl Environment {
                             self.udf_bypass_lr_count = 0;
                             f.call_from_guest(self);
 
+                            let guest_control_flow_redirected =
+                                std::mem::take(&mut self.guest_control_flow_redirected);
+                            if self.guest_termination_requested {
+                                log_dbg!(
+                                    "Guest termination requested on thread {}; \
+                                     returning through the host boundary.",
+                                    self.current_thread
+                                );
+                                return ThreadNextAction::ReturnToHost;
+                            }
+                            if guest_control_flow_redirected {
+                                log_dbg!(
+                                    "Linked host function redirected guest control flow; \
+                                     skipping normal stub return."
+                                );
+                                return ThreadNextAction::Continue;
+                            }
+
                             // ORIGINAL LOGIC MERGED: Stack zeroing
                             if svc & dyld::Dyld::SVC_LAZY_LINK_RET_FLAG == 0 {
                                 if let Some(len) = self.options.zero_stack_after_guest_to_host_call
@@ -2277,6 +2416,13 @@ impl Environment {
                 "Warning: run_inner called on thread {} which already has a \
                  guest_context (re-entrant run loop?). Returning early to \
                  avoid assertion failure.",
+                initial_thread
+            );
+            return;
+        }
+        if self.guest_termination_requested {
+            log_dbg!(
+                "Guest termination is pending on thread {}; returning to host.",
                 initial_thread
             );
             return;

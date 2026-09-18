@@ -797,61 +797,106 @@ fn unsetenv(env: &mut Environment, name: ConstPtr<u8>) -> i32 {
     }
 }
 
-fn exit(env: &mut Environment, exit_code: i32) {
-    set_errno(env, 0);
-
-    // Забираем список функций через mem::take, чтобы избежать проблем с borrow
-    // checker,
-    // так как вызов call_from_host требует мутабельного доступа к env.
-    let handlers = std::mem::take(&mut env.libc_state.stdlib.atexit_handlers);
-
-    // По стандарту atexit вызывает функции в обратном порядке (LIFO), поэтому
-    // делаем .rev()
-    for func in handlers.into_iter().rev() {
-        log_dbg!("Executing atexit handler: {:?}", func);
-        // Вызываем гостевую функцию (она не принимает аргументов и ничего не
-        // возвращает)
-        let _: () = func.call_from_host(env, ());
-    }
-
+/// Try to turn a guest-only termination request into a non-local guest return.
+///
+/// `abort` and the `exit` family are marked `noreturn` by their callers, so
+/// allowing their host-function stubs to return normally tends to execute an
+/// unreachable instruction in the guest. The shared C++ recovery helper instead
+/// validates the frame chain and resumes the nearest caller in the main app.
+pub(crate) fn recover_guest_termination(env: &mut Environment, termination: &str) -> bool {
     log!(
-        "Guest exit({}) on emulated thread {}",
-        exit_code,
+        "Guest {} on emulated thread {}; attempting validated frame recovery.",
+        termination,
         env.current_thread
     );
     env.stack_trace_current();
-    echo!("App called exit({}); touchHLE will now quit.", exit_code);
-    std::process::exit(exit_code);
+
+    let Some(continuation) = crate::libc::cxxabi::unwind_to_app_frame(env) else {
+        return false;
+    };
+
+    echo!(
+        "Guest {} was recovered by unwinding to app frame {:#010x}.",
+        termination,
+        continuation.addr_with_thumb_bit()
+    );
+    true
+}
+
+/// End the guest session after recovery could not find a safe continuation.
+///
+/// This only requests a return through the active host boundary; it never exits
+/// or panics the emulator process directly.
+pub(crate) fn end_guest_termination(env: &mut Environment, termination: &str) {
+    echo!(
+        "App called {}; no valid app frame was available for recovery. \
+         Ending the guest session through the return-to-host path.",
+        termination
+    );
+    env.request_guest_termination();
+}
+
+/// Resume a validated app caller when possible, otherwise end only the guest.
+pub(crate) fn recover_or_end_guest_termination(env: &mut Environment, termination: &str) {
+    if !recover_guest_termination(env, termination) {
+        end_guest_termination(env, termination);
+    }
+}
+
+/// Follow the C `exit` contract only when the guest cannot be safely resumed.
+///
+/// In the common compatibility case, a nested library or DRM check calls
+/// `exit`; recovery happens before atexit handlers are drained so that the app
+/// can continue with its process state intact. An unrecoverable `exit` still
+/// runs its handlers, but returns through the emulator's controlled host
+/// boundary rather than ending the emulator process directly.
+fn exit(env: &mut Environment, exit_code: i32) {
+    set_errno(env, 0);
+    let termination = format!("exit({exit_code})");
+    if recover_guest_termination(env, &termination) {
+        return;
+    }
+
+    // Take the handlers before calling guest code so recursively invoked exit
+    // handlers cannot execute the same registrations more than once.
+    let handlers = std::mem::take(&mut env.libc_state.stdlib.atexit_handlers);
+    for func in handlers.into_iter().rev() {
+        log_dbg!("Executing atexit handler: {:?}", func);
+        let _: () = func.call_from_host(env, ());
+        if env.is_guest_termination_requested() {
+            log_dbg!("An atexit handler requested controlled guest termination.");
+            break;
+        }
+    }
+
+    end_guest_termination(env, &termination);
+}
+
+/// Shared implementation for termination functions that do not run `atexit`
+/// handlers (`_exit`, `_Exit` and `quick_exit`).
+fn immediate_exit(env: &mut Environment, name: &str, exit_code: i32) {
+    set_errno(env, 0);
+    let termination = format!("{name}({exit_code})");
+    recover_or_end_guest_termination(env, &termination);
+}
+
+fn _exit(env: &mut Environment, exit_code: i32) {
+    immediate_exit(env, "_exit", exit_code);
+}
+
+fn _Exit(env: &mut Environment, exit_code: i32) {
+    immediate_exit(env, "_Exit", exit_code);
+}
+
+fn quick_exit(env: &mut Environment, exit_code: i32) {
+    immediate_exit(env, "quick_exit", exit_code);
 }
 
 fn abort(env: &mut Environment) {
-    // Asphalt 8 calls abort() from its DRM/network checks; unwinding to the
-    // caller frame (XaView "BypassExceptionUnwind") lets the game survive.
-    // Fall back to the original fatal path if no valid frame is found.
-    let mut fp = env.cpu.regs()[7];
-    for _ in 0..30 {
-        if fp == 0 {
-            break;
-        }
-        let prev_fp: u32 = env.mem.read(crate::mem::ConstPtr::<u32>::from_bits(fp));
-        let lr: u32 = env.mem.read(crate::mem::ConstPtr::<u32>::from_bits(fp + 4));
-        if lr > 0 && lr < 0x10000000 {
-            echo!(
-                "App called abort(); unwinding to caller frame at {:#010x} instead of crashing.",
-                lr
-            );
-            env.stack_trace_current();
-            env.cpu.regs_mut()[7] = prev_fp;
-            env.cpu.regs_mut()[13] = fp + 8;
-            env.cpu.regs_mut()[0] = 0;
-            env.cpu.branch(GuestFunction::from_addr_with_thumb_bit(lr));
-            return;
-        }
-        fp = prev_fp;
-    }
-    echo!("App called abort(); the guest encountered a fatal error.");
-    env.stack_trace_current();
-    panic!("guest called abort()")
+    // Some games use abort() for recoverable DRM, networking or asset checks.
+    // The same validated recovery path used by exit avoids the old blind frame
+    // walk and, critically, does not terminate the emulator process.
+    recover_or_end_guest_termination(env, "abort()");
 }
 
 fn bsearch(
@@ -1236,6 +1281,7 @@ fn __assert_rtn(
         file_str,
         line
     );
+    recover_or_end_guest_termination(env, "__assert_rtn()");
 }
 
 fn __assert(env: &mut Environment, expr: ConstPtr<u8>, file: ConstPtr<u8>, line: i32) {
@@ -1247,6 +1293,7 @@ fn __assert(env: &mut Environment, expr: ConstPtr<u8>, file: ConstPtr<u8>, line:
         file_str,
         line
     );
+    recover_or_end_guest_termination(env, "__assert()");
 }
 
 fn __assert_fail(
@@ -1266,24 +1313,17 @@ fn __assert_fail(
         file_str,
         line
     );
+    recover_or_end_guest_termination(env, "__assert_fail()");
 }
 
 fn read_cstr_safe(env: &mut Environment, ptr: ConstPtr<u8>) -> String {
     if ptr.is_null() {
         return "(null)".to_string();
     }
-    // Read bytes until NUL terminator.
-    let mut bytes = Vec::new();
-    let mut offset = 0u32;
-    loop {
-        let b: u8 = env.mem.read(ptr + offset);
-        if b == 0 {
-            break;
-        }
-        bytes.push(b);
-        offset += 1;
-    }
-    String::from_utf8(bytes).unwrap_or_else(|_| "(invalid utf-8)".to_string())
+    // Assertions can arrive after guest memory corruption. Keep diagnostics
+    // bounded rather than scanning an unterminated guest buffer forever.
+    String::from_utf8(env.mem.cstr_at(ptr).to_vec())
+        .unwrap_or_else(|_| "(invalid utf-8)".to_string())
 }
 
 #[allow(non_snake_case)]
@@ -1750,6 +1790,9 @@ pub const FUNCTIONS: FunctionExports = &[
     // <--- ИСПРАВЛЕНИЕ НА 3 АРГУМЕНТА ГОСТЯ
     export_c_func!(unsetenv(_)),
     export_c_func!(exit(_)),
+    export_c_func!(_exit(_)),
+    export_c_func!(_Exit(_)),
+    export_c_func!(quick_exit(_)),
     export_c_func!(abort()),
     export_c_func_aliased!("_abort", abort()),
     export_c_func!(bsearch(_, _, _, _, _)),
