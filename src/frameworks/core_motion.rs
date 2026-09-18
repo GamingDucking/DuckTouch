@@ -120,10 +120,9 @@ struct CMMotionManagerHostObject {
     /// fallback created via `Default::default()`; real motion managers
     /// allocated through `+alloc` always populate this with `Instant::now()`.
     start_time: Option<Instant>,
-    /// Attitude quaternion (x, y, z, w) from the complementary filter, and
-    /// the timestamp of the last filter step. `None` until initialised on
-    /// the first device-motion read.
-    attitude_state: Option<((f64, f64, f64, f64), Instant)>,
+    /// Complementary attitude filter state (quaternion, learned gyro bias,
+    /// low-passed gravity input). `None` until the first device-motion read.
+    attitude_state: Option<MotionFilter>,
 }
 impl HostObject for CMMotionManagerHostObject {}
 
@@ -326,24 +325,163 @@ fn read_sdl_gyroscope(env: &Environment) -> Option<CMRotationRate> {
 
 /// Smallest angular step worth applying, to avoid normalising ~zero vectors.
 const ATTITUDE_EPSILON: f64 = 1.0e-9;
+
+/// Time constant of the low-pass filter applied to the accelerometer before
+/// it may push the attitude around. Smartphones' accelerometers wobble by
+/// +-0.02g even in a resting hand (and much more during normal handling);
+/// feeding that straight into a strong gravity correction shows up as
+/// visible camera jitter. The gravity anchor only needs the slow content.
+const ATTITUDE_ACCEL_LPF_TAU: f64 = 0.2;
+
+/// Time constant for learning the gyroscope bias while the device is
+/// evidently stationary. Host gyroscopes delivered through SDL can carry a
+/// constant offset large enough to spin a naive complementary filter away;
+/// whatever the gyroscope reports while the device is provably not rotating
+/// is, by definition, bias to subtract.
+const ATTITUDE_BIAS_TAU: f64 = 2.0;
+
 /// Gain [0..1] of the gravity correction applied per second of elapsed time
-/// while the accelerometer reading looks trustworthy (see trust_weight).
-/// Kept deliberately small: the visible motion must be dominated by the
-/// buttery gyroscope integration, with gravity only correcting long-term
-/// drift. A large gain leaks raw accelerometer noise (±0.02g even in a
-/// resting hand) straight into the attitude, which shows up as camera
-/// jitter.
-const ATTITUDE_CORRECTION_PER_SEC: f64 = 3.0;
+/// while the (smoothed) accelerometer reading looks trustworthy. The anchor
+/// must stay assertive — when it was weakened in testing, gyroscope bias on
+/// real devices made the estimate wander — while the low-passed input keeps
+/// it from twitching.
+const ATTITUDE_CORRECTION_PER_SEC: f64 = 6.0;
 /// How far the measured acceleration magnitude may deviate from 1g before
-/// the gravity correction is distrusted completely. When the device is being
-/// shaken/accelerated, the accelerometer's reading is no longer "gravity" —
-/// weighting it then would inject the user's linear shaking into the
-/// orientation. This is the standard adaptive-gain trick from practical
-/// attitude filters.
-const ATTITUDE_ACCEL_TRUST_BAND: f64 = 0.15;
+/// the gravity correction is distrusted completely. When the device is
+/// being shaken/accelerated, the accelerometer's reading is no longer
+/// "gravity" — weighting it then would inject the user's linear shaking
+/// into the orientation. Tested against the RAW magnitude.
+const ATTITUDE_ACCEL_TRUST_BAND: f64 = 0.2;
 /// Gyroscope integration is skipped for steps larger than this: beyond it a
 /// stale rate sample would integrate garbage (e.g. after a suspended frame).
 const ATTITUDE_MAX_GYRO_DT: f64 = 0.1;
+
+#[inline]
+fn vec_len(v: (f64, f64, f64)) -> f64 {
+    (v.0 * v.0 + v.1 * v.1 + v.2 * v.2).sqrt()
+}
+#[inline]
+fn vec_sub(a: (f64, f64, f64), b: (f64, f64, f64)) -> (f64, f64, f64) {
+    (a.0 - b.0, a.1 - b.1, a.2 - b.2)
+}
+#[inline]
+fn vec_lerp(a: (f64, f64, f64), b: (f64, f64, f64), t: f64) -> (f64, f64, f64) {
+    (
+        a.0 + (b.0 - a.0) * t,
+        a.1 + (b.1 - a.1) * t,
+        a.2 + (b.2 - a.2) * t,
+    )
+}
+
+/// Complementary gyro+accelerometer attitude filter with long-lived state:
+/// low-passed gravity input and a learned gyroscope bias.
+struct MotionFilter {
+    /// Attitude quaternion (x, y, z, w) expressing device orientation.
+    q: (f64, f64, f64, f64),
+    /// Timestamp of the previous step.
+    last: Instant,
+    /// Low-pass filtered accelerometer input (gravity reference).
+    smoothed_accel: (f64, f64, f64),
+    /// Gyroscope bias learned while the device is stationary.
+    gyro_bias: (f64, f64, f64),
+}
+
+impl MotionFilter {
+    /// Initialise from the first accelerometer reading so the implied
+    /// gravity matches it exactly (yaw arbitrary = 0, matching the
+    /// XArbitraryZVertical reference Apple uses without a magnetometer).
+    fn new(accel: (f64, f64, f64)) -> MotionFilter {
+        let g = attitude_normalize_vec(accel);
+        MotionFilter {
+            q: quat_shortest_arc(g, (0.0, 0.0, -1.0)),
+            last: Instant::now(),
+            smoothed_accel: accel,
+            gyro_bias: (0.0, 0.0, 0.0),
+        }
+    }
+
+    /// One filter step; `now` is the current instant, `allow_gyro` disables
+    /// integration for the TOUCHHLE_NO_MOTION_GYRO diagnostic mode.
+    /// Returns (gravity estimate, user acceleration), both device frame.
+    fn step(
+        &mut self,
+        gyro: (f64, f64, f64),
+        accel: (f64, f64, f64),
+        now: Instant,
+        allow_gyro: bool,
+    ) -> ((f64, f64, f64), (f64, f64, f64)) {
+        let dt = now
+            .duration_since(self.last)
+            .min(std::time::Duration::from_secs(1))
+            .as_secs_f64();
+        self.last = now;
+
+        // 0. Low-pass the accelerometer input (limits ~[0, 5Hz] content for
+        //    the gravity anchor; kills sensor wobble in a resting hand).
+        let lerp_t = (1.0 - (-dt / ATTITUDE_ACCEL_LPF_TAU).exp()).clamp(0.0, 1.0);
+        self.smoothed_accel = vec_lerp(self.smoothed_accel, accel, lerp_t);
+
+        // 0b. Learn the gyroscope bias while the device is evidently
+        //     stationary: raw magnitude near 1g *and* no recent change
+        //     between the raw sample and its own low-pass. Learning is
+        //     deliberately one-sided (only from accel evidence), so even a
+        //     huge constant gyro offset eventually converges instead of
+        //     spinning the estimate forever.
+        let raw_len = vec_len(accel);
+        let recent_change = vec_len(vec_sub(accel, self.smoothed_accel));
+        let gyro_is_bias_evidence = (raw_len - 1.0).abs() < 0.05 && recent_change < 0.01;
+        if gyro_is_bias_evidence && dt > 0.0 {
+            let bias_t = (dt / ATTITUDE_BIAS_TAU).clamp(0.0, 1.0);
+            self.gyro_bias = vec_lerp(self.gyro_bias, gyro, bias_t);
+        }
+        let gyro_clean = vec_sub(gyro, self.gyro_bias);
+
+        // 1. Integrate the (debiased) gyroscope: body-frame rate => right
+        //    multiply. This is the smooth, low-latency part of the motion.
+        if allow_gyro && dt > 0.0 && dt <= ATTITUDE_MAX_GYRO_DT {
+            let half_dt = dt * 0.5;
+            let dq = (
+                gyro_clean.0 * half_dt,
+                gyro_clean.1 * half_dt,
+                gyro_clean.2 * half_dt,
+                1.0,
+            );
+            self.q = quat_normalized(quat_mul(self.q, dq));
+        }
+
+        // 2. Gravity correction, from the *smoothed* samples; trust is
+        //    decided on the *raw* magnitude so shaking disables it.
+        let sm_len = vec_len(self.smoothed_accel);
+        let trust_weight = if raw_len > 1.0e-3 {
+            (1.0 - (raw_len - 1.0).abs() / ATTITUDE_ACCEL_TRUST_BAND).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        if sm_len > 1.0e-3 && trust_weight > 0.0 {
+            let measured_g = (
+                self.smoothed_accel.0 / sm_len,
+                self.smoothed_accel.1 / sm_len,
+                self.smoothed_accel.2 / sm_len,
+            );
+            let predicted_g = quat_world_to_device(self.q, (0.0, 0.0, -1.0));
+            // NOTE the arc direction: the implied gravity is
+            // quat_world_to_device(q, ¦-z¦) = R(q)^-1(-z), and extending
+            // q <- q*r rotates the implied vector by R(r)^-1. To move the
+            // predicted vector towards the measured one the correction arc
+            // must map *measured -> predicted*; its inverse then maps
+            // predicted -> measured.
+            let correction = quat_shortest_arc(measured_g, predicted_g);
+            let gain = (dt * ATTITUDE_CORRECTION_PER_SEC * trust_weight).clamp(0.0, 1.0);
+            let correction = quat_scale_angle(correction, gain);
+            self.q = quat_normalized(quat_mul(self.q, correction));
+        }
+
+        // 3. Derived outputs.
+        let gravity = quat_world_to_device(self.q, (0.0, 0.0, -1.0));
+        let user = vec_sub(accel, gravity);
+        (gravity, user)
+    }
+}
 
 /// Rotate world-frame vector `v` into the device frame expressed by
 /// attitude quaternion `q` (q maps device orientation -> world; applying the
@@ -376,9 +514,7 @@ fn quat_shortest_arc(from: (f64, f64, f64), to: (f64, f64, f64)) -> (f64, f64, f
     let norm = (q.0 * q.0 + q.1 * q.1 + q.2 * q.2 + q.3 * q.3).sqrt();
     if norm < ATTITUDE_EPSILON {
         // Vectors are opposite; pick any perpendicular axis.
-        return (
-            1.0, 0.0, 0.0, 0.0,
-        );
+        return (1.0, 0.0, 0.0, 0.0);
     }
     q.0 /= norm;
     q.1 /= norm;
@@ -405,73 +541,6 @@ fn quat_scale_angle(q: (f64, f64, f64, f64), gain: f64) -> (f64, f64, f64, f64) 
         qz * factor,
         scaled.cos(),
     )
-}
-
-/// One step of the complementary attitude filter.
-///
-/// - `q`: attitude quaternion (x, y, z, w) expressing device orientation.
-/// - `gyro`: rotation rate about the device axes, rad/s.
-/// - `accel`: total acceleration in g units (gravity + user), device frame.
-/// - `dt`: elapsed time in seconds since the previous step.
-///
-/// Returns the updated quaternion, the gravity estimate (device frame) and
-/// the user acceleration (device frame).
-fn attitude_filter_step(
-    q: (f64, f64, f64, f64),
-    gyro: (f64, f64, f64),
-    accel: (f64, f64, f64),
-    dt: f64,
-) -> ((f64, f64, f64, f64), (f64, f64, f64), (f64, f64, f64)) {
-    let mut q = q;
-
-    // 1. Integrate the gyroscope (body-frame rate => multiply on the right).
-    if dt > 0.0 && dt <= ATTITUDE_MAX_GYRO_DT {
-        let half_dt_angle_scale = dt * 0.5;
-        let dq = (
-            gyro.0 * half_dt_angle_scale,
-            gyro.1 * half_dt_angle_scale,
-            gyro.2 * half_dt_angle_scale,
-            1.0,
-        );
-        q = quat_mul(q, dq);
-        q = quat_normalized(q);
-    }
-
-    // 2. Correct towards the measured gravity vector (when sane and
-    //    trustworthy).
-    let accel_len = (accel.0 * accel.0 + accel.1 * accel.1 + accel.2 * accel.2).sqrt();
-    // Trust the accelerometer as a gravity reference only while its
-    // magnitude is ~1g: any deviation means the reading is polluted by
-    // linear acceleration (shaking hands, car movement, etc.), and the
-    // gyroscope is a far better source then.
-    let trust_weight = if accel_len > 1.0e-3 {
-        (1.0 - (accel_len - 1.0).abs() / ATTITUDE_ACCEL_TRUST_BAND).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    if trust_weight > 0.0 {
-        let measured_g = (accel.0 / accel_len, accel.1 / accel_len, accel.2 / accel_len);
-        let predicted_g = quat_world_to_device(q, (0.0, 0.0, -1.0));
-        // NOTE the arc direction: the implied gravity is
-        // quat_world_to_device(q, ¦-z¦) = R(q)^-1(-z), and right-multiplying
-        // q <- q*r rotates the implied vector by R(r)^-1. So to move the
-        // predicted vector towards the measured one we need the arc that
-        // maps *measured -> predicted*; its inverse then maps
-        // predicted -> measured. (The other way round mirrors the estimate
-        // and fights the gain every step: inverted and jerky.)
-        let correction = quat_shortest_arc(measured_g, predicted_g);
-        // Gain must be "per second" so behaviour doesn't depend on the
-        // polling rate of the game; scaled down by the trust weight.
-        let gain = (dt * ATTITUDE_CORRECTION_PER_SEC * trust_weight).clamp(0.0, 1.0);
-        let correction = quat_scale_angle(correction, gain);
-        q = quat_mul(q, correction);
-        q = quat_normalized(q);
-    }
-
-    // 3. Derived outputs.
-    let gravity = quat_world_to_device(q, (0.0, 0.0, -1.0));
-    let user = (accel.0 - gravity.0, accel.1 - gravity.1, accel.2 - gravity.2);
-    (q, gravity, user)
 }
 
 fn quat_mul(a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)) -> (f64, f64, f64, f64) {
@@ -1012,21 +1081,16 @@ const CLASSES: ClassExports = objc_classes! {
     let (attitude_q, gravity_g, user_g) = {
         let accel_t = (accel.x, accel.y, accel.z);
         let gyro_t = (rotation_rate.x, rotation_rate.y, rotation_rate.z);
+        // Diagnostic escape hatch: with TOUCHHLE_NO_MOTION_GYRO set, gyro
+        // integration is disabled (useful on hosts whose gyro signal is
+        // unusable; gravity-only operation then applies).
+        let allow_gyro = !crate::env_flag_cached!("TOUCHHLE_NO_MOTION_GYRO");
         let host = env.objc.borrow_mut::<CMMotionManagerHostObject>(this);
-        let (q, dt) = match host.attitude_state {
-            Some((q, last)) => (q, now.duration_since(last).as_secs_f64()),
-            None => {
-                // Initialise so the implied gravity matches the current
-                // accelerometer reading (yaw arbitrary = 0, matching the
-                // XArbitraryZVertical reference frame Apple uses without a
-                // magnetometer).
-                let g_measured = attitude_normalize_vec(accel_t);
-                (quat_shortest_arc(g_measured, (0.0, 0.0, -1.0)), 0.0)
-            }
-        };
-        let (q, gravity_g, user_g) = attitude_filter_step(q, gyro_t, accel_t, dt);
-        host.attitude_state = Some((q, now));
-        (q, gravity_g, user_g)
+        let filter = host
+            .attitude_state
+            .get_or_insert_with(|| MotionFilter::new(accel_t));
+        let (gravity_g, user_g) = filter.step(gyro_t, accel_t, now, allow_gyro);
+        (filter.q, gravity_g, user_g)
     };
 
     // Deliver the *filter's* continuous attitude quaternion and the angles
