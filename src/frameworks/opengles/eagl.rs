@@ -687,7 +687,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     // The presented frame should be displayed ASAP, but the next one must be
     // delayed, so this needs to be checked before returning.
-    let sleep_for = limit_framerate(&mut env.objc.borrow_mut::<EAGLContextHostObject>(this).next_frame_due, &env.options);
+    let frame_due = limit_framerate(&mut env.objc.borrow_mut::<EAGLContextHostObject>(this).next_frame_due, &env.options);
 
     if env.options.print_fps {
         env
@@ -722,8 +722,8 @@ pub const CLASSES: ClassExports = objc_classes! {
             target,
             env.current_thread
         );
-        if let Some(sleep_for) = sleep_for {
-            env.sleep(sleep_for);
+        if let Some(frame_due) = frame_due {
+            pace_frame(env, frame_due);
         }
         return false;
     };
@@ -799,8 +799,8 @@ pub const CLASSES: ClassExports = objc_classes! {
                 fullscreen_layer,
                 renderbuffer,
             );
-            if let Some(sleep_for) = sleep_for {
-                env.sleep(sleep_for);
+            if let Some(frame_due) = frame_due {
+                pace_frame(env, frame_due);
             }
             return true;
         }
@@ -839,8 +839,8 @@ pub const CLASSES: ClassExports = objc_classes! {
             }
         };
         let Some((pixels_vec, width, height)) = read_result else {
-            if let Some(sleep_for) = sleep_for {
-                env.sleep(sleep_for);
+            if let Some(frame_due) = frame_due {
+                pace_frame(env, frame_due);
             }
             return false;
         };
@@ -866,9 +866,9 @@ pub const CLASSES: ClassExports = objc_classes! {
         crate::frameworks::core_animation::recomposite_if_necessary(env, true);
     }
 
-    if let Some(sleep_for) = sleep_for {
-        env.sleep(sleep_for);
-    }
+    if let Some(frame_due) = frame_due {
+        pace_frame(env, frame_due);
+        }
 
     true
 }
@@ -899,7 +899,7 @@ unsafe fn present_renderbuffer_readback(env: &mut Environment, renderbuffer: GLu
     {
         use std::sync::atomic::{AtomicBool, Ordering};
         static DUMPED: AtomicBool = AtomicBool::new(false);
-        if std::env::var("TOUCHHLE_DUMP_READBACK").is_ok()
+        if crate::env_flag_cached!("TOUCHHLE_DUMP_READBACK")
             && !DUMPED.swap(true, Ordering::Relaxed)
         {
             let path = "/tmp/a8run/readback.ppm";
@@ -947,7 +947,11 @@ unsafe fn present_renderbuffer_readback(env: &mut Environment, renderbuffer: GLu
 /// an interval's worth of accumulated slop. Allowing infinite accumulation of
 /// slop is not desirable, because if the game is running slowly for a long time
 /// and suddenly speeds back up, it will then run too fast for a long time.
-fn limit_framerate(next_frame_due: &mut Option<Instant>, options: &Options) -> Option<Duration> {
+///
+/// Returns the [Instant] the current frame is due at (or `None` if no pacing
+/// is needed), so the caller can pace the *next* guest work precisely with
+/// [pace_frame].
+fn limit_framerate(next_frame_due: &mut Option<Instant>, options: &Options) -> Option<Instant> {
     let interval = if let Some(fps) = options.fps_limit {
         1.0 / fps
     } else {
@@ -979,11 +983,53 @@ fn limit_framerate(next_frame_due: &mut Option<Instant>, options: &Options) -> O
     };
 
     if now < current_frame_due {
-        // Frame was presented early, delay it to maintain framerate limit.
-        Some(current_frame_due.saturating_duration_since(now))
+        // Frame was presented early, pace the next one to the due time.
+        Some(current_frame_due)
     } else {
-        // Frame was presented on time or late, don't delay.
+        // Frame was presented on time or late, don't pace.
         None
+    }
+}
+
+/// How far before the frame deadline [pace_frame] stops the cooperative sleep
+/// and switches to a spin-wait. Chosen to comfortably cover the typical
+/// overshoot of the scheduler's final `std::thread::sleep` on Android
+/// (hundreds of microseconds; a few ms when waking a parked core) without
+/// burning significant CPU: at 60 FPS with a normal frame time the spin phase
+/// usually lasts well under a millisecond.
+const FRAME_PACING_SPIN_BUDGET: Duration = Duration::from_millis(2);
+
+/// Pace the guest so its next frame's work resumes exactly at `frame_due`:
+///
+/// - **Coarse phase**: `env.sleep()` until shortly before the deadline. This
+///   is a cooperative guest-thread sleep, so other guest threads (audio, run
+///   loops, timers) still get CPU time while this frame waits.
+/// - **Fine phase**: a short host-side spin until the deadline. Plain timer
+///   sleeps wake up to several ms late, which used to start the guest's next
+///   frame late and made its presentation miss the pacing grid (visible as
+///   micro-stutter / cadence wobble). Spinning the last couple of
+///   milliseconds lands the wake-up within tens of microseconds of the
+///   deadline — the frame pacing equivalent of a vsync phase-lock.
+fn pace_frame(env: &mut Environment, frame_due: Instant) {
+    let now = Instant::now();
+    if frame_due <= now {
+        return;
+    }
+    let remaining = frame_due - now;
+    if remaining > FRAME_PACING_SPIN_BUDGET {
+        env.sleep(remaining - FRAME_PACING_SPIN_BUDGET);
+    }
+    // Fine phase: spin until the deadline. The extra half-budget past the
+    // deadline is a circuit breaker in case the coarse sleep woke *late*
+    // (a busy batch can do that): then the deadline is already in the past
+    // and the deadline check exits immediately.
+    let give_up_at = frame_due + FRAME_PACING_SPIN_BUDGET / 2;
+    loop {
+        let now = Instant::now();
+        if now >= frame_due || now >= give_up_at {
+            break;
+        }
+        std::hint::spin_loop();
     }
 }
 
@@ -1811,7 +1857,8 @@ unsafe fn present_renderbuffer(
             device_orientation,
             crate::window::DeviceOrientation::Portrait
         );
-    let rotation_matrix = if std::env::var_os("TOUCHHLE_DISABLE_PRESENT_ROTATION").is_some() {
+    // PERF: cached read-once flag; present_renderbuffer runs every frame.
+    let rotation_matrix = if crate::env_flag_cached!("TOUCHHLE_DISABLE_PRESENT_ROTATION") {
         log_once!(
             "TOUCHHLE_DISABLE_PRESENT_ROTATION=1: presenting EAGL renderbuffer without texture rotation"
         );

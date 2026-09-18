@@ -26,6 +26,7 @@
 
 #[macro_use]
 mod log;
+mod env_flags;
 mod abi;
 mod android_media;
 mod android_web_view;
@@ -61,6 +62,15 @@ mod window;
 use environment::{Environment, MutexId, MutexType, ThreadId, PTHREAD_MUTEX_DEFAULT};
 
 use std::path::PathBuf;
+
+// PERF: use mimalloc as the global allocator. The emulator performs a large
+// number of small, short-lived allocations per frame (autorelease pools,
+// string handling and various collections in the Foundation/UIKit HLE
+// implementations), a workload that mimalloc handles measurably faster than
+// the platform malloc — in particular on Android, where every allocation
+// additionally goes through Scudo hardening.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub use touchHLE_version::*;
 /// This is the true entry point on Android (SDLActivity calls it after
@@ -113,6 +123,25 @@ Special options:
 pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
     crash_handler::install();
     crash_handler::install_panic_hook();
+
+    #[cfg(target_os = "android")]
+    {
+        // PERF: raise the scheduling priority of the thread that runs the
+        // emulation loop. Android aggressively deprioritises background-ish
+        // app threads, which on big.LITTLE SoCs tends to keep the emulator on
+        // a little (efficiency) core and costs a large chunk of FPS. SDL's
+        // implementation of SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH)
+        // on Android/Linux raises the niceness of the calling thread and
+        // degrades gracefully (returns -1) if the OS disallows it — this is
+        // deliberately routed through SDL rather than libc::setpriority
+        // because the latter is not exposed for Android by the libc crate.
+        let rc = unsafe {
+            sdl2_sys::SDL_SetThreadPriority(sdl2_sys::SDL_ThreadPriority::SDL_THREAD_PRIORITY_HIGH)
+        };
+        if rc != 0 {
+            log!("Warning: failed to raise emulator thread priority; continuing with default priority.");
+        }
+    }
 
     echo!(
         "touchHLE {}{}{}",

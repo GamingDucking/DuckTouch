@@ -42,7 +42,7 @@ const SUPPORTED_COMPRESSED_TEXTURE_FORMATS: &[GLenum] = &[
 ];
 
 fn trace_potatogold_render() -> bool {
-    std::env::var_os("TOUCHHLE_TRACE_POTATOGOLD_RENDER").is_some()
+    crate::env_flag_cached!("TOUCHHLE_TRACE_POTATOGOLD_RENDER")
 }
 
 #[track_caller]
@@ -579,7 +579,7 @@ fn glViewport(env: &mut Environment, x: GLint, y: GLint, width: GLsizei, height:
     {
         log!("UltraHLE MinionJump: viewport swap 768x1024 -> 1024x768");
         (0, 0, 1024, 768)
-    } else if std::env::var_os("TOUCHHLE_FORCE_IPAD_LANDSCAPE_SCREEN").is_some()
+    } else if crate::env_flag_cached!("TOUCHHLE_FORCE_IPAD_LANDSCAPE_SCREEN")
         && x == 0
         && y == 0
         && width == 768
@@ -593,7 +593,7 @@ fn glViewport(env: &mut Environment, x: GLint, y: GLint, width: GLsizei, height:
     // ULTRAHLE_MINIONJUMP_VIEWPORT_END
     let (mut x, mut y, mut width, mut height) = (x, y, width, height);
 
-    if std::env::var_os("TOUCHHLE_FORCE_LANDSCAPE_VIEWPORT").is_some() {
+    if crate::env_flag_cached!("TOUCHHLE_FORCE_LANDSCAPE_VIEWPORT") {
         // PotatoGold/adrastea-style landscape apps can end up with a 20px
         // status-bar-shortened portrait-derived viewport, e.g. 460x320,
         // even after UIScreen/EAGL have been made landscape. That leaves the
@@ -1449,7 +1449,7 @@ fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsize
     with_ctx_and_mem(env, |gles, mem| unsafe {
         let disabled_arrays = guard_client_vertex_arrays(gles, mem);
         let fog_state_backup = clamp_fog_state_values(gles);
-        if std::env::var_os("TOUCHHLE_POTATO_NATIVE_GLES2_PC_STATE").is_some() {
+        if crate::env_flag_cached!("TOUCHHLE_POTATO_NATIVE_GLES2_PC_STATE") {
             static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 log!(
@@ -1510,7 +1510,7 @@ fn glDrawElements(
     with_ctx_and_mem(env, |gles, mem| unsafe {
         let disabled_arrays = guard_client_vertex_arrays(gles, mem);
         let fog_state_backup = clamp_fog_state_values(gles);
-        if std::env::var_os("TOUCHHLE_POTATO_NATIVE_GLES2_PC_STATE").is_some() {
+        if crate::env_flag_cached!("TOUCHHLE_POTATO_NATIVE_GLES2_PC_STATE") {
             static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 log!(
@@ -1918,7 +1918,7 @@ fn glTexParameterx(env: &mut Environment, target: GLenum, pname: GLenum, param: 
 }
 fn glTexParameteriv(env: &mut Environment, target: GLenum, pname: GLenum, params: ConstPtr<GLint>) {
     if pname == gles11::TEXTURE_CROP_RECT_OES {
-        if std::env::var_os("TOUCHHLE_ENABLE_TEXTURE_CROP_RECT").is_none() {
+        if !crate::env_flag_cached!("TOUCHHLE_ENABLE_TEXTURE_CROP_RECT") {
             return;
         }
 
@@ -1964,7 +1964,7 @@ fn glTexParameterfv(
     params: ConstPtr<GLfloat>,
 ) {
     if pname == gles11::TEXTURE_CROP_RECT_OES {
-        if std::env::var_os("TOUCHHLE_ENABLE_TEXTURE_CROP_RECT").is_none() {
+        if !crate::env_flag_cached!("TOUCHHLE_ENABLE_TEXTURE_CROP_RECT") {
             return;
         }
 
@@ -2010,7 +2010,7 @@ fn glTexParameterxv(
     params: ConstPtr<GLfixed>,
 ) {
     if pname == gles11::TEXTURE_CROP_RECT_OES {
-        if std::env::var_os("TOUCHHLE_ENABLE_TEXTURE_CROP_RECT").is_none() {
+        if !crate::env_flag_cached!("TOUCHHLE_ENABLE_TEXTURE_CROP_RECT") {
             return;
         }
 

@@ -59,6 +59,19 @@ Compatibility:
   - Support for NIBArchive NIB file format decoding. (@ciciplusplus)
 - Switch to coroutine based threading system. This solved [some compatibility issues](https://github.com/touchHLE/touchHLE/issues/119) and improved performance in some games. (@abnormalmaps)
 
+Quality and performance:
+
+- Implemented true frame pacing in the EAGL presentation path, making the picture noticeably smoother: the frame limiter now paces the guest to an exact frame deadline using a hybrid timer — a cooperative `env.sleep()` until shortly before the deadline (other guest threads still run) followed by a short spin-wait for the last ~2ms. Previously the pacing sleep was a plain timer sleep that could wake several ms late, starting the guest's next frame late and visibly wobbling the frame cadence (micro-stutter). The wake-up now lands within tens of microseconds of the deadline.
+- The CPU scheduler batch is now adaptive: 1,000,000 ticks during long busy stretches, automatically reduced to 100,000 whenever any guest thread has an imminent wake deadline (<10ms), so frame pacing, run-loop timers and audio callbacks stay millisecond-precise.
+- Major performance optimisation pass, focused on game FPS on Android devices:
+  - The dynarmic CPU JIT now enables its "unsafe" floating-point/codegen optimizations (`Unsafe_UnfuseFMA`, `Unsafe_ReducedErrorFP`, `Unsafe_InaccurateNaN`, `Unsafe_IgnoreStandardFPCRValue`; the accuracy differences are limited to FP edge cases that games don't depend on), so VFP/NEON-heavy guest code no longer pays for per-instruction NaN/rounding bookkeeping where the backend supports these switches (currently the x86-64 JIT backend; on AArch64 hosts the flags are accepted but don't change emitted code yet). `Unsafe_IgnoreGlobalMonitor` deliberately stays off so guest atomics remain correct on multithreaded apps.
+  - The CPU scheduler batch was raised from 100,000 to 1,000,000 ticks, amortising JIT exits, coroutine switches and scheduler passes ~10x better. Event polling keeps its independent 120 Hz throttle and guest thread wakeups are deadline-based, so input and timer responsiveness are unaffected.
+  - The release profile now uses fat (whole-program) LTO instead of thin LTO, letting LLVM inline across all crate boundaries in the hottest emulation paths.
+  - The global allocator is now mimalloc, which handles the emulator's small-allocation-heavy workload (autorelease pools, string and collection churn in the HLE frameworks) measurably faster than the platform allocator, especially on Android.
+  - On Android the emulator thread's scheduling priority is raised via SDL's `SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH)`, keeping the emulation loop on big CPU cores on big.LITTLE SoCs.
+  - The window framebuffer no longer requests depth/stencil buffers it never uses (everything host-drawn is a flat textured quad), saving a swap chain resolution's worth of bandwidth on tile-based mobile GPUs.
+  - Per-frame/per-touch `getenv`-style debug toggle checks (`TOUCHHLE_*` env vars on the present, viewport, draw-call, hit-test and touch-remap paths) are now read once and cached; previously several of them ran an environ scan with locking and allocation on every frame or touch event.
+
 ## v0.2.3 (2026-01-02)
 
 Compatibility:

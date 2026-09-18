@@ -801,6 +801,19 @@ impl Window {
         // here, and then the app can disable it if it wants to.
         video_ctx.enable_screen_saver();
 
+        // PERF: never request depth or stencil buffers for the window's own
+        // framebuffer. The only things ever drawn to it are flat,
+        // depth-untested textured quads (app presentation, splash screen, app
+        // picker); the guest app itself renders into offscreen renderbuffers
+        // with their own attachments. On tile-based mobile GPUs, skipping the
+        // window depth/stencil buffers saves memory bandwidth on every swap
+        // chain resolution. Note: must be set *before* window creation.
+        {
+            let attr = video_ctx.gl_attr();
+            attr.set_depth_size(0);
+            attr.set_stencil_size(0);
+        }
+
         let scale_hack = options.scale_hack;
         let host_screen_size = options.host_screen_size.map(normalize_portrait_size);
         // TODO: some apps specify their orientation in Info.plist, we could use
@@ -1106,8 +1119,11 @@ impl Window {
             // 320x480 UIKit space so EAGLView still receives the event; a
             // separate UITouch locationInView compatibility path can remap
             // the coordinates returned to the game.
-            let [x, y] = if std::env::var_os("TOUCHHLE_DISABLE_PRESENT_ROTATION").is_some()
-                || std::env::var_os("TOUCHHLE_DISABLE_TOUCH_ROTATION").is_some()
+            // PERF: cache the read-once debug toggles; this runs per SDL
+            // touch event, and each std::env::var_os is a global-lock environ
+            // scan with allocation.
+            let [x, y] = if crate::env_flag_cached!("TOUCHHLE_DISABLE_PRESENT_ROTATION")
+                || crate::env_flag_cached!("TOUCHHLE_DISABLE_TOUCH_ROTATION")
             {
                 log_once!(
                     "TOUCHHLE_DISABLE_TOUCH_ROTATION: not rotating touch hit-test coordinates [this log will only be shown once]"
@@ -1125,12 +1141,12 @@ impl Window {
 
             // Optional hit-test tuning only. Do not use these unless you are
             // deliberately testing the UIKit hit-test position.
-            if let Ok(offset) = std::env::var("TOUCHHLE_HITTEST_X_OFFSET") {
+            if let Some(offset) = crate::env_var_cached!("TOUCHHLE_HITTEST_X_OFFSET") {
                 if let Ok(offset) = offset.parse::<f32>() {
                     out_x += offset;
                 }
             }
-            if let Ok(offset) = std::env::var("TOUCHHLE_HITTEST_Y_OFFSET") {
+            if let Some(offset) = crate::env_var_cached!("TOUCHHLE_HITTEST_Y_OFFSET") {
                 if let Ok(offset) = offset.parse::<f32>() {
                     out_y += offset;
                 }

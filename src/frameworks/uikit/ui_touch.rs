@@ -170,11 +170,12 @@ fn touchhle_should_use_landscape_touch_remap(env: &Environment) -> bool {
         "at.source.tomzom" => false,
 
         // Manual override for testing.
+        // PERF: read-once cached flags; this is checked per touch event.
         _ => {
-            std::env::var_os("TOUCHHLE_TOUCH_LOCATION_PORTRAIT_TO_LANDSCAPE").is_some()
-                || std::env::var_os("TOUCHHLE_COCOS_TOUCH_REMAP").is_some()
-                || std::env::var_os("TOUCHHLE_UNITY_TOUCH_REMAP").is_some()
-                || std::env::var_os("TOUCHHLE_ENGINE_TOUCH_REMAP").is_some()
+            crate::env_flag_cached!("TOUCHHLE_TOUCH_LOCATION_PORTRAIT_TO_LANDSCAPE")
+                || crate::env_flag_cached!("TOUCHHLE_COCOS_TOUCH_REMAP")
+                || crate::env_flag_cached!("TOUCHHLE_UNITY_TOUCH_REMAP")
+                || crate::env_flag_cached!("TOUCHHLE_ENGINE_TOUCH_REMAP")
         }
     }
 }
@@ -192,33 +193,41 @@ fn should_remap_touch_location_for_view(env: &mut Environment, view: id) -> bool
 }
 
 fn touchhle_cocos_target_size() -> (f32, f32) {
-    std::env::var("TOUCHHLE_COCOS_TOUCH_SIZE")
-        .or_else(|_| std::env::var("TOUCHHLE_UNITY_TOUCH_SIZE"))
-        .or_else(|_| std::env::var("TOUCHHLE_ENGINE_TOUCH_SIZE"))
-        .ok()
-        .and_then(|v| {
-            let mut parts = v.split(|c| c == 'x' || c == 'X' || c == ',');
-            let w = parts.next()?.trim().parse::<f32>().ok()?;
-            let h = parts.next()?.trim().parse::<f32>().ok()?;
-            Some((w, h))
-        })
-        .unwrap_or((480.0, 320.0))
+    // PERF: computed once; this runs for every remapped touch point.
+    static CACHED: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("TOUCHHLE_COCOS_TOUCH_SIZE")
+            .or_else(|_| std::env::var("TOUCHHLE_UNITY_TOUCH_SIZE"))
+            .or_else(|_| std::env::var("TOUCHHLE_ENGINE_TOUCH_SIZE"))
+            .ok()
+            .and_then(|v| {
+                let mut parts = v.split(|c| c == 'x' || c == 'X' || c == ',');
+                let w = parts.next()?.trim().parse::<f32>().ok()?;
+                let h = parts.next()?.trim().parse::<f32>().ok()?;
+                Some((w, h))
+            })
+            .unwrap_or((480.0, 320.0))
+    })
 }
 
 fn touchhle_cocos_remap_point(env: &mut Environment, view: id, point: CGPoint) -> CGPoint {
     let old_x = point.x;
     let old_y = point.y;
     let (target_w, target_h) = touchhle_cocos_target_size();
-    let mode = std::env::var("TOUCHHLE_TOUCH_MODE").unwrap_or_else(|_| {
+    // PERF: cached read-once lookups; runs for every remapped touch point.
+    let mode = crate::env_var_cached!("TOUCHHLE_TOUCH_MODE")
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
         match env.bundle.bundle_identifier() {
             "at.source.veggie1"
             | "at.source.potato3D"
             | "at.source.potpan"
             | "com.robtop.geometryjump" => "scale".to_string(),
-            _ => std::env::var("TOUCHHLE_COCOS_TOUCH_MODE")
-                .or_else(|_| std::env::var("TOUCHHLE_UNITY_TOUCH_MODE"))
-                .or_else(|_| std::env::var("TOUCHHLE_ENGINE_TOUCH_MODE"))
-                .unwrap_or_else(|_| "scale".to_string()),
+            _ => crate::env_var_cached!("TOUCHHLE_COCOS_TOUCH_MODE")
+                .or(crate::env_var_cached!("TOUCHHLE_UNITY_TOUCH_MODE"))
+                .or(crate::env_var_cached!("TOUCHHLE_ENGINE_TOUCH_MODE"))
+                .map(str::to_owned)
+                .unwrap_or_else(|| "scale".to_string()),
         }
     });
 
@@ -273,18 +282,18 @@ fn touchhle_cocos_remap_point(env: &mut Environment, view: id, point: CGPoint) -
         }
     };
 
-    if let Ok(offset) = std::env::var("TOUCHHLE_TOUCH_LOCATION_X_OFFSET") {
+    if let Some(offset) = crate::env_var_cached!("TOUCHHLE_TOUCH_LOCATION_X_OFFSET") {
         if let Ok(offset) = offset.parse::<f32>() {
             new_x += offset;
         }
     }
-    if let Ok(offset) = std::env::var("TOUCHHLE_TOUCH_LOCATION_Y_OFFSET") {
+    if let Some(offset) = crate::env_var_cached!("TOUCHHLE_TOUCH_LOCATION_Y_OFFSET") {
         if let Ok(offset) = offset.parse::<f32>() {
             new_y += offset;
         }
     }
 
-    if std::env::var_os("TOUCHHLE_COCOS_NO_TOUCH_CLAMP").is_none() {
+    if !crate::env_flag_cached!("TOUCHHLE_COCOS_NO_TOUCH_CLAMP") {
         new_x = new_x.clamp(0.0, (target_w - 1.0).max(0.0));
         new_y = new_y.clamp(0.0, (target_h - 1.0).max(0.0));
     }
@@ -298,15 +307,15 @@ fn touchhle_cocos_remap_point(env: &mut Environment, view: id, point: CGPoint) -
 }
 
 fn touchhle_cocos_should_allow_multitouch(env: &mut Environment, view: id) -> bool {
-    if std::env::var_os("TOUCHHLE_COCOS_FORCE_SINGLE_TOUCH").is_some()
-        || std::env::var_os("TOUCHHLE_UNITY_FORCE_SINGLE_TOUCH").is_some()
-        || std::env::var_os("TOUCHHLE_ENGINE_FORCE_SINGLE_TOUCH").is_some()
+    if crate::env_flag_cached!("TOUCHHLE_COCOS_FORCE_SINGLE_TOUCH")
+        || crate::env_flag_cached!("TOUCHHLE_UNITY_FORCE_SINGLE_TOUCH")
+        || crate::env_flag_cached!("TOUCHHLE_ENGINE_FORCE_SINGLE_TOUCH")
     {
         return false;
     }
-    if std::env::var_os("TOUCHHLE_COCOS_FORCE_MULTITOUCH").is_some()
-        || std::env::var_os("TOUCHHLE_UNITY_FORCE_MULTITOUCH").is_some()
-        || std::env::var_os("TOUCHHLE_ENGINE_FORCE_MULTITOUCH").is_some()
+    if crate::env_flag_cached!("TOUCHHLE_COCOS_FORCE_MULTITOUCH")
+        || crate::env_flag_cached!("TOUCHHLE_UNITY_FORCE_MULTITOUCH")
+        || crate::env_flag_cached!("TOUCHHLE_ENGINE_FORCE_MULTITOUCH")
     {
         return true;
     }
@@ -443,10 +452,10 @@ pub fn handle_event(env: &mut Environment, event: Event) {
 }
 
 fn touchhle_cocos_touch_aliases_enabled(env: &mut Environment, view: id) -> bool {
-    if std::env::var_os("TOUCHHLE_DISABLE_COCOS_TOUCH_ALIASES").is_some() {
+    if crate::env_flag_cached!("TOUCHHLE_DISABLE_COCOS_TOUCH_ALIASES") {
         return false;
     }
-    if std::env::var_os("TOUCHHLE_COCOS_TOUCH_ALIASES").is_some() {
+    if crate::env_flag_cached!("TOUCHHLE_COCOS_TOUCH_ALIASES") {
         return true;
     }
     let class_name = touchhle_cocos_view_class_name(env, view);

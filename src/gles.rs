@@ -1420,7 +1420,8 @@ static TRANSLATOR_TRACE_EVENTS: AtomicU32 = AtomicU32::new(0);
 pub(crate) fn configure_translator_tracing(_enabled: bool) {}
 
 pub(crate) fn translator_tracing_enabled() -> bool {
-    std::env::var_os("TOUCHHLE_TRACE_TRANSLATOR").is_some()
+    // PERF: cached read-once flag; called from hot GL-translation paths.
+    crate::env_flag_cached!("TOUCHHLE_TRACE_TRANSLATOR")
 }
 
 pub(crate) fn trace_translator_event(event: String) {
