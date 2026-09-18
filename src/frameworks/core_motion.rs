@@ -358,7 +358,14 @@ fn attitude_filter_step(
     if accel_len > 1.0e-3 {
         let measured_g = (accel.0 / accel_len, accel.1 / accel_len, accel.2 / accel_len);
         let predicted_g = quat_world_to_device(q, (0.0, 0.0, -1.0));
-        let correction = quat_shortest_arc(predicted_g, measured_g);
+        // NOTE the arc direction: the implied gravity is
+        // quat_world_to_device(q, ¦-z¦) = R(q)^-1(-z), and right-multiplying
+        // q <- q*r rotates the implied vector by R(r)^-1. So to move the
+        // predicted vector towards the measured one we need the arc that
+        // maps *measured -> predicted*; its inverse then maps
+        // predicted -> measured. (The other way round mirrors the estimate
+        // and fights the gain every step: inverted and jerky.)
+        let correction = quat_shortest_arc(measured_g, predicted_g);
         // Gain must be "per second" so behaviour doesn't depend on the
         // polling rate of the game.
         let gain = (dt * ATTITUDE_CORRECTION_PER_SEC).clamp(0.0, 1.0);
