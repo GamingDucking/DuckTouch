@@ -59,6 +59,7 @@ symphonia = { version = "0.6.0", default-features = false, features = [
     "aac", "adpcm", "alac", "mp3", "pcm"
 ] }
 quick-xml = "0.38.4"
+mimalloc = { version = "0.1", default-features = false }
 digest = "0.10.7"
 md-5 = "0.10.6"
 sha1 = "0.10.6"
@@ -105,7 +106,15 @@ gl_generator = { workspace = true }
 [profile.release]
 opt-level = 3
 codegen-units = 1
-lto = "thin"
+# PERF: fat (whole-program) LTO instead of thin LTO. The emulator's hottest
+# paths span crate boundaries (the main crate calls into the dynarmic/gl
+# wrapper crates on every guest memory access, host function dispatch, etc.),
+# and fat LTO lets LLVM inline across all of them. Slower link times, but a
+# consistent few-percent win in emulation-heavy workloads.
+lto = "fat"
+# NOTE: binaries are intentionally NOT stripped: the symbol table is what
+# makes crash-handler backtraces readable, and both CI and the Android build
+# already discard debug info through other means.
 
 # Patched copy of symphonia-codec-aac 0.6.0: its AAC section-data parser can
 # index out of bounds (len 64, index 64) on unusual but valid streams and

@@ -421,6 +421,50 @@ fn set_sdl2_orientation(orientation: DeviceOrientation) {
     );
 }
 
+/// COMPAT: per-game accelerometer axis remap, applied to real-sensor data in
+/// the hardware path of [Window::get_acceleration].
+///
+/// The values delivered to the guest are always in the device's portrait
+/// frame (iOS semantics), which is correct for games that honour their
+/// declared interface orientation. Some games, however, hard-code their
+/// tilt math for one particular way of holding the phone — or the host
+/// device reports sensors in a natural-orientation frame some games don't
+/// expect (e.g. tablets) — and then steering/camera controls come out
+/// mirrored or sideways (seen with e.g. Asphalt 7's tilt camera).
+///
+/// `TOUCHHLE_ACCELEROMETER_AXES` accepts a comma-separated list of:
+/// - "swap": transpose x and y (sideways behaviour on some devices)
+/// - "flipx": negate x (left/right inversion)
+/// - "flipy": negate y (forward/backward inversion)
+/// Both flips together make a 180-degree fix; all three together swap and
+/// flip. Example: TOUCHHLE_ACCELEROMETER_AXES=swap,flipy
+///
+/// The knob is read once and cached. Gyroscope readings are NOT remapped.
+fn accelerometer_compat_remap(x: f32, y: f32, z: f32) -> (f32, f32, f32) {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<(bool, bool, bool)> = OnceLock::new();
+    let (swap, flipx, flipy) = *CACHE.get_or_init(|| {
+        let var = std::env::var("TOUCHHLE_ACCELEROMETER_AXES").unwrap_or_default();
+        let var = var.to_ascii_lowercase();
+        (
+            var.contains("swap"),
+            var.contains("flipx"),
+            var.contains("flipy"),
+        )
+    });
+    let (mut x, mut y) = (x, y);
+    if swap {
+        std::mem::swap(&mut x, &mut y);
+    }
+    if flipx {
+        x = -x;
+    }
+    if flipy {
+        y = -y;
+    }
+    (x, y, z)
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum FingerId {
     Mouse,
@@ -801,6 +845,19 @@ impl Window {
         // here, and then the app can disable it if it wants to.
         video_ctx.enable_screen_saver();
 
+        // PERF: never request depth or stencil buffers for the window's own
+        // framebuffer. The only things ever drawn to it are flat,
+        // depth-untested textured quads (app presentation, splash screen, app
+        // picker); the guest app itself renders into offscreen renderbuffers
+        // with their own attachments. On tile-based mobile GPUs, skipping the
+        // window depth/stencil buffers saves memory bandwidth on every swap
+        // chain resolution. Note: must be set *before* window creation.
+        {
+            let attr = video_ctx.gl_attr();
+            attr.set_depth_size(0);
+            attr.set_stencil_size(0);
+        }
+
         let scale_hack = options.scale_hack;
         let host_screen_size = options.host_screen_size.map(normalize_portrait_size);
         // TODO: some apps specify their orientation in Info.plist, we could use
@@ -1106,8 +1163,11 @@ impl Window {
             // 320x480 UIKit space so EAGLView still receives the event; a
             // separate UITouch locationInView compatibility path can remap
             // the coordinates returned to the game.
-            let [x, y] = if std::env::var_os("TOUCHHLE_DISABLE_PRESENT_ROTATION").is_some()
-                || std::env::var_os("TOUCHHLE_DISABLE_TOUCH_ROTATION").is_some()
+            // PERF: cache the read-once debug toggles; this runs per SDL
+            // touch event, and each std::env::var_os is a global-lock environ
+            // scan with allocation.
+            let [x, y] = if crate::env_flag_cached!("TOUCHHLE_DISABLE_PRESENT_ROTATION")
+                || crate::env_flag_cached!("TOUCHHLE_DISABLE_TOUCH_ROTATION")
             {
                 log_once!(
                     "TOUCHHLE_DISABLE_TOUCH_ROTATION: not rotating touch hit-test coordinates [this log will only be shown once]"
@@ -1125,12 +1185,12 @@ impl Window {
 
             // Optional hit-test tuning only. Do not use these unless you are
             // deliberately testing the UIKit hit-test position.
-            if let Ok(offset) = std::env::var("TOUCHHLE_HITTEST_X_OFFSET") {
+            if let Some(offset) = crate::env_var_cached!("TOUCHHLE_HITTEST_X_OFFSET") {
                 if let Ok(offset) = offset.parse::<f32>() {
                     out_x += offset;
                 }
             }
-            if let Ok(offset) = std::env::var("TOUCHHLE_HITTEST_Y_OFFSET") {
+            if let Some(offset) = crate::env_var_cached!("TOUCHHLE_HITTEST_Y_OFFSET") {
                 if let Ok(offset) = offset.parse::<f32>() {
                     out_y += offset;
                 }
@@ -1729,7 +1789,7 @@ impl Window {
                 // SDL2 reports acceleration in units of m/s^2.
                 let gravity: f32 = 9.80665; // SDL_STANDARD_GRAVITY
                 let (x, y, z) = (x / gravity, y / gravity, z / gravity);
-                return (x, y, z);
+                return accelerometer_compat_remap(x, y, z);
             }
         }
 

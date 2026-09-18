@@ -1618,11 +1618,44 @@ impl Environment {
             if stepping {
                 self.remaining_ticks = None;
             } else {
-                // 100,000 ticks is an arbitrary number. It needs to be
+                // 1,000,000 ticks is an arbitrary number. It needs to be
                 // reasonably large so we aren't jumping in and out of dynarmic
                 // or trying to poll for events too often. At the same time,
                 // very large values are bad for responsiveness.
-                self.remaining_ticks = Some(100_000);
+                //
+                // PERF: raised from 100,000 to 1,000,000: the per-batch costs
+                // (leaving/re-entering the JIT, coroutine switch, scheduler
+                // pass and one event-poll attempt) are amortised 10x better.
+                // This is responsiveness-safe because:
+                // - OS event polling has its own throttle in
+                //   Window::poll_for_events (roughly 120 Hz), independent of
+                //   batch size;
+                // - sleeping guest threads use absolute host deadlines, so the
+                //   scheduler still wakes them on time between batches;
+                // - in practice most batches end early anyway, when the guest
+                //   calls a host framework function (which happens many times
+                //   per frame: present, timers, audio, input, etc.), so the
+                //   larger cap mostly helps busy guest spin-loops, which is
+                //   exactly where the per-batch overhead used to matter.
+                //
+                // FRAME PACING: a thread still has to finish its current batch
+                // before the scheduler gets to wake any *sleeping* thread
+                // whose deadline arrived in the meantime, so with the large
+                // batch a pacing/timer/audio wake-up could land up to one
+                // batch (~a few ms at ~1M ticks) late. To keep
+                // millisecond-accurate deadlines (frame pacing, run-loop
+                // timers, audio callbacks) precise while retaining the
+                // overhead win in long busy stretches, fall back to the
+                // smaller batch whenever any thread has an imminent wake-up.
+                let imminent_wakeup = self.threads.iter().any(|thread| {
+                    matches!(thread.blocked_by, ThreadBlock::Sleeping(deadline)
+                        if deadline < Instant::now() + Duration::from_millis(10))
+                });
+                self.remaining_ticks = Some(if imminent_wakeup {
+                    100_000
+                } else {
+                    1_000_000
+                });
             }
             // RTCV-style game corruption: once per main-loop iteration, give the
             // corruption engine a chance to mangle live guest memory. This is a

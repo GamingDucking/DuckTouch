@@ -248,25 +248,31 @@ fn touchhle_cocos_is_gl_or_game_view_name(class_name: &str) -> bool {
 }
 
 fn touchhle_cocos_landscape_rect(env: &Environment) -> CGRect {
-    let size = std::env::var("TOUCHHLE_COCOS_LANDSCAPE_SIZE")
-        .or_else(|_| std::env::var("TOUCHHLE_UNITY_LANDSCAPE_SIZE"))
-        .or_else(|_| std::env::var("TOUCHHLE_ENGINE_LANDSCAPE_SIZE"))
-        .ok()
-        .and_then(|v| {
-            let mut parts = v.split(|c| c == 'x' || c == 'X' || c == ',');
-            let w = parts.next()?.trim().parse::<f32>().ok()?;
-            let h = parts.next()?.trim().parse::<f32>().ok()?;
-            Some((w, h))
-        })
-        .unwrap_or_else(|| {
-            match env.bundle.bundle_identifier() {
-                // Existing known iPad-ish Cocos clones keep using their old safe size.
-                "com.apprisetec9.minionjump" | "com.risinghighapps.kingdomprincepro" => {
-                    (1024.0, 768.0)
+    // PERF: computed once; both the env lookups and the parse are not free
+    // and this is consulted from layout/hit-test paths.
+    let bundle_id = env.bundle.bundle_identifier();
+    static CACHED: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
+    let size = *CACHED.get_or_init(|| {
+        std::env::var("TOUCHHLE_COCOS_LANDSCAPE_SIZE")
+            .or_else(|_| std::env::var("TOUCHHLE_UNITY_LANDSCAPE_SIZE"))
+            .or_else(|_| std::env::var("TOUCHHLE_ENGINE_LANDSCAPE_SIZE"))
+            .ok()
+            .and_then(|v| {
+                let mut parts = v.split(|c| c == 'x' || c == 'X' || c == ',');
+                let w = parts.next()?.trim().parse::<f32>().ok()?;
+                let h = parts.next()?.trim().parse::<f32>().ok()?;
+                Some((w, h))
+            })
+            .unwrap_or_else(|| {
+                match bundle_id {
+                    // Existing known iPad-ish Cocos clones keep using their old safe size.
+                    "com.apprisetec9.minionjump" | "com.risinghighapps.kingdomprincepro" => {
+                        (1024.0, 768.0)
+                    }
+                    _ => (480.0, 320.0),
                 }
-                _ => (480.0, 320.0),
-            }
-        });
+            })
+    });
     CGRect {
         origin: CGPoint { x: 0.0, y: 0.0 },
         size: CGSize {
@@ -286,11 +292,11 @@ fn touchhle_cocos_should_force_landscape_view(env: &mut Environment, view: id) -
         return false;
     }
 
-    if std::env::var_os("TOUCHHLE_COCOS_FORCE_LANDSCAPE_VIEW").is_some()
-        || std::env::var_os("TOUCHHLE_UNITY_FORCE_LANDSCAPE_VIEW").is_some()
-        || std::env::var_os("TOUCHHLE_ENGINE_FORCE_LANDSCAPE_VIEW").is_some()
+    if crate::env_flag_cached!("TOUCHHLE_COCOS_FORCE_LANDSCAPE_VIEW")
+        || crate::env_flag_cached!("TOUCHHLE_UNITY_FORCE_LANDSCAPE_VIEW")
+        || crate::env_flag_cached!("TOUCHHLE_ENGINE_FORCE_LANDSCAPE_VIEW")
         || env.bundle.bundle_identifier() == "com.disney.SwampyGame"
-        || std::env::var_os("TOUCHHLE_FORCE_LANDSCAPE_VIEW_BOUNDS").is_some()
+        || crate::env_flag_cached!("TOUCHHLE_FORCE_LANDSCAPE_VIEW_BOUNDS")
     {
         return true;
     }
@@ -319,7 +325,7 @@ fn touchhle_cocos_sanitize_rect(rect: CGRect) -> CGRect {
 }
 
 fn touchhle_cocos_should_fuzz_hit_testing(env: &mut Environment, view: id) -> bool {
-    if std::env::var_os("TOUCHHLE_COCOS_STRICT_HITTEST").is_some() {
+    if crate::env_flag_cached!("TOUCHHLE_COCOS_STRICT_HITTEST") {
         return false;
     }
     let class_name = touchhle_cocos_view_class_name(env, view);
@@ -820,7 +826,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         let view_class: Class = msg![env; this class];
         let class_name = env.objc.get_class_name(view_class).to_owned();
 
-        if std::env::var_os("TOUCHHLE_FORCE_LANDSCAPE_VIEW_BOUNDS").is_some()
+        if crate::env_flag_cached!("TOUCHHLE_FORCE_LANDSCAPE_VIEW_BOUNDS")
             && (class_name == "UIWindow" || class_name.contains("EAGLView"))
         {
             let forced_bounds = CGRect {
@@ -1611,7 +1617,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())setBounds:(CGRect)bounds {
     let mut bounds = touchhle_cocos_sanitize_rect(bounds);
 
-    if std::env::var_os("TOUCHHLE_FORCE_LANDSCAPE_VIEW_BOUNDS").is_some() {
+    if crate::env_flag_cached!("TOUCHHLE_FORCE_LANDSCAPE_VIEW_BOUNDS") {
         let view_class: Class = msg![env; this class];
         let class_name = env.objc.get_class_name(view_class).to_owned();
         if class_name == "UIWindow" || class_name.contains("EAGLView") {
@@ -1667,7 +1673,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     let mut frame = touchhle_cocos_sanitize_rect(frame);
 
-    if std::env::var_os("TOUCHHLE_FORCE_LANDSCAPE_VIEW_BOUNDS").is_some() {
+    if crate::env_flag_cached!("TOUCHHLE_FORCE_LANDSCAPE_VIEW_BOUNDS") {
         let view_class: Class = msg![env; this class];
         let class_name = env.objc.get_class_name(view_class).to_owned();
         if class_name == "UIWindow" || class_name.contains("EAGLView") {
@@ -1727,10 +1733,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     if touchhle_cocos_should_fuzz_hit_testing(env, this) {
         let bounds: CGRect = msg![env; this bounds];
-        let inset = std::env::var("TOUCHHLE_COCOS_HITTEST_SLOP")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(12.0);
+        // PERF: parsed once; this runs for every fuzzy hit test.
+        static SLOP: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        let inset = *SLOP.get_or_init(|| {
+            std::env::var("TOUCHHLE_COCOS_HITTEST_SLOP")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(12.0)
+        });
         return point.x >= bounds.origin.x - inset
             && point.y >= bounds.origin.y - inset
             && point.x <= bounds.origin.x + bounds.size.width + inset
