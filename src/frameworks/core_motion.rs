@@ -326,8 +326,21 @@ fn read_sdl_gyroscope(env: &Environment) -> Option<CMRotationRate> {
 
 /// Smallest angular step worth applying, to avoid normalising ~zero vectors.
 const ATTITUDE_EPSILON: f64 = 1.0e-9;
-/// Gain [0..1] of the gravity correction applied per second of elapsed time.
-const ATTITUDE_CORRECTION_PER_SEC: f64 = 8.0;
+/// Gain [0..1] of the gravity correction applied per second of elapsed time
+/// while the accelerometer reading looks trustworthy (see trust_weight).
+/// Kept deliberately small: the visible motion must be dominated by the
+/// buttery gyroscope integration, with gravity only correcting long-term
+/// drift. A large gain leaks raw accelerometer noise (±0.02g even in a
+/// resting hand) straight into the attitude, which shows up as camera
+/// jitter.
+const ATTITUDE_CORRECTION_PER_SEC: f64 = 3.0;
+/// How far the measured acceleration magnitude may deviate from 1g before
+/// the gravity correction is distrusted completely. When the device is being
+/// shaken/accelerated, the accelerometer's reading is no longer "gravity" —
+/// weighting it then would inject the user's linear shaking into the
+/// orientation. This is the standard adaptive-gain trick from practical
+/// attitude filters.
+const ATTITUDE_ACCEL_TRUST_BAND: f64 = 0.15;
 /// Gyroscope integration is skipped for steps larger than this: beyond it a
 /// stale rate sample would integrate garbage (e.g. after a suspended frame).
 const ATTITUDE_MAX_GYRO_DT: f64 = 0.1;
@@ -424,9 +437,19 @@ fn attitude_filter_step(
         q = quat_normalized(q);
     }
 
-    // 2. Correct towards the measured gravity vector (when sane).
+    // 2. Correct towards the measured gravity vector (when sane and
+    //    trustworthy).
     let accel_len = (accel.0 * accel.0 + accel.1 * accel.1 + accel.2 * accel.2).sqrt();
-    if accel_len > 1.0e-3 {
+    // Trust the accelerometer as a gravity reference only while its
+    // magnitude is ~1g: any deviation means the reading is polluted by
+    // linear acceleration (shaking hands, car movement, etc.), and the
+    // gyroscope is a far better source then.
+    let trust_weight = if accel_len > 1.0e-3 {
+        (1.0 - (accel_len - 1.0).abs() / ATTITUDE_ACCEL_TRUST_BAND).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if trust_weight > 0.0 {
         let measured_g = (accel.0 / accel_len, accel.1 / accel_len, accel.2 / accel_len);
         let predicted_g = quat_world_to_device(q, (0.0, 0.0, -1.0));
         // NOTE the arc direction: the implied gravity is
@@ -438,8 +461,8 @@ fn attitude_filter_step(
         // and fights the gain every step: inverted and jerky.)
         let correction = quat_shortest_arc(measured_g, predicted_g);
         // Gain must be "per second" so behaviour doesn't depend on the
-        // polling rate of the game.
-        let gain = (dt * ATTITUDE_CORRECTION_PER_SEC).clamp(0.0, 1.0);
+        // polling rate of the game; scaled down by the trust weight.
+        let gain = (dt * ATTITUDE_CORRECTION_PER_SEC * trust_weight).clamp(0.0, 1.0);
         let correction = quat_scale_angle(correction, gain);
         q = quat_mul(q, correction);
         q = quat_normalized(q);
