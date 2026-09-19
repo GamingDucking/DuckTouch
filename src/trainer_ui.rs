@@ -197,8 +197,12 @@ struct PanelLayout {
 const RESULT_ROWS: usize = 5;
 
 fn compute_layout(ui: &TrainerUi, viewport: (u32, u32, u32, u32)) -> Layout {
-    let (vx, vy, vw, vh) = viewport;
-    let (vx, vy, vw, vh) = (vx as f32, vy as f32, vw as f32, vh as f32);
+    // Coordinates are VIEWPORT-RELATIVE: the GL viewport already offsets
+    // drawing by (vx, vy), and the touch handlers subtract it before
+    // hit-testing. Adding the origin here would double it (panel shifted
+    // by the letterbox offset, tap targets misaligned with drawn keys).
+    let (_vx, _vy, vw, vh) = viewport;
+    let (vx, vy, vw, vh) = (0.0_f32, 0.0_f32, vw as f32, vh as f32);
     // UI scale: reference height is 480 px (iPhone portrait).
     let s = (vh / 480.0).clamp(0.75, 4.0);
     let btn = 30.0 * s;
@@ -312,7 +316,8 @@ pub fn touch_down(abs: (f32, f32), viewport: (u32, u32, u32, u32)) -> bool {
     }
     let mut ui = UI.lock().unwrap();
     let layout = compute_layout(&ui, viewport);
-    let (x, y) = abs;
+    let (vx, vy, _, _) = viewport;
+    let (x, y) = (abs.0 - vx as f32, abs.1 - vy as f32);
     if layout.button.contains(x, y) {
         ui.pending = Some(W_BUTTON);
         return true;
@@ -349,7 +354,8 @@ pub fn touch_up(abs: (f32, f32), viewport: (u32, u32, u32, u32)) -> bool {
     }
     let mut ui = UI.lock().unwrap();
     let layout = compute_layout(&ui, viewport);
-    let (x, y) = abs;
+    let (vx, vy, _, _) = viewport;
+    let (x, y) = (abs.0 - vx as f32, abs.1 - vy as f32);
     let Some(pending) = ui.pending.take() else {
         // Finger wasn't consumed on the way down.
         if layout.button.contains(x, y) || layout.panel.as_ref().map_or(false, |p| p.rect.contains(x, y)) {
@@ -949,8 +955,12 @@ unsafe fn build_scene(
 
 /// Render the scene with GLES 1.x fixed-function calls.
 unsafe fn render_gles1(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quads: &[Quad]) {
-    let (vx, vy, vw, vh) = viewport;
-    let (vx, vy, vw, vh) = (vx as f32, vy as f32, vw as f32, vh as f32);
+    // Coordinates are VIEWPORT-RELATIVE: the GL viewport already offsets
+    // drawing by (vx, vy), and the touch handlers subtract it before
+    // hit-testing. Adding the origin here would double it (panel shifted
+    // by the letterbox offset, tap targets misaligned with drawn keys).
+    let (_vx, _vy, vw, vh) = viewport;
+    let (vx, vy, vw, vh) = (0.0_f32, 0.0_f32, vw as f32, vh as f32);
 
     // Save state (mirrors draw_onscreen_text).
     let mut old_active_texture: GLint = 0;
