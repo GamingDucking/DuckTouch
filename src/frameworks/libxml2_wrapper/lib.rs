@@ -275,8 +275,13 @@ extern "C" {
     pub fn xmlCheckVersion(version: c_int);
 
     // ------------------------ Memory ------------------------------------
+    // libxml2 exports xmlFree/xmlMalloc as function-pointer VARIABLES (or
+    // thread-local accessor macros), not functions. Calling those symbols
+    // directly branches into data memory and can SIGSEGV. Resolve them in
+    // C using libxml2's headers, then call the real shim functions from Rust.
+    #[link_name = "hxml_free"]
     pub fn xmlFree(ptr: *mut c_void);
-    pub fn hxml_free(ptr: *mut c_void);
+    #[link_name = "hxml_malloc"]
     pub fn xmlMalloc(size: usize) -> *mut c_void;
     pub fn xmlMemoryDump() -> c_int;
     /// `xmlInitMemory(void)` — initialises libxml2's allocator override
@@ -958,3 +963,6 @@ fn _ensure_constants_in_scope() {
     let _ = html_parser_option::HTML_PARSE_RECOVER;
     let _: c_uint = 0;
 }
+
+#[cfg(test)]
+mod tests;
