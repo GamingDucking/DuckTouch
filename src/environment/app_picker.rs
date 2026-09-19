@@ -174,6 +174,7 @@ struct AppPickerDelegateHostObject {
     analog_stick_tilt_controls: Option<bool>,
     network: Option<bool>,
     show_fps: Option<bool>,
+    gg_trainer: Option<bool>,
     trace_gl_errors: Option<bool>,
     verbose_gles: Option<bool>,
     fullscreen: Option<bool>,
@@ -277,6 +278,10 @@ const CLASSES: ClassExports = objc_classes! {
         std::env::remove_var("TOUCHHLE_ONSCREEN_FPS");
         crate::gles::present::set_onscreen_fps_enabled(false);
     }
+}
+- (())ggTrainer:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).gg_trainer = Some(switch_state);
 }
 - (())fullscreen:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
@@ -549,6 +554,7 @@ fn app_picker_inner(
     let mut quick_options_analog_stick_tilt_controls = true;
     let mut quick_options_network = false;
     let mut quick_options_show_fps = false;
+    let mut quick_options_gg_trainer = true;
     let mut quick_options_trace_gl_errors = false;
     let mut quick_options_verbose_gles = false;
     let mut quick_options_device_tag: Option<i32> = None;
@@ -800,6 +806,8 @@ fn app_picker_inner(
             quick_options_analog_stick_tilt_controls = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.network) {
             quick_options_network = enabled;
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.gg_trainer) {
+            quick_options_gg_trainer = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.show_fps) {
             quick_options_show_fps = enabled;
         } else if let Some(trace_gl_errors) = std::mem::take(&mut host_obj.trace_gl_errors) {
@@ -867,6 +875,9 @@ fn app_picker_inner(
     }
     if quick_options_network {
         option_args.push("--allow-network-access".to_string());
+    }
+    if !quick_options_gg_trainer {
+        option_args.push("--no-trainer".to_string());
     }
 
     if quick_options_show_fps {
@@ -1479,6 +1490,8 @@ fn setup_quick_options(
         ]),
         RowKind::Label("Device model"),
         RowKind::DeviceDropdown,
+        RowKind::Label("GG trainer (GameGuardian)"),
+        RowKind::Switch("ggTrainer:", true),
         RowKind::Label("Network access"),
         RowKind::Switch("network:", false),
         RowKind::Label("Show FPS"),

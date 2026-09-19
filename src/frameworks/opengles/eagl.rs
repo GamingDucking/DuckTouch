@@ -1627,6 +1627,11 @@ unsafe fn present_renderbuffer_es2(
     );
     gles.DrawArrays(gles2::TRIANGLES, 0, 6);
 
+    // GameGuardian-style trainer overlay (floating button + panel), drawn
+    // with a dedicated ES 2.0 shader so it also works on native ES 2.0
+    // drivers (Android), where the fixed-function GLES 1.x path is unusable.
+    crate::trainer_ui::draw_es2(gles, viewport);
+
     // Optional: virtual cursor.
     if let Some((cx, cy, pressed)) = virtual_cursor_visible_at {
         let (vx, vy, vw, vh) = viewport;
