@@ -364,6 +364,51 @@ Other options:
         enabled with TOUCHHLE_PRESENT_FINISH=1; --no-present-finish turns it
         off again.
 
+    --vsync=...
+        Whether presenting a frame waits for the display's vertical refresh.
+        One of:
+
+        'auto' (default): on Android, off — HyperHLE paces frames itself (see
+        --fps-limit) and the Android compositor is synchronised to the display
+        anyway, so a blocking swap can only stall the emulator (a frame that
+        takes slightly longer than one refresh then costs two, i.e. 60 FPS
+        becomes 30 FPS). On other systems the driver's default is left alone.
+
+        'on': every swap waits for the next refresh (swap interval 1).
+
+        'off': swaps never wait (swap interval 0).
+
+        The environment variable TOUCHHLE_VSYNC accepts the same values; the
+        option takes precedence over it. --vsync and --no-vsync are shorthands
+        for 'on' and 'off'.
+
+    --gl-driver=...
+        (Android only.) Which host OpenGL ES driver to use. One of:
+
+        'auto' (default): apps whose executable only imports OpenGL ES 2.0
+        shader entry points run on the vendor's native OpenGL ES driver; every
+        other app (and the app picker) runs on the bundled ANGLE driver.
+        Vendors' native ES 1.1 drivers are the ones with the black-screen bugs
+        that ANGLE was adopted to avoid, while their ES 2.0 drivers are what
+        every Android game uses and are faster than ANGLE's OpenGL ES-on-Vulkan
+        translation. The log says which driver was chosen and why.
+
+        'angle': always use the bundled ANGLE driver (the previous behaviour).
+
+        'native': always use the vendor's native driver, even for ES 1.1 apps.
+
+        The environment variable TOUCHHLE_GL_DRIVER accepts the same values;
+        the option takes precedence over it.
+
+    --no-perf-hints
+        (Android only.) Don't raise the emulator thread's scheduling priority
+        and don't report its per-frame CPU time to the system's performance
+        hint manager (ADPF, Android 13+). By default both are done so that the
+        CPU governor keeps the core clocked for the emulated workload instead
+        of for the idle time between frames, which otherwise tends to make a
+        game that could run at 60 FPS settle at 30. Can also be disabled with
+        TOUCHHLE_PERF_HINTS=0; --perf-hints turns it back on.
+
     --prefer-gles2-context
         Force EAGL initWithAPI: to create an OpenGL ES 2.0 context even when
         the app requested an OpenGL ES 1.1 context.
