@@ -32,6 +32,7 @@ pub enum TrainerCmd {
     Refine { vtype: VType, text: String },
     Reset,
     Set { vtype: VType, text: String },
+    SetAll { vtype: VType, text: String },
     Freeze { vtype: VType, text: String },
     UnfreezeAll,
     Dump,
@@ -79,7 +80,7 @@ impl TrainerUi {
             focus: Focus::Search,
             search_text: String::new(),
             set_text: String::new(),
-            vtype: VType::I32,
+            vtype: VType::Auto,
             results: Vec::new(),
             total_results: 0,
             selected: None,
@@ -169,6 +170,7 @@ const W_RESET: u16 = 8;
 const W_SET: u16 = 9;
 const W_FREEZE: u16 = 10;
 const W_UNFREEZE: u16 = 11;
+const W_SET_ALL: u16 = 12;
 const W_DUMP: u16 = 12;
 const W_SAVE: u16 = 13;
 const W_SCROLL_UP: u16 = 14;
@@ -289,10 +291,10 @@ fn compute_layout(ui: &TrainerUi, viewport: (u32, u32, u32, u32)) -> Layout {
         // Set value field.
         push_widget(W_FIELD_SET, px + 6.0 * s, y, pw - 12.0 * s, row_h, &mut widgets);
         y += row_h + 4.0 * s;
-        // Set / freeze row.
-        let third = (pw - 12.0 * s - 8.0 * s) / 3.0;
-        for (i, id) in [W_SET, W_FREEZE, W_UNFREEZE].iter().enumerate() {
-            push_widget(*id, px + 6.0 * s + (third + 4.0 * s) * i as f32, y, third, row_h, &mut widgets);
+        // Set / set-all / freeze row.
+        let quarter = (pw - 12.0 * s - 12.0 * s) / 4.0;
+        for (i, id) in [W_SET, W_SET_ALL, W_FREEZE, W_UNFREEZE].iter().enumerate() {
+            push_widget(*id, px + 6.0 * s + (quarter + 4.0 * s) * i as f32, y, quarter, row_h, &mut widgets);
         }
         y += row_h + 4.0 * s;
         // Dump / save row.
@@ -418,6 +420,10 @@ fn activate_widget(ui: &mut TrainerUi, id: u16) {
             let text = ui.set_text.trim().to_string();
             COMMANDS.lock().unwrap().push(TrainerCmd::Set { vtype: ui.vtype, text });
         }
+        W_SET_ALL => {
+            let text = ui.set_text.trim().to_string();
+            COMMANDS.lock().unwrap().push(TrainerCmd::SetAll { vtype: ui.vtype, text });
+        }
         W_FREEZE => {
             let text = ui.set_text.trim().to_string();
             COMMANDS
@@ -500,6 +506,9 @@ struct Atlas {
     tex: GLuint,
     height: f32,
     glyphs: Vec<Option<GlyphCell>>,
+    atlas_w: usize,
+    atlas_h: usize,
+    bitmap: Vec<u8>,
 }
 
 static ATLAS: OnceLock<Mutex<Option<Atlas>>> = OnceLock::new();
@@ -646,20 +655,66 @@ unsafe fn build_atlas(gles: &mut dyn GLES) -> Option<Atlas> {
     gles.TexParameteri(gles11::TEXTURE_2D, gles11::TEXTURE_MAG_FILTER, gles11::LINEAR as _);
     gles.TexParameteri(gles11::TEXTURE_2D, gles11::TEXTURE_WRAP_S, gles11::CLAMP_TO_EDGE as _);
     gles.TexParameteri(gles11::TEXTURE_2D, gles11::TEXTURE_WRAP_T, gles11::CLAMP_TO_EDGE as _);
-    Some(Atlas { tex, height: cell_h, glyphs: cells })
+    Some(Atlas {
+        tex,
+        height: cell_h,
+        glyphs: cells,
+        atlas_w,
+        atlas_h,
+        bitmap,
+    })
 }
 
 unsafe fn ensure_atlas(gles: &mut dyn GLES) -> Option<()> {
-    let lock = ATLAS.get_or_init(|| Mutex::new(None)).lock().unwrap();
-    if lock.is_some() {
-        return Some(());
+    {
+        let lock = ATLAS.get_or_init(|| Mutex::new(None)).lock().unwrap();
+        if let Some(atlas) = lock.as_ref() {
+            if gles.IsTexture(atlas.tex) != 0 {
+                return Some(());
+            }
+        }
     }
-    drop(lock);
     let mut guard = ATLAS.get_or_init(|| Mutex::new(None)).lock().unwrap();
-    if guard.is_none() {
-        *guard = build_atlas(gles);
+    match guard.as_mut() {
+        // Bitmap/cells are still valid — only re-create the GL texture.
+        Some(atlas) if gles.IsTexture(atlas.tex) == 0 => {
+            atlas.tex = upload_atlas_texture(gles, &atlas.bitmap, atlas.atlas_w, atlas.atlas_h);
+            Some(())
+        }
+        Some(_) => Some(()),
+        None => {
+            *guard = build_atlas(gles);
+            guard.is_some().then_some(())
+        }
     }
-    guard.is_some().then_some(())
+}
+
+/// Create and fill a texture from raw RGBA atlas pixels.
+unsafe fn upload_atlas_texture(
+    gles: &mut dyn GLES,
+    bitmap: &[u8],
+    atlas_w: usize,
+    atlas_h: usize,
+) -> GLuint {
+    let mut tex: GLuint = 0;
+    gles.GenTextures(1, &mut tex);
+    gles.BindTexture(gles11::TEXTURE_2D, tex);
+    gles.TexImage2D(
+        gles11::TEXTURE_2D,
+        0,
+        gles11::RGBA as _,
+        atlas_w as _,
+        atlas_h as _,
+        0,
+        gles11::RGBA,
+        gles11::UNSIGNED_BYTE,
+        bitmap.as_ptr() as *const _,
+    );
+    gles.TexParameteri(gles11::TEXTURE_2D, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as _);
+    gles.TexParameteri(gles11::TEXTURE_2D, gles11::TEXTURE_MAG_FILTER, gles11::LINEAR as _);
+    gles.TexParameteri(gles11::TEXTURE_2D, gles11::TEXTURE_WRAP_S, gles11::CLAMP_TO_EDGE as _);
+    gles.TexParameteri(gles11::TEXTURE_2D, gles11::TEXTURE_WRAP_T, gles11::CLAMP_TO_EDGE as _);
+    tex
 }
 
 /// Draw a solid rectangle.
@@ -751,14 +806,14 @@ fn push_text(
     cursor - x
 }
 
-const COL_PANEL: (f32, f32, f32, f32) = (0.05, 0.05, 0.06, 0.88);
-const COL_WIDGET: (f32, f32, f32, f32) = (0.22, 0.22, 0.24, 0.95);
-const COL_WIDGET_LIT: (f32, f32, f32, f32) = (0.0, 0.5, 0.25, 0.95);
-const COL_FIELD: (f32, f32, f32, f32) = (0.12, 0.12, 0.14, 0.95);
+const COL_PANEL: (f32, f32, f32, f32) = (0.03, 0.03, 0.04, 1.0);
+const COL_WIDGET: (f32, f32, f32, f32) = (0.22, 0.22, 0.24, 1.0);
+const COL_WIDGET_LIT: (f32, f32, f32, f32) = (0.0, 0.5, 0.25, 1.0);
+const COL_FIELD: (f32, f32, f32, f32) = (0.12, 0.12, 0.14, 1.0);
 const COL_TEXT: (f32, f32, f32, f32) = (0.95, 0.95, 0.95, 1.0);
 const COL_TEXT_DIM: (f32, f32, f32, f32) = (0.6, 0.6, 0.62, 1.0);
 const COL_ACCENT: (f32, f32, f32, f32) = (0.0, 0.75, 0.35, 0.92);
-const COL_SELECTED: (f32, f32, f32, f32) = (0.15, 0.3, 0.6, 0.95);
+const COL_SELECTED: (f32, f32, f32, f32) = (0.15, 0.3, 0.6, 1.0);
 const COL_CHANGED: (f32, f32, f32, f32) = (0.75, 0.55, 0.0, 0.95);
 
 /// Entry point called from present_frame (CA composition and native ES 1.1
@@ -773,7 +828,24 @@ pub unsafe fn draw(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32)) {
 
 /// Entry point for native OpenGL ES 2.0 present paths (see
 /// present_renderbuffer_es2), which lack the fixed-function pipeline.
-pub unsafe fn draw_es2(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32)) {
+pub unsafe fn draw_es2(
+    gles: &mut dyn GLES,
+    viewport: (u32, u32, u32, u32),
+    context_token: usize,
+) {
+    // When the game switches EAGL contexts (e.g. between apps or between
+    // context instances), all our cached GL objects (program, VBO, atlas
+    // texture) belong to a dead context. Drop them so they get rebuilt.
+    {
+        let mut stored = OVERLAY_CONTEXT_TOKEN.lock().unwrap();
+        if *stored != Some(context_token) {
+            *stored = Some(context_token);
+            drop(stored);
+            *OVERLAY_PROGRAM.lock().unwrap() = None;
+            *OVERLAY_VBO.lock().unwrap() = None;
+            invalidate_atlas();
+        }
+    }
     let Some(quads) = build_scene(gles, viewport) else {
         return;
     };
@@ -889,13 +961,14 @@ unsafe fn build_scene(
                         );
                     }
                 }
-                W_SEARCH | W_REFINE | W_RESET | W_SET | W_FREEZE | W_UNFREEZE | W_DUMP | W_SAVE => {
+                W_SEARCH | W_REFINE | W_RESET | W_SET | W_SET_ALL | W_FREEZE | W_UNFREEZE | W_DUMP | W_SAVE => {
                     push_rect(&mut quads, *rect, COL_WIDGET);
                     let label: &str = match *id {
                         W_SEARCH => "SEARCH",
                         W_REFINE => "REFINE",
                         W_RESET => "RESET",
                         W_SET => "SET",
+                        W_SET_ALL => "SET ALL",
                         W_FREEZE => "FREEZE",
                         W_UNFREEZE => "UNFRZ",
                         W_DUMP => "DUMP",
@@ -1075,6 +1148,7 @@ struct OverlayProgram {
     u_tex: GLint,
 }
 
+static OVERLAY_CONTEXT_TOKEN: Mutex<Option<usize>> = Mutex::new(None);
 static OVERLAY_PROGRAM: Mutex<Option<OverlayProgram>> = Mutex::new(None);
 static OVERLAY_VBO: Mutex<Option<GLuint>> = Mutex::new(None);
 static OVERLAY_WHITE_TEX: Mutex<Option<GLuint>> = Mutex::new(None);

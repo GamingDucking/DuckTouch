@@ -1342,6 +1342,7 @@ unsafe fn present_renderbuffer_es2(
     rotation_matrix: crate::matrix::Matrix<2>,
     virtual_cursor_visible_at: Option<(f32, f32, bool)>,
     present_finish: bool,
+    context_token: usize,
 ) {
     use crate::gles::gles2_raw as gles2;
 
@@ -1630,7 +1631,7 @@ unsafe fn present_renderbuffer_es2(
     // GameGuardian-style trainer overlay (floating button + panel), drawn
     // with a dedicated ES 2.0 shader so it also works on native ES 2.0
     // drivers (Android), where the fixed-function GLES 1.x path is unusable.
-    crate::trainer_ui::draw_es2(gles, viewport);
+    crate::trainer_ui::draw_es2(gles, viewport, context_token);
 
     // Optional: virtual cursor.
     if let Some((cx, cy, pressed)) = virtual_cursor_visible_at {
@@ -2292,6 +2293,7 @@ unsafe fn present_renderbuffer(
             rotation_matrix,
             virtual_cursor_visible_at,
             options.present_finish,
+            context_token,
         );
         std::mem::drop(gles_boxed);
         env.window.as_mut().unwrap().swap_window();
