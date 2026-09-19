@@ -77,6 +77,7 @@ pub mod store_kit;
 pub mod system_configuration;
 pub mod tw_tweet_compose_view_controller;
 pub mod uikit;
+pub mod watch_connectivity;
 pub mod web_kit;
 pub mod xsapitcui;
 
@@ -95,6 +96,7 @@ pub struct State {
     openal: openal::State,
     opengles: opengles::State,
     uikit: uikit::State,
+    watch_connectivity: watch_connectivity::State,
 }
 
 /// Container for thread local state of various child modules

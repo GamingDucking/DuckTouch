@@ -11,6 +11,7 @@ use crate::dyld::{export_c_func, export_c_func_aliased, FunctionExports};
 use crate::fs::{resolve_path, GuestPath};
 use crate::libc::clocale::{setlocale, LC_CTYPE};
 use crate::libc::errno::{set_errno, EINVAL};
+use crate::libc::signal::{raise_signal, RaiseOutcome, SIGABRT};
 use crate::libc::string::strlen;
 use crate::libc::wchar::wchar_t;
 use crate::mem::{ConstPtr, ConstVoidPtr, GuestUSize, MutPtr, MutVoidPtr, Ptr, SafeRead};
@@ -919,6 +920,17 @@ fn abort(env: &mut Environment) {
     // Some games use abort() for recoverable DRM, networking or asset checks.
     // The same validated recovery path used by exit avoids the old blind frame
     // walk and, critically, does not terminate the emulator process.
+    //
+    // POSIX defines abort() as "unblock SIGABRT, raise it, and terminate if
+    // that returns". Raising first means an installed SIGABRT handler (crash
+    // reporters, Unity's unhandled-exception shim, ...) actually runs, which
+    // those apps rely on; the statements below then terminate unless the
+    // signal path already did.
+    let outcome = raise_signal(env, SIGABRT);
+    if outcome == RaiseOutcome::DefaultActionPerformed || env.is_guest_termination_requested()
+    {
+        return;
+    }
     recover_or_end_guest_termination(env, "abort()");
 }
 

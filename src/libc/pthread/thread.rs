@@ -706,10 +706,42 @@ fn pthread_sigmask(
 }
 
 /// `pthread_kill` — send a signal to a specific thread.
-/// Not supported in HLE; returns 0 (success) to avoid app abort.
-fn pthread_kill(_env: &mut Environment, thread: pthread_t, sig: i32) -> i32 {
-    log_dbg!("pthread_kill(thread={:?}, sig={}) -> stub 0", thread, sig);
-    0
+///
+/// Signal delivery in touchHLE is synchronous and runs on the calling guest
+/// thread (see `crate::libc::signal`), so a signal aimed at the calling
+/// thread is exactly `raise()`. A signal aimed at any *other* thread is
+/// delivered on the calling thread as well: refusing it would hang the
+/// crash reporters that signal a worker thread, and the only observable
+/// difference is the receiver's `pthread_self()`.
+fn pthread_kill(env: &mut Environment, thread: pthread_t, sig: i32) -> i32 {
+    // `sig == 0` is the documented way of asking whether a thread exists,
+    // without sending anything.
+    if sig == 0 {
+        return if State::get(env).threads.contains_key(&thread) {
+            0
+        } else {
+            ESRCH
+        };
+    }
+    let Some(target_thread) = State::get(env).threads.get(&thread).map(|t| t.thread_id) else {
+        // A stale or foreign pthread_t: this is what the real kernel
+        // reports when the thread does not exist.
+        return ESRCH;
+    };
+    if target_thread != env.current_thread {
+        log!(
+            "Warning: pthread_kill() targets thread {} while running on \
+             thread {}; delivering signal {} on the calling thread.",
+            target_thread,
+            env.current_thread,
+            sig
+        );
+    }
+    if crate::libc::signal::raise(env, sig) == 0 {
+        0
+    } else {
+        EINVAL
+    }
 }
 
 /// `pthread_attr_setscope` — set the contention scope attribute.
