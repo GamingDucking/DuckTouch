@@ -101,6 +101,10 @@ pub fn set_hardware_enabled(enabled: bool) {
 
 /// Called by the trainer engine whenever the running app changes.
 pub fn reset_for_app(app_id: Option<&str>) {
+    // Each app gets a fresh GL context, so the cached glyph atlas texture
+    // (created under the previous context) is stale — sampling it in the new
+    // context returns garbage/white. Rebuild it for the new context.
+    invalidate_atlas();
     let mut ui = UI.lock().unwrap();
     ui.app_id = app_id.map(String::from);
     ui.open = false;
@@ -114,6 +118,17 @@ pub fn reset_for_app(app_id: Option<&str>) {
     ui.status.clear();
     ui.frozen_count = 0;
     ui.pending = None;
+}
+
+/// Live value refresh: replace the displayed values (and `changed` flags)
+/// without touching scroll position or selection.
+pub fn publish_live_values(results: &[crate::trainer::SearchResult]) {
+    let mut ui = UI.lock().unwrap();
+    if ui.results.is_empty() && results.is_empty() {
+        return;
+    }
+    ui.results = results.iter().copied().take(200).collect();
+    ui.total_results = results.len();
 }
 
 pub fn take_commands() -> Vec<TrainerCmd> {
@@ -489,6 +504,13 @@ struct Atlas {
 
 static ATLAS: OnceLock<Mutex<Option<Atlas>>> = OnceLock::new();
 
+/// Drop the cached glyph atlas (e.g. because the GL context changed).
+pub fn invalidate_atlas() {
+    if let Some(lock) = ATLAS.get() {
+        *lock.lock().unwrap() = None;
+    }
+}
+
 fn char_index(ch: char) -> Option<usize> {
     ATLAS_CHARS.chars().position(|c| c == ch)
 }
@@ -737,6 +759,7 @@ const COL_TEXT: (f32, f32, f32, f32) = (0.95, 0.95, 0.95, 1.0);
 const COL_TEXT_DIM: (f32, f32, f32, f32) = (0.6, 0.6, 0.62, 1.0);
 const COL_ACCENT: (f32, f32, f32, f32) = (0.0, 0.75, 0.35, 0.92);
 const COL_SELECTED: (f32, f32, f32, f32) = (0.15, 0.3, 0.6, 0.95);
+const COL_CHANGED: (f32, f32, f32, f32) = (0.75, 0.55, 0.0, 0.95);
 
 /// Entry point called from present_frame (CA composition and native ES 1.1
 /// present paths), in viewport pixel space. Renders with GLES 1.x
@@ -909,7 +932,17 @@ unsafe fn build_scene(
                     let abs_idx = ui_state.scroll + row_idx;
                     if let Some(result) = ui_state.results.get(abs_idx) {
                         let selected = ui_state.selected == Some(result.addr);
-                        push_rect(&mut quads, *rect, if selected { COL_SELECTED } else { COL_FIELD });
+                        push_rect(
+                            &mut quads,
+                            *rect,
+                            if selected {
+                                COL_SELECTED
+                            } else if result.changed {
+                                COL_CHANGED
+                            } else {
+                                COL_FIELD
+                            },
+                        );
                         let text = format!(
                             "0x{:08X} {}",
                             result.addr,

@@ -151,7 +151,11 @@ impl VType {
 #[derive(Copy, Clone, Debug)]
 pub struct SearchResult {
     pub addr: u32,
+    pub vtype: VType,
     pub bits: u64,
+    /// Set during a live-value refresh when the value at this address
+    /// changed since the previous refresh (shown highlighted in the UI).
+    pub changed: bool,
 }
 
 /// A hack patch: either applied once from a hack file, or continuously
@@ -185,6 +189,7 @@ pub struct Trainer {
     state: TrainerState,
     last_file_check: Instant,
     last_freeze_tick: Instant,
+    last_value_refresh: Instant,
     dump_counter: u32,
 }
 
@@ -205,6 +210,7 @@ impl Trainer {
             state: TrainerState::default(),
             last_file_check: Instant::now() - Duration::from_secs(60),
             last_freeze_tick: Instant::now(),
+            last_value_refresh: Instant::now(),
             dump_counter: 0,
         }
     }
@@ -238,6 +244,14 @@ impl Trainer {
         if self.last_freeze_tick.elapsed() >= Duration::from_millis(50) {
             self.last_freeze_tick = Instant::now();
             self.apply_frozen(mem);
+        }
+
+        // Live-update the values shown in the results list ~4 times per
+        // second, flagging addresses whose value changed since last time —
+        // spend coins in-game and the matching row lights up.
+        if self.last_value_refresh.elapsed() >= Duration::from_millis(250) {
+            self.last_value_refresh = Instant::now();
+            self.refresh_live_values(mem);
         }
 
         // Watch hack files for external edits (e.g. edited over ADB or a
@@ -506,6 +520,23 @@ impl Trainer {
         }
     }
 
+    /// Re-read the current value at every stored result address and publish
+    /// the updated list to the UI, marking rows whose value changed since the
+    /// previous refresh. This makes the right address "light up" when the
+    /// in-game value changes (e.g. coins are spent).
+    fn refresh_live_values(&mut self, mem: &mut Mem) {
+        if self.state.results.is_empty() {
+            return;
+        }
+        for r in self.state.results.iter_mut() {
+            if let Some(current) = r.vtype.read_at(mem, r.addr) {
+                r.changed = current != r.bits;
+                r.bits = current;
+            }
+        }
+        trainer_ui::publish_live_values(&self.state.results);
+    }
+
     // --- dump & save ---
 
     fn write_dump(&mut self, results: &[SearchResult]) -> String {
@@ -646,7 +677,9 @@ fn search_all(
                 if bits == want_bits {
                     results.push(SearchResult {
                         addr: result.addr,
+                        vtype,
                         bits,
+                        changed: false,
                     });
                     if results.len() >= MAX_RESULTS {
                         break;
@@ -674,7 +707,9 @@ fn search_all(
             if VType::read_le(bytes, offset, size) == want_bits {
                 results.push(SearchResult {
                     addr: base + offset as u32,
+                    vtype,
                     bits: want_bits,
+                    changed: false,
                 });
                 if results.len() >= MAX_RESULTS {
                     return results;
