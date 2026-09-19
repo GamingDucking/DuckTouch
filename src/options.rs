@@ -57,6 +57,36 @@ impl Default for CorruptionOptions {
     }
 }
 
+/// How `-[EAGLContext presentRenderbuffer:]` gets a rendered frame onto the
+/// host window when the app draws into a fullscreen `CAEAGLLayer`
+/// (`--present-mode=`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PresentMode {
+    /// Present on the GPU (copy the renderbuffer into a texture and draw a
+    /// quad into the window). If the first frames come out black even though
+    /// the renderbuffer has content, automatically fall back to `Readback`.
+    Auto,
+    /// Always present on the GPU, never fall back.
+    Direct,
+    /// Read the renderbuffer back to system RAM with `glReadPixels()` and
+    /// push it through the Core Animation compositor. Slow (a full GPU
+    /// pipeline stall plus two full-frame copies per frame), but it avoids
+    /// touching the app's GL state and is a useful workaround for broken
+    /// vendor OpenGL ES 1.1 drivers.
+    Readback,
+}
+
+impl PresentMode {
+    pub fn from_short_name(name: &str) -> Result<Self, ()> {
+        match name {
+            "auto" => Ok(Self::Auto),
+            "direct" => Ok(Self::Direct),
+            "readback" => Ok(Self::Readback),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Struct containing all user-configurable options.
 #[derive(Clone)]
 pub struct Options {
@@ -97,6 +127,14 @@ pub struct Options {
     pub print_fps: bool,
     pub fps_limit: Option<f64>,
     pub force_composition: bool,
+    /// See [PresentMode]. Can also be set with the `TOUCHHLE_PRESENT_MODE`
+    /// environment variable (the option takes precedence).
+    pub present_mode: PresentMode,
+    /// Issue a `glFinish()` before the presented renderbuffer is copied to
+    /// the window. Only needed for drivers that don't order the copy after
+    /// the app's draws correctly; costs a GPU pipeline stall per frame.
+    /// Can also be enabled with `TOUCHHLE_PRESENT_FINISH=1`.
+    pub present_finish: bool,
     /// Force EAGL `initWithAPI:` to create an OpenGL ES 2.0 context even when
     /// the app requested an OpenGL ES 1.1 context.
     ///
@@ -179,6 +217,13 @@ impl Default for Options {
             print_fps: false,
             fps_limit: Some(60.0),
             force_composition: false,
+            present_mode: std::env::var("TOUCHHLE_PRESENT_MODE")
+                .ok()
+                .and_then(|value| PresentMode::from_short_name(value.trim()).ok())
+                .unwrap_or(PresentMode::Auto),
+            present_finish: std::env::var_os("TOUCHHLE_PRESENT_FINISH")
+                .map(|value| value != "0")
+                .unwrap_or(false),
             prefer_gles2_context: false,
             network_access: false,
             popup_errors: true,
@@ -404,6 +449,15 @@ impl Options {
             }
         } else if arg == "--force-composition" {
             self.force_composition = true;
+        } else if let Some(value) = arg.strip_prefix("--present-mode=") {
+            self.present_mode = PresentMode::from_short_name(value).map_err(|_| {
+                "Invalid value for --present-mode= (expected auto, direct or readback)"
+                    .to_string()
+            })?;
+        } else if arg == "--present-finish" {
+            self.present_finish = true;
+        } else if arg == "--no-present-finish" {
+            self.present_finish = false;
         } else if arg == "--prefer-gles2-context" {
             self.prefer_gles2_context = true;
         } else if arg == "--allow-network-access" {

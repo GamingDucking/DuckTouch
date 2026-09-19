@@ -85,6 +85,10 @@ pub(crate) struct CALayerHostObject {
     pub(super) cg_context: Option<CGContextRef>,
     pub(super) gles_texture: Option<crate::gles::gles11_raw::types::GLuint>,
     pub(super) gles_texture_is_up_to_date: bool,
+    /// Dimensions of the storage currently allocated for `gles_texture`, so
+    /// the compositor can update it in place (`glTexSubImage2D`) rather than
+    /// reallocating it (`glTexImage2D`) whenever the contents change.
+    pub(super) gles_texture_size: Option<(u32, u32)>,
     pub(super) animations: HashMap<String, id>,
     pub(super) anonymous_animations: HashSet<id>,
     pub(super) name: Option<String>,
@@ -405,6 +409,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         cg_context: None,
         gles_texture: None,
         gles_texture_is_up_to_date: false,
+        gles_texture_size: None,
         animations: HashMap::new(),
         anonymous_animations: HashSet::new(),
         name: None,

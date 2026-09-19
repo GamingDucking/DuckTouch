@@ -23,11 +23,12 @@ use crate::mem::MutPtr;
 use crate::objc::{
     id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
 };
-use crate::options::Options;
+use crate::options::{Options, PresentMode};
 use crate::Environment;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 // These are used by the EAGLDrawable protocol implemented by CAEAGLayer.
@@ -106,9 +107,77 @@ fn effective_eagl_api(requested: EAGLRenderingAPI, prefer_gles2_context: bool) -
     requested
 }
 
+/// Host-side mirror of a few pieces of guest-visible OpenGL ES state.
+///
+/// The guest wrappers in [super::gles_guest] used to ask the host driver
+/// (`glGetIntegerv`, `glGetBooleanv`, `glGetFloatv`, each followed by a
+/// `glGetError()` to swallow the errors strict drivers raise for those
+/// queries) on *every* `gl*Pointer` and draw call, just to learn state that
+/// only the guest itself can change. On mobile drivers and on ANGLE those
+/// round-trips are far from free, and they add up to thousands of extra GL
+/// calls per frame in draw-heavy games. Tracking the state here instead makes
+/// them disappear.
+///
+/// Everything in here is per-context (bindings and fixed-function state are
+/// context state, not sharegroup state) and is updated by the guest wrappers
+/// that change it. Host-side code that touches this state on the app's
+/// context (the presenter) always restores what it found, so the mirror stays
+/// valid across presents.
+pub(super) struct GLShadowState {
+    /// `GL_ARRAY_BUFFER_BINDING`.
+    pub(super) array_buffer: GLuint,
+    /// `GL_ELEMENT_ARRAY_BUFFER_BINDING`. `None` means "unknown, ask the
+    /// driver": the element array binding is part of vertex array object
+    /// state, so it is invalidated whenever the guest switches VAOs.
+    pub(super) element_array_buffer: Option<GLuint>,
+    /// `glIsEnabled(GL_FOG)`.
+    pub(super) fog_enabled: bool,
+    /// `GL_FOG_START` / `GL_FOG_END`.
+    pub(super) fog_start: f32,
+    pub(super) fog_end: f32,
+    /// Whether `glEnableVertexAttribArray` was ever called on this context.
+    /// Draw-call guards for generic vertex attributes are skipped entirely
+    /// for the (very common) fixed-function-only apps that never use them.
+    pub(super) generic_attribs_used: bool,
+}
+impl Default for GLShadowState {
+    fn default() -> Self {
+        GLShadowState {
+            array_buffer: 0,
+            element_array_buffer: Some(0),
+            fog_enabled: false,
+            // OpenGL ES 1.1 defaults.
+            fog_start: 0.0,
+            fog_end: 1.0,
+            generic_attribs_used: false,
+        }
+    }
+}
+impl GLShadowState {
+    /// Forget everything that is stored in vertex array object state.
+    pub(super) fn invalidate_vao_state(&mut self) {
+        self.element_array_buffer = None;
+    }
+    /// Update the mirror after `glDeleteBuffers`: deleting a bound buffer
+    /// resets the binding to zero.
+    pub(super) fn on_buffers_deleted(&mut self, deleted: GLuint) {
+        if deleted == 0 {
+            return;
+        }
+        if self.array_buffer == deleted {
+            self.array_buffer = 0;
+        }
+        if self.element_array_buffer == Some(deleted) {
+            self.element_array_buffer = Some(0);
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct EAGLContextHostObject {
     pub(super) gles_ctx: Option<Box<dyn GLESContext>>,
+    /// See [GLShadowState].
+    pub(super) shadow: GLShadowState,
     /// Which EAGL rendering API was requested. This influences how
     /// [super::gles_guest] dispatches calls and how the present-renderbuffer
     /// path saves and restores state.
@@ -168,6 +237,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)alloc {
     let host_object = Box::new(EAGLContextHostObject {
         gles_ctx: None,
+        shadow: GLShadowState::default(),
         api: kEAGLRenderingAPIOpenGLES1,
         renderbuffer_drawable_bindings: Rc::new(RefCell::new(HashMap::new())),
         fps_counter: None,
@@ -486,6 +556,24 @@ pub const CLASSES: ClassExports = objc_classes! {
             // minimum 1x1 so the GL call below cannot receive a zero extent.
             width = width.max(1);
             height = height.max(1);
+            // ... and to a sane maximum, so a bogus bounds/contentsScale/
+            // scale-hack combination can't overflow the GLsizei conversion
+            // below (a host panic) or ask the driver for gigabytes.
+            const MAX_RENDERBUFFER_DIMENSION: u32 = 16384;
+            if width > MAX_RENDERBUFFER_DIMENSION || height > MAX_RENDERBUFFER_DIMENSION {
+                log!(
+                    "[renderbufferStorage:{:?} fromDrawable:{:?}] Warning: clamping \
+                     oversized renderbuffer {}x{} to at most {}x{}",
+                    target,
+                    drawable,
+                    width,
+                    height,
+                    MAX_RENDERBUFFER_DIMENSION,
+                    MAX_RENDERBUFFER_DIMENSION
+                );
+                width = width.min(MAX_RENDERBUFFER_DIMENSION);
+                height = height.min(MAX_RENDERBUFFER_DIMENSION);
+            }
 
             if std::env::var_os("TOUCHHLE_FORCE_LANDSCAPE_RENDERBUFFER").is_some() {
                 let is_landscape = env
@@ -749,28 +837,75 @@ pub const CLASSES: ClassExports = objc_classes! {
     // We're presenting to the opaque CAEAGLLayer that covers the screen.
     // We can use the fast path where we skip composition and present directly.
     if drawable == fullscreen_layer {
-        let presentation_mode = {
+        // Decide between presenting on the GPU (copy the renderbuffer into a
+        // texture and draw it into the window — cheap) and reading the frame
+        // back to RAM and pushing it through the compositor (a full pipeline
+        // stall plus two full-frame copies per frame — very slow, but it
+        // never touches the app's GL state).
+        //
+        // The readback route used to be the default for every native ES 1.1
+        // backend, i.e. for every ES 1.1 game on Android, where it was by far
+        // the biggest per-frame cost. It's now an explicit choice
+        // (--present-mode=readback) or an automatic fallback when the GPU
+        // route demonstrably produces black frames on this driver.
+        let (backend_is_translator, backend_is_native_es1, backend_is_es2) = {
             let maybe_gles = super::sync_context(
                 &mut env.framework_state.opengles,
                 &mut env.objc,
                 env.window.as_mut().unwrap(),
                 env.current_thread,
             );
-            maybe_gles.map(|gles| {
-                if gles.is_native_es1() {
-                    "native-es1-readback"
-                } else if gles.is_translator() {
-                    "translator-readback"
-                } else {
-                    "shader-direct"
-                }
-            })
+            maybe_gles
+                .map(|gles| (gles.is_translator(), gles.is_native_es1(), gles.is_es2()))
+                .unwrap_or((false, false, false))
         };
-        if matches!(presentation_mode, Some("native-es1-readback" | "translator-readback")) {
+        let use_readback = match env.options.present_mode {
+            PresentMode::Readback => {
+                if backend_is_es2 && !backend_is_translator {
+                    // The readback path speaks ES 1.1 (OES framebuffer entry
+                    // points); the shader presenter is the only option on a
+                    // real ES 2.0 driver.
+                    log_once!(
+                        "--present-mode=readback is not available on an OpenGL ES 2.0 backend; presenting directly"
+                    );
+                    false
+                } else {
+                    true
+                }
+            }
+            PresentMode::Direct => false,
+            // The ES 1.1-on-ES 2.0 translator can't run either GPU presenter
+            // (its glDrawArrays is the fixed-function emulation itself), so
+            // it keeps using readback unless explicitly overridden.
+            PresentMode::Auto => {
+                backend_is_translator
+                    || (backend_is_native_es1 && direct_present_is_broken())
+            }
+        };
+        {
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| {
+                log!(
+                    "EAGL presenter: fullscreen layer {:?} will be presented via {} \
+                     (present_mode={:?}, translator={}, native_es1={}, es2={}) \
+                     [this log will only be shown once]",
+                    drawable,
+                    if use_readback {
+                        "glReadPixels readback + compositor"
+                    } else {
+                        "GPU copy (direct)"
+                    },
+                    env.options.present_mode,
+                    backend_is_translator,
+                    backend_is_native_es1,
+                    backend_is_es2,
+                );
+            });
+        }
+        if use_readback {
             log_dbg!(
-                "Layer {:?} uses {}; presenting renderbuffer {:?} through resolved RAM readback to preserve tile contents and alpha.",
+                "Layer {:?} is the fullscreen layer, presenting renderbuffer {:?} through RAM readback.",
                 drawable,
-                presentation_mode.unwrap_or("unknown"),
                 renderbuffer,
             );
             unsafe {
@@ -878,6 +1013,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 };
 
 unsafe fn present_renderbuffer_readback(env: &mut Environment, renderbuffer: GLuint, drawable: id) {
+    // PERF: recycle the layer's previous pixel buffer instead of allocating
+    // (and page-faulting in) a fresh multi-megabyte Vec every frame.
+    let pixels_vec = get_pixels_vec_for_presenting(env, drawable);
     let read_result = {
         let maybe_gles = super::sync_context(
             &mut env.framework_state.opengles,
@@ -886,7 +1024,7 @@ unsafe fn present_renderbuffer_readback(env: &mut Environment, renderbuffer: GLu
             env.current_thread,
         );
         match maybe_gles {
-            Some(mut gles) => Some(read_renderbuffer(gles.as_mut(), renderbuffer, Vec::new())),
+            Some(mut gles) => Some(read_renderbuffer(gles.as_mut(), renderbuffer, pixels_vec)),
             None => None,
         }
     };
@@ -1203,6 +1341,7 @@ unsafe fn present_renderbuffer_es2(
     viewport: (u32, u32, u32, u32),
     rotation_matrix: crate::matrix::Matrix<2>,
     virtual_cursor_visible_at: Option<(f32, f32, bool)>,
+    present_finish: bool,
 ) {
     use crate::gles::gles2_raw as gles2;
 
@@ -1309,10 +1448,15 @@ unsafe fn present_renderbuffer_es2(
 
         // Copy into preallocated texture storage. CopyTexImage2D reallocates
         // that storage on every frame, while CopyTexSubImage2D does not.
-        // Finish while the guest FBO is still bound: on tile-based Adreno
-        // drivers this resolves the current frame before the copy without
-        // forcing an FBO switch (which is the operation that loses the tiles).
-        gles.Finish();
+        //
+        // glCopyTexSubImage2D from the bound framebuffer is ordered after the
+        // app's draws by the driver, so no explicit sync is needed here. A
+        // glFinish() at this point drains the whole GPU pipeline every frame
+        // (the most expensive thing a presenter can do on a tile-based GPU),
+        // so it is opt-in: --present-finish / TOUCHHLE_PRESENT_FINISH=1.
+        if present_finish {
+            gles.Finish();
+        }
         gles.ActiveTexture(gles2::TEXTURE0);
         gles.BindTexture(gles2::TEXTURE_2D, present_objects.texture);
         let texture_size = PRESENT_TEXTURE_SIZE.with(|cell| cell.get());
@@ -1368,7 +1512,10 @@ unsafe fn present_renderbuffer_es2(
     gles.ColorMask(gles2::TRUE, gles2::TRUE, gles2::TRUE, gles2::TRUE);
     gles.DepthMask(gles2::TRUE);
     gles.StencilMask(!0);
-    gles.Clear(gles2::COLOR_BUFFER_BIT | gles2::DEPTH_BUFFER_BIT | gles2::STENCIL_BUFFER_BIT);
+    // The window has no depth/stencil attachments (see window.rs) and the
+    // quad is drawn with depth/stencil testing off; only colour needs
+    // clearing (for the letterbox area).
+    gles.Clear(gles2::COLOR_BUFFER_BIT);
 
     // Compile the present shader program once and cache it. If the shader
     // fails to compile/link (e.g. on a host with a buggy GLSL ES driver),
@@ -1600,6 +1747,10 @@ struct PresentObjects {
     quad_vbo: GLuint,
 }
 
+/// One flag per entry of [gles1_on_gl2::CAPABILITIES]: does the driver reject
+/// the enum?
+type RejectedCaps = [bool; gles1_on_gl2::CAPABILITIES.len()];
+
 thread_local! {
     static PRESENT_PROGRAM: std::cell::Cell<Option<PresentProgram>> =
         const { std::cell::Cell::new(None) };
@@ -1612,6 +1763,11 @@ thread_local! {
     // Cached texture for the ES 1.1 (fixed-function) present path. Keeping it
     // alive avoids per-frame allocation and storage redefinition.
     static PRESENT_ES1_TEXTURE: std::cell::Cell<Option<(GLuint, GLint, GLint)>> =
+        const { std::cell::Cell::new(None) };
+    // Which entries of gles1_on_gl2::CAPABILITIES the driver rejects
+    // (GL_INVALID_ENUM on glGetBooleanv). Probed once per context by the ES
+    // 1.1 present path.
+    static PRESENT_ES1_REJECTED_CAPS: std::cell::Cell<Option<RejectedCaps>> =
         const { std::cell::Cell::new(None) };
     /// GL object names are context-local unless contexts share a sharegroup.
     /// Keep every presenter cache tied to the EAGLContext host object so a game
@@ -1635,7 +1791,171 @@ fn invalidate_present_cache_for_context(context_token: usize) {
         PRESENT_SOURCE_RENDERBUFFER.with(|cell| cell.set(0));
         PRESENT_TEXTURE_SIZE.with(|cell| cell.set(None));
         PRESENT_ES1_TEXTURE.with(|cell| cell.set(None));
+        PRESENT_ES1_REJECTED_CAPS.with(|cell| cell.set(None));
         log!("EAGL presenter: invalidated cached GL objects after EAGL context switch");
+    }
+}
+
+/// Drain the GL error queue. Returns whether there was anything in it.
+///
+/// Bounded, unlike a bare `while gles.GetError() != 0 {}`: a driver that
+/// reports a sticky error (e.g. `GL_CONTEXT_LOST`) must not hang the
+/// presenter.
+unsafe fn drain_gl_errors(gles: &mut dyn GLES) -> bool {
+    let mut any = false;
+    for _ in 0..16 {
+        if gles.GetError() == 0 {
+            break;
+        }
+        any = true;
+    }
+    any
+}
+
+// --- Black-frame detector for PresentMode::Auto -----------------------------
+//
+// Presenting on the GPU is the fast path, but on some vendor OpenGL ES 1.1
+// drivers it has produced black frames in the past even though the app's
+// renderbuffer had content (that's why Android used to read every frame back
+// to RAM instead). Rather than paying the readback tax on every device
+// forever, `PresentMode::Auto` checks the GPU path during the first seconds
+// of a session: sample a few pixels of the source renderbuffer and, after the
+// present quad has been drawn, the same points in the window. If the source
+// repeatedly has content while the window stays black, the GPU path is
+// considered broken and the session switches to readback.
+//
+// Only native ES 1.1 backends are probed (the desktop GL fallback and the ES
+// 2.0 shader presenter never used readback), and only while the decision is
+// pending, so the probe costs nothing in steady state.
+
+/// Frames on which the source was too dark to draw a conclusion do count, so
+/// the probe can't run forever on a game with a long black loading screen.
+const DIRECT_PRESENT_PROBE_MAX_FRAMES: u32 = 600;
+/// Probe every frame at first, then only every Nth frame.
+const DIRECT_PRESENT_PROBE_DENSE_FRAMES: u32 = 90;
+const DIRECT_PRESENT_PROBE_SPARSE_INTERVAL: u32 = 5;
+/// The brightest sampled source channel must exceed this for the frame to
+/// count as "has content".
+const DIRECT_PRESENT_PROBE_CONTENT_THRESHOLD: u8 = 24;
+/// The window counts as black if no sampled channel exceeds this.
+const DIRECT_PRESENT_PROBE_BLACK_THRESHOLD: u8 = 8;
+/// Consecutive conclusive frames needed for a verdict.
+const DIRECT_PRESENT_PROBE_VERDICT_FRAMES: u32 = 3;
+
+static DIRECT_PRESENT_BROKEN: AtomicBool = AtomicBool::new(false);
+static DIRECT_PRESENT_PROBE_DONE: AtomicBool = AtomicBool::new(false);
+static DIRECT_PRESENT_PROBE_FRAMES: AtomicU32 = AtomicU32::new(0);
+static DIRECT_PRESENT_PROBE_FAILURES: AtomicU32 = AtomicU32::new(0);
+static DIRECT_PRESENT_PROBE_SUCCESSES: AtomicU32 = AtomicU32::new(0);
+
+/// Has the detector concluded that presenting on the GPU doesn't work here?
+fn direct_present_is_broken() -> bool {
+    DIRECT_PRESENT_BROKEN.load(Ordering::Relaxed)
+}
+
+/// Should this frame be probed? Also advances the frame counter.
+fn direct_present_probe_pending() -> bool {
+    if DIRECT_PRESENT_PROBE_DONE.load(Ordering::Relaxed) {
+        return false;
+    }
+    let frame = DIRECT_PRESENT_PROBE_FRAMES.fetch_add(1, Ordering::Relaxed);
+    if frame >= DIRECT_PRESENT_PROBE_MAX_FRAMES {
+        DIRECT_PRESENT_PROBE_DONE.store(true, Ordering::Relaxed);
+        log!(
+            "EAGL presenter: GPU present check finished without a verdict after {} frames \
+             (the frames sampled were too dark to judge); keeping the GPU present path.",
+            frame
+        );
+        return false;
+    }
+    frame < DIRECT_PRESENT_PROBE_DENSE_FRAMES
+        || frame.is_multiple_of(DIRECT_PRESENT_PROBE_SPARSE_INTERVAL)
+}
+
+/// Read five single pixels (centre and the four quadrant centres) of the
+/// `width`×`height` region at (`x0`, `y0`) of the currently bound framebuffer
+/// and return the brightest colour channel seen. The set of sample points is
+/// invariant under the 90° rotations and flips the presenter may apply, so the
+/// same function can sample both the source renderbuffer and the window.
+unsafe fn probe_max_channel(
+    gles: &mut dyn GLES,
+    x0: GLint,
+    y0: GLint,
+    width: GLint,
+    height: GLint,
+) -> u8 {
+    if width <= 0 || height <= 0 {
+        return 0;
+    }
+    let points = [
+        (width / 2, height / 2),
+        (width / 4, height / 4),
+        (width * 3 / 4, height / 4),
+        (width / 4, height * 3 / 4),
+        (width * 3 / 4, height * 3 / 4),
+    ];
+    let mut max = 0u8;
+    for (x, y) in points {
+        let mut pixel = [0u8; 4];
+        gles.ReadPixels(
+            x0 + x,
+            y0 + y,
+            1,
+            1,
+            gles11::RGBA,
+            gles11::UNSIGNED_BYTE,
+            pixel.as_mut_ptr() as *mut _,
+        );
+        max = max.max(pixel[0]).max(pixel[1]).max(pixel[2]);
+    }
+    // Never leak probe errors into the guest's error queue.
+    drain_gl_errors(gles);
+    max
+}
+
+/// Second half of the detector: called after the present quad was drawn into
+/// the window (framebuffer 0 bound), with the source sample from before.
+unsafe fn probe_direct_present(
+    gles: &mut dyn GLES,
+    viewport: (u32, u32, u32, u32),
+    source_max: u8,
+) {
+    if source_max < DIRECT_PRESENT_PROBE_CONTENT_THRESHOLD {
+        // Nothing (bright enough) to compare against; try again later.
+        return;
+    }
+    let (vx, vy, vw, vh) = viewport;
+    let window_max = probe_max_channel(gles, vx as GLint, vy as GLint, vw as GLint, vh as GLint);
+    let (failures, successes) = if window_max <= DIRECT_PRESENT_PROBE_BLACK_THRESHOLD {
+        (
+            DIRECT_PRESENT_PROBE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1,
+            DIRECT_PRESENT_PROBE_SUCCESSES.load(Ordering::Relaxed),
+        )
+    } else {
+        (
+            DIRECT_PRESENT_PROBE_FAILURES.load(Ordering::Relaxed),
+            DIRECT_PRESENT_PROBE_SUCCESSES.fetch_add(1, Ordering::Relaxed) + 1,
+        )
+    };
+    if successes >= DIRECT_PRESENT_PROBE_VERDICT_FRAMES {
+        DIRECT_PRESENT_PROBE_DONE.store(true, Ordering::Relaxed);
+        log!(
+            "EAGL presenter: GPU present path verified on this driver \
+             (window shows the rendered frame; {} frame(s) checked, {} looked black).",
+            successes + failures,
+            failures
+        );
+    } else if failures >= DIRECT_PRESENT_PROBE_VERDICT_FRAMES && successes == 0 {
+        DIRECT_PRESENT_PROBE_DONE.store(true, Ordering::Relaxed);
+        DIRECT_PRESENT_BROKEN.store(true, Ordering::Relaxed);
+        log!(
+            "EAGL presenter: the GPU present path produced a black window on {} consecutive \
+             frames although the app's renderbuffer has content (brightest source sample {}). \
+             Switching to glReadPixels readback for the rest of this session. \
+             Use --present-mode=direct to override, or --present-mode=readback to skip this check.",
+            failures,
+            source_max
+        );
     }
 }
 
@@ -1654,12 +1974,15 @@ unsafe fn ensure_present_program(gles: &mut dyn GLES) -> Option<PresentProgram> 
             gl_Position = vec4(aPos, 0.0, 1.0);\n\
             vUV = (uTexMat * vec4(aUV, 0.0, 1.0)).xy;\n\
         }\0";
+    // Alpha is forced to 1.0: the window surface may have an alpha channel
+    // that the OS compositor honours (Android SurfaceFlinger), and an app's
+    // renderbuffer alpha is meaningless for an opaque CAEAGLLayer.
     let fs_src = b"\
         precision mediump float;\n\
         varying vec2 vUV;\n\
         uniform sampler2D uTex;\n\
         void main() {\n\
-            gl_FragColor = texture2D(uTex, vUV);\n\
+            gl_FragColor = vec4(texture2D(uTex, vUV).rgb, 1.0);\n\
         }\0";
 
     let vs = gles.CreateShader(gles2::VERTEX_SHADER);
@@ -1825,7 +2148,7 @@ unsafe fn ensure_present_objects(gles: &mut dyn GLES) -> PresentObjects {
 unsafe fn present_renderbuffer(
     env: &mut Environment,
     renderbuffer: GLuint,
-    drawable: id,
+    _drawable: id,
     options: &crate::options::Options,
     context_token: usize,
 ) {
@@ -1956,23 +2279,33 @@ unsafe fn present_renderbuffer(
     // path below cannot be used — there is no glMatrixMode / glColor4f /
     // glEnableClientState / glVertexPointer. Use a small dedicated
     // shader-based presenter instead.
-    if gles.is_es2() {
-        if gles.is_translator() {
-            std::mem::drop(gles_boxed);
-            present_renderbuffer_readback(env, renderbuffer, drawable);
-        } else {
-            present_renderbuffer_es2(
-                gles,
-                renderbuffer,
-                viewport,
-                rotation_matrix,
-                virtual_cursor_visible_at,
-            );
-            std::mem::drop(gles_boxed);
-            env.window.as_mut().unwrap().swap_window();
-        }
+    if gles.is_es2() && !gles.is_translator() {
+        present_renderbuffer_es2(
+            gles,
+            renderbuffer,
+            viewport,
+            rotation_matrix,
+            virtual_cursor_visible_at,
+            options.present_finish,
+        );
+        std::mem::drop(gles_boxed);
+        env.window.as_mut().unwrap().swap_window();
         return;
     }
+    if gles.is_translator() {
+        // Only reachable with --present-mode=direct: the ES 1.1-on-ES 2.0
+        // translator normally presents through readback (see
+        // presentRenderbuffer:). The translator emulates the whole
+        // fixed-function API, so the ES 1.1 presenter below is at least
+        // plausible on it, but this combination is not well tested.
+        log_once!(
+            "EAGL presenter: using the fixed-function presenter on the ES 1.1-on-ES 2.0 translator (experimental, forced by --present-mode=direct)"
+        );
+    }
+    // Black-frame detector for PresentMode::Auto (see probe_direct_present).
+    let probe_active = options.present_mode == PresentMode::Auto
+        && gles.is_native_es1()
+        && direct_present_probe_pending();
 
     // We can't directly copy the content of the renderbuffer to the default
     // framebuffer (the window), but if we attach it to a framebuffer object, we
@@ -2148,24 +2481,19 @@ unsafe fn present_renderbuffer(
             );
             (texture, false)
         };
-    // Force completion of any pending draws targeting the renderbuffer
-    // BEFORE we copy from it. On a spec-conformant driver glCopyTexImage2D
-    // implicitly syncs, but on ARM Mali r32p1 (Mali-G57 MC2 OpenGL ES-CM
-    // 1.1) we have evidence that it doesn't always: the LEGO Ninjago
-    // splash logo (frames 0..30) renders fine — its few draws are
-    // already tile-resolved by the time we Copy — but the title menu
-    // (~frame 120, many more draws per frame) reads back as a uniform
-    // colour from the renderbuffer probe even though every guest GL
-    // state field is identical to the working logo frame. The simplest
-    // explanation that fits all the evidence is that the title menu's
-    // tile cache hasn't been resolved to main memory when CopyTexImage2D
-    // runs, so the copy reads stale or uninitialised pixels. glFinish()
-    // is the heaviest possible sync but the safest one — any present
-    // path that needs to display a renderbuffer is *already* on the
-    // critical path of the frame, so spending a few hundred microseconds
-    // ensuring correctness is fine. (And on lenient drivers glFinish on
-    // an already-flushed pipeline is essentially free.)
-    gles.Finish();
+    // glCopyTex(Sub)Image2D from the bound framebuffer is ordered after the
+    // app's draws into it by the driver; that's what the spec guarantees and
+    // what every driver we've seen honours. We used to glFinish() here
+    // regardless, on the suspicion that a Mali-G57 r32p1 "title menu renders
+    // as a uniform colour" bug was a missing tile resolve — it turned out to
+    // be mipmap-incomplete textures (see fix_texture_min_filter). A full
+    // pipeline drain every frame is the single most expensive thing a
+    // presenter can do on a tile-based GPU (it serialises CPU and GPU and
+    // defeats the driver's frame pipelining), so it is opt-in now:
+    // --present-finish / TOUCHHLE_PRESENT_FINISH=1.
+    if options.present_finish {
+        gles.Finish();
+    }
     if storage_valid {
         // Steady state: copy into the preallocated storage without
         // redefining it.
@@ -2202,6 +2530,13 @@ unsafe fn present_renderbuffer(
             "after Finish + CopyTexImage2D",
         );
     }
+    // Black-frame detector, part 1: sample the source while the framebuffer
+    // we copied from is still bound.
+    let probe_source_max = if probe_active {
+        Some(probe_max_channel(gles, 0, 0, width, height))
+    } else {
+        None
+    };
     // Diagnostic probe: read a few pixels of the renderbuffer the guest
     // just rendered into, so we can tell apart "renderbuffer is empty /
     // all-black" (a guest-side or attach-side / tile-resolve bug) from
@@ -2469,63 +2804,74 @@ unsafe fn present_renderbuffer(
     // the very first cap that errors would poison the queue and make every
     // later checkpoint look like *it* failed.
     let is_native_es1 = gles.is_native_es1();
+    // Which caps does this driver reject? That's a property of the driver,
+    // not of the frame, so probe it once per context (the answer is cached in
+    // PRESENT_ES1_REJECTED_CAPS and dropped on context switch) instead of
+    // wrapping every GetBooleanv/Disable of every frame in glGetError() drain
+    // loops — that was ~100 extra GL calls per presented frame.
+    let rejected_caps: RejectedCaps =
+        if let Some(cached) = PRESENT_ES1_REJECTED_CAPS.with(|c| c.get()) {
+            cached
+        } else {
+            let mut rejected: RejectedCaps = [false; gles1_on_gl2::CAPABILITIES.len()];
+            // Collect rejected caps so we can log them as a single line the
+            // first time present runs. Useful for diagnosing "title menu
+            // black on Mali but logo works" style bugs: maybe Mali rejected
+            // the very cap the title menu relies on (e.g. ALPHA_TEST,
+            // POINT_SPRITE_OES, ...).
+            let mut rejected_names: Vec<GLenum> = Vec::new();
+            for (slot, &name) in rejected.iter_mut().zip(gles1_on_gl2::CAPABILITIES.iter()) {
+                if is_native_es1 && gles1_on_gl2::CAPABILITIES_GL21_ONLY.contains(&name) {
+                    *slot = true;
+                    continue;
+                }
+                // Drain anything that leaked in from earlier so we can
+                // attribute a fresh error to *this* cap.
+                drain_gl_errors(gles);
+                let mut value: GLboolean = gles11::FALSE;
+                gles.GetBooleanv(name, &mut value);
+                if drain_gl_errors(gles) {
+                    // Driver doesn't accept this cap: skip it on save and
+                    // restore, and never try to Enable/Disable it.
+                    *slot = true;
+                    rejected_names.push(name);
+                }
+            }
+            if !rejected_names.is_empty() {
+                let names: Vec<String> = rejected_names
+                    .iter()
+                    .map(|c| format!("0x{:04x}", c))
+                    .collect();
+                log!(
+                    "present_renderbuffer: driver rejected {} ES1.1 caps \
+                     (will be skipped on save/restore): [{}]. \
+                     They may also be rejected when the *guest* tries to use them, \
+                     which could explain why some screens render black. \
+                     [this log will only be shown once per context]",
+                    rejected_names.len(),
+                    names.join(", "),
+                );
+            }
+            PRESENT_ES1_REJECTED_CAPS.with(|c| c.set(Some(rejected)));
+            rejected
+        };
     let old_capabilities: [Option<GLboolean>; gles1_on_gl2::CAPABILITIES.len()] = {
         let mut old_capabilities: [Option<GLboolean>; gles1_on_gl2::CAPABILITIES.len()] =
             [None; gles1_on_gl2::CAPABILITIES.len()];
-        // Collect rejected caps so we can log them as a single line the
-        // first time present runs. Useful for diagnosing "title menu
-        // black on Mali but logo works" style bugs: maybe Mali rejected
-        // the very cap the title menu relies on (e.g. ALPHA_TEST,
-        // POINT_SPRITE_OES, ...).
-        static FIRST_PRESENT: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(true);
-        let log_rejects =
-            trace_gl_errors && FIRST_PRESENT.swap(false, std::sync::atomic::Ordering::Relaxed);
-        let mut rejected_caps: Vec<GLenum> = Vec::new();
-        for (slot, &name) in old_capabilities
+        for ((slot, &name), &rejected) in old_capabilities
             .iter_mut()
             .zip(gles1_on_gl2::CAPABILITIES.iter())
+            .zip(rejected_caps.iter())
         {
-            if is_native_es1 && gles1_on_gl2::CAPABILITIES_GL21_ONLY.contains(&name) {
+            if rejected {
                 continue;
             }
-            // Drain anything that leaked in from earlier so we can attribute
-            // a fresh error to *this* cap.
-            while gles.GetError() != 0 {}
             let mut value: GLboolean = gles11::FALSE;
             gles.GetBooleanv(name, &mut value);
-            let mut probe_failed = false;
-            while gles.GetError() != 0 {
-                probe_failed = true;
-            }
-            if probe_failed {
-                // Driver doesn't accept this cap. Leave slot as None so we
-                // also skip it on restore, and don't try to Disable it.
-                if log_rejects {
-                    rejected_caps.push(name);
-                }
-                continue;
-            }
             *slot = Some(value);
-            gles.Disable(name);
-            // Disable on a valid cap shouldn't error, but a few drivers are
-            // looser on Get than on Enable/Disable; drain to be safe.
-            while gles.GetError() != 0 {}
-        }
-        if log_rejects && !rejected_caps.is_empty() {
-            let names: Vec<String> = rejected_caps
-                .iter()
-                .map(|c| format!("0x{:04x}", c))
-                .collect();
-            log!(
-                "[--trace-gl-errors] present_renderbuffer driver rejected {} ES1.1 caps \
-                 (will be skipped on save/restore): [{}]. \
-                 Hard-coded CAPABILITIES_GL21_ONLY allow-list missed these — they \
-                 may also be rejected when the *guest* tries to use them, which \
-                 could explain why some screens render black.",
-                rejected_caps.len(),
-                names.join(", "),
-            );
+            if value != gles11::FALSE {
+                gles.Disable(name);
+            }
         }
         old_capabilities
     };
@@ -2639,6 +2985,11 @@ unsafe fn present_renderbuffer(
             "after present_frame (textured quad draw)",
         );
     }
+    // Black-frame detector, part 2: compare what ended up in the window
+    // with what the source looked like.
+    if let Some(source_max) = probe_source_max {
+        probe_direct_present(gles, viewport, source_max);
+    }
 
     // PERF: the present texture is cached across frames
     // (PRESENT_ES1_TEXTURE); do not delete it here. The restore below binds
@@ -2646,10 +2997,12 @@ unsafe fn present_renderbuffer(
 
     // Restore all the state saved before rendering
     for (&is_enabled, info) in old_arrays.iter().zip(gles1_on_gl2::ARRAYS.iter()) {
-        match is_enabled {
-            gles11::TRUE => gles.EnableClientState(info.name),
-            gles11::FALSE => gles.DisableClientState(info.name),
-            _ => unreachable!(),
+        // Any non-zero GLboolean counts as enabled: a driver answering a
+        // query with garbage must not be able to panic the emulator here.
+        if is_enabled != gles11::FALSE {
+            gles.EnableClientState(info.name);
+        } else {
+            gles.DisableClientState(info.name);
         }
     }
     for (&saved, &name) in old_capabilities
@@ -2665,10 +3018,10 @@ unsafe fn present_renderbuffer(
         let Some(is_enabled) = saved else {
             continue;
         };
-        match is_enabled {
-            gles11::TRUE => gles.Enable(name),
-            gles11::FALSE => gles.Disable(name),
-            _ => unreachable!(),
+        if is_enabled != gles11::FALSE {
+            gles.Enable(name);
+        } else {
+            gles.Disable(name);
         }
     }
     for mode in [gles11::MODELVIEW, gles11::PROJECTION, gles11::TEXTURE] {

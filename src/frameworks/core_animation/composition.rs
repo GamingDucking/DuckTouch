@@ -339,7 +339,12 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
                     gles11::GENERATE_MIPMAP,
                     gles11::TRUE as _,
                 );
-                upload_rgba8_pixels(gles.as_mut(), image.pixels(), (dimension as _, dimension as _));
+                upload_rgba8_pixels(
+                    gles.as_mut(),
+                    image.pixels(),
+                    (dimension as _, dimension as _),
+                    None,
+                );
                 gles.TexParameteri(
                     gles11::TEXTURE_2D,
                     gles11::TEXTURE_MIN_FILTER,
@@ -531,7 +536,25 @@ unsafe fn composite_layer_recursive(
 
     // This is both acting as the presentationLayer and the private render layer
     // It might need to be reworked in the future into a guest presentationLayer
-    let host_obj = animation_state.create_presentation_layer(env, layer);
+    //
+    // PERF: the presentation layer is a clone of the layer's host object.
+    // For a CAEAGLLayer presented through the compositor that would clone a
+    // full frame of pixels (hundreds of KB to several MB) every time it is
+    // composited, so take the pixels out for the duration of the clone and
+    // leave only a placeholder (with the real dimensions) in the copy — the
+    // upload below reads the pixels from the original layer anyway.
+    let presented_pixels = env
+        .objc
+        .borrow_mut::<CALayerHostObject>(layer)
+        .presented_pixels
+        .take();
+    let mut host_obj = animation_state.create_presentation_layer(env, layer);
+    if let Some((pixels, width, height)) = presented_pixels {
+        host_obj.presented_pixels = Some((Vec::new(), width, height));
+        env.objc
+            .borrow_mut::<CALayerHostObject>(layer)
+            .presented_pixels = Some((pixels, width, height));
+    }
 
     if host_obj.hidden {
         return;
@@ -658,7 +681,7 @@ unsafe fn composite_layer_recursive(
             gles.GenTextures(1, &mut t);
             gles.BindTexture(gles11::TEXTURE_2D, t);
             let pixels = image.pixels();
-            upload_rgba8_pixels(gles.as_mut(), pixels, (img_w, img_h));
+            upload_rgba8_pixels(gles.as_mut(), pixels, (img_w, img_h), None);
             gles.TexParameteri(
                 gles11::TEXTURE_2D,
                 gles11::TEXTURE_WRAP_S,
@@ -742,6 +765,10 @@ unsafe fn composite_layer_recursive(
         }
     }
 
+    // Dimensions of the texture storage that already exists (if any), so the
+    // uploads below can update it in place.
+    let mut texture_size = host_obj.gles_texture_size;
+
     // Update original layer texture with CAEAGLLayer pixels (slow path), if any
     if need_update {
         let original_host_obj = env.objc.borrow_mut::<CALayerHostObject>(layer);
@@ -757,7 +784,12 @@ unsafe fn composite_layer_recursive(
                 }
             }
 
-            upload_rgba8_pixels(gles.as_mut(), pixels, (width, height));
+            texture_size = Some(upload_rgba8_pixels(
+                gles.as_mut(),
+                pixels,
+                (width, height),
+                texture_size,
+            ));
         }
     }
 
@@ -768,22 +800,32 @@ unsafe fn composite_layer_recursive(
 
             // No special handling for opacity is needed here: the alpha channel
             // on an image is meaningful and won't be ignored.
-            upload_rgba8_pixels(gles.as_mut(), image.pixels(), image.dimensions());
+            texture_size = Some(upload_rgba8_pixels(
+                gles.as_mut(),
+                image.pixels(),
+                image.dimensions(),
+                texture_size,
+            ));
         } else if let Some(cg_context) = host_obj.cg_context {
             // Make sure this is in sync with the code in ca_layer.rs that
             // sets up the context!
             let (width, height, data) = cg_bitmap_context::get_data(&env.objc, cg_context);
             let size = width * height * 4;
             let pixels = env.mem.bytes_at(data.cast(), size);
-            upload_rgba8_pixels(gles.as_mut(), pixels, (width, height));
+            texture_size = Some(upload_rgba8_pixels(
+                gles.as_mut(),
+                pixels,
+                (width, height),
+                texture_size,
+            ));
         }
     }
 
     if need_update {
-        // Update original layer field
-        env.objc
-            .borrow_mut::<CALayerHostObject>(layer)
-            .gles_texture_is_up_to_date = true;
+        // Update original layer fields
+        let original_host_obj = env.objc.borrow_mut::<CALayerHostObject>(layer);
+        original_host_obj.gles_texture_is_up_to_date = true;
+        original_host_obj.gles_texture_size = texture_size;
     }
 
     // Draw texture, if any
@@ -916,7 +958,37 @@ unsafe fn upload_slice<T: SafeWrite>(
     )
 }
 
-unsafe fn upload_rgba8_pixels(gles: &mut dyn GLES, pixels: &[u8], dimensions: (u32, u32)) {
+/// Upload RGBA8 `pixels` to the texture bound to `GL_TEXTURE_2D`.
+///
+/// `current_size` is the size of the storage the texture already has (if it
+/// was uploaded to before); when it matches, the contents are replaced in
+/// place with `glTexSubImage2D`, which lets the driver update the existing
+/// allocation instead of orphaning it and allocating a new one on every
+/// change (a measurable per-frame cost for layers that update continuously,
+/// e.g. a CAEAGLLayer presented through the compositor). Returns the size of
+/// the texture storage afterwards.
+unsafe fn upload_rgba8_pixels(
+    gles: &mut dyn GLES,
+    pixels: &[u8],
+    dimensions: (u32, u32),
+    current_size: Option<(u32, u32)>,
+) -> (u32, u32) {
+    if current_size == Some(dimensions) {
+        gles.TexSubImage2D(
+            gles11::TEXTURE_2D,
+            0,
+            0,
+            0,
+            dimensions.0 as _,
+            dimensions.1 as _,
+            gles11::RGBA,
+            gles11::UNSIGNED_BYTE,
+            pixels.as_ptr() as *const _,
+        );
+        // The parameters below were already applied when the storage was
+        // first created.
+        return dimensions;
+    }
     gles.TexImage2D(
         gles11::TEXTURE_2D,
         0,
@@ -955,4 +1027,5 @@ unsafe fn upload_rgba8_pixels(gles: &mut dyn GLES, pixels: &[u8], dimensions: (u
         gles11::TEXTURE_WRAP_T,
         gles11::CLAMP_TO_EDGE as _,
     );
+    dimensions
 }

@@ -334,6 +334,36 @@ Other options:
         Enabling this option may solve some rendering issues, but implies
         a performance hit which is undesirable in most of the cases.
 
+    --present-mode=...
+        How a frame that an app rendered into a fullscreen EAGL layer is put
+        on the screen. One of:
+
+        'auto' (default): present on the GPU (the renderbuffer is copied to a
+        texture and drawn into the window). If the first frames come out
+        black while the renderbuffer clearly has content, HyperHLE assumes the
+        host driver mishandles this path and switches to 'readback' for the
+        rest of the session (a message is logged).
+
+        'direct': always present on the GPU, never fall back.
+
+        'readback': read the frame back to system RAM with glReadPixels()
+        and push it through the compositor, like older versions did on
+        Android. This is much slower (a full GPU pipeline stall and two
+        full-frame copies per frame), but it never touches the app's GL state,
+        which makes it a useful workaround for buggy vendor OpenGL ES 1.1
+        drivers.
+
+        The environment variable TOUCHHLE_PRESENT_MODE accepts the same
+        values; the option takes precedence over it.
+
+    --present-finish
+        Insert a glFinish() before the presented renderbuffer is copied to the
+        window. Only useful for host drivers that fail to order that copy after
+        the app's draws (symptom: stale or partially drawn frames). It costs a
+        GPU pipeline stall per frame, so it is off by default. Can also be
+        enabled with TOUCHHLE_PRESENT_FINISH=1; --no-present-finish turns it
+        off again.
+
     --prefer-gles2-context
         Force EAGL initWithAPI: to create an OpenGL ES 2.0 context even when
         the app requested an OpenGL ES 1.1 context.
