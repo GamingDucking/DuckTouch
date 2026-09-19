@@ -7,7 +7,7 @@
 //! Checked bulk editing: preview a filtered batch, then revalidate on confirm.
 //! This detects structural hazards, not the meaning of a game's memory.
 
-use super::{Mem, SearchResult, VType};
+use super::{Mem, SearchResult, VType, ResultFilter};
 
 type Allocation = (u32, u32);
 
@@ -33,6 +33,7 @@ pub(super) struct BulkPlan {
     requested_type: VType,
     text: String,
     safe_mode: bool,
+    filter: ResultFilter,
     pub(super) writes: Vec<BulkWrite>,
     pub(super) skipped: usize,
 }
@@ -56,6 +57,7 @@ pub(super) fn plan_bulk(
     requested_type: VType,
     text: &str,
     safe_mode: bool,
+    filter: ResultFilter,
 ) -> Result<BulkPlan, &'static str> {
     if results.is_empty() {
         return Err("NO RESULTS TO SET");
@@ -64,7 +66,10 @@ pub(super) fn plan_bulk(
     let mut allocations = mem.live_allocations();
     allocations.sort_unstable_by_key(|&(base, _)| base);
     let mut candidates = Vec::new();
+    let mut matching = 0;
     for (index, result) in results.iter().enumerate() {
+        if !filter.matches(result.analysis.category) { continue; }
+        matching += 1;
         let t = result.vtype;
         if t == VType::Auto || (requested_type != VType::Auto && requested_type != t) {
             if !safe_mode {
@@ -128,10 +133,11 @@ pub(super) fn plan_bulk(
         return Err("NO ELIGIBLE HITS: REFINE / CHECK TYPE");
     }
     Ok(BulkPlan {
+        filter,
         safe_mode,
         requested_type,
         text: text.trim().to_string(),
-        skipped: results.len() - writes.len(),
+        skipped: matching - writes.len(),
         writes,
     })
 }
@@ -149,7 +155,8 @@ pub(super) fn apply_bulk(
         let Some(result) = results.get(write.index) else {
             return Err("RESULTS CHANGED: PREVIEW AGAIN");
         };
-        if result.addr != write.addr || result.vtype != write.vtype
+        if !plan.filter.matches(result.analysis.category)
+            || result.addr != write.addr || result.vtype != write.vtype
             || result.bits != write.before
             || containing_allocation(&allocations, write.addr, write.vtype.size())
                 != Some(write.allocation)
@@ -163,12 +170,24 @@ pub(super) fn apply_bulk(
             return Err("WRITE FAILED (BAD ADDR?)");
         }
     }
-    // In normal mode overlapping writes can overwrite each other. Display
-    // the actual final contents, not each intermediate requested value.
-    for write in &plan.writes {
-        let result = &mut results[write.index];
-        result.bits = write.vtype.read_at(mem, write.addr).unwrap();
-        result.changed = false;
+    // Re-read every affected alias, including hidden/non-targeted results.
+    // A sorted prefix maximum handles nested/overlapping writes in O(N log W)
+    // rather than doing a full results scan once per write. Trainer edits
+    // must never be interpreted as evidence of in-game value changes.
+    let ends: Vec<u64> = plan.writes.iter().scan(0u64, |end, write| {
+        *end = (*end).max(write.end());
+        Some(*end)
+    }).collect();
+    for result in results {
+        let end = result.addr as u64 + result.vtype.size() as u64;
+        let i = plan.writes.partition_point(|w| (w.addr as u64) < end);
+        if i > 0 && ends[i - 1] > result.addr as u64 {
+            if let Some(bits) = result.vtype.read_at(mem, result.addr) {
+                result.bits = bits;
+            }
+            result.changed = false;
+            result.analysis.reset_history();
+        }
     }
     Ok(plan.writes.len())
 }

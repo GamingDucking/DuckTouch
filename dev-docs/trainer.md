@@ -44,6 +44,48 @@ validate a game's invariants, or bypass its value checks. Back up saves first.
 - `REFINE` with no remaining results stays empty; only `SEARCH` starts a new
   scan of memory.
 
+## Address-purpose hints and categories
+
+An address such as `0x003C8B28` does not encode the meaning of its contents.
+The panel now makes **heuristic guesses**, not guaranteed field identifications:
+`Money?`, `Ammo?`, `Health?`, `Score?`, `Timer?`, or `Unknown`.
+
+- Tap **GROUP** to cycle through All and the six categories. The button shows
+  the current group's count; HITS shows filtered/total results. Counts and
+  paging cover the entire stored search, not just its first 200 entries.
+- Every row includes its concrete type and category. Tap a row for the reason
+  and low/medium confidence in the status line. There are no invented numerical
+  probabilities. A changed value is still highlighted separately.
+- DUMP exports the full search (up to its existing dump limit), with concrete
+  type, category and reason, regardless of the current view filter.
+- `SET ALL` previews **only matching results in the selected group**, including
+  pages not currently visible. Switching groups cancels confirmation; a changed
+  group/eligible batch needs a fresh preview. SAFE MODE is still independent.
+  Aliases can share bytes with other results: a filter is not memory isolation.
+
+The classifier reads at most 64 neighbouring bytes on each side of a value,
+inside the same live allocation. It checks complete, case-insensitive English
+keywords in ASCII or ASCII-compatible UTF-16LE; clipped words and the searched
+value's own bytes are excluded. Conflicting keyword categories stay Unknown.
+It does not follow pointers, execute guest code, or probe addresses with writes.
+Inspection is incremental (at most 1,024 hits per refresh); large searches take
+several refreshes to classify. Unknown also includes not-yet-inspected results.
+
+During live refresh, three observed unit decrements of a small nonnegative
+integer can suggest Ammo; three small fractional float decreases can suggest
+Timer. Neither pattern proves what a value represents: health, money and other
+counters may behave identically. A matching keyword plus pattern is medium
+confidence at most. Money/Health/Score currently depend on nearby keywords,
+not on a number being large or an address having a particular shape. Trainer
+writes reset affected observation histories, and frozen ranges/aliases do not
+contribute behavioural evidence. Refinement preserves hints for unchanged types.
+
+Most games will still have many Unknown results: field names may be stripped,
+stored elsewhere, encrypted, or absent. Hints can be wrong or become stale;
+allocation reuse is not reliably detectable. **A Money? label does not prove
+currency or make a write safe.** Verify with legitimate in-game changes and
+refinement; back up saves before editing.
+
 ## SAFE MODE toggle
 
 `SAFE MODE` is a separate latching switch next to the type selector:
@@ -70,7 +112,7 @@ Neither setting identifies currency or guarantees a crash-free edit.
 There is one bulk-edit button, `SET ALL`. The other bottom-row button is
 `DUMP`, which only exports the search results. They have distinct widget IDs.
 
-The old **32-address bulk limit is removed**. All stored search results are
+The old **32-address bulk limit is removed**. All stored search results matching the current group are
 considered (the existing search-storage cap of 500,000 still applies), not just
 those visible in the panel. For large batches, allocation lookup uses a sorted
 index rather than a full allocation scan per hit.
@@ -118,6 +160,7 @@ are not subject to the bulk preview/filter and still require care.
 ```sh
 RUSTFLAGS="-C link-arg=-latomic" cargo test --lib guest_clock::tests
 RUSTFLAGS="-C link-arg=-latomic" cargo test --lib trainer::tests
+RUSTFLAGS="-C link-arg=-latomic" cargo test --lib trainer::classify::tests
 RUSTFLAGS="-C link-arg=-latomic" cargo test --lib trainer_ui::tests
 ```
 
@@ -125,4 +168,7 @@ The tests cover numeric bounds, float encoding, truncated AUTO matches, empty
 refinement, preview without writing, filtering/counts, more than 32 matches,
 confirmation/cancellation/expiry, stale plans without partial writes, unique
 widget IDs, independent DUMP/bulk actions, and the latched mode switch. They do
-not replace testing against real games on the target device.
+not replace testing against real games on the target device. Classification tests
+also cover keyword boundaries/conflicts, read-only allocation-bounded inspection,
+behavioural hints, incremental batches, frozen/edit suppression, full-set paging,
+category-scoped bulk plans and invalidation after category changes.

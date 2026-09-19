@@ -184,7 +184,7 @@ fn panel_has_unique_actions_and_results_header_below_keypad() {
             assert!(rect.w > 0.0 && rect.h > 0.0, "invalid widget {id}");
             assert!(rect.y >= panel.rect.y && rect.y + rect.h <= panel.rect.y + panel.rect.h);
         }
-        for id in [W_SPEED_DOWN, W_SPEED_RESET, W_SPEED_UP] {
+        for id in [W_SPEED_DOWN, W_SPEED_RESET, W_SPEED_UP, W_CATEGORY] {
             assert_eq!(panel.widgets.iter().filter(|&&(widget, _)| widget == id).count(), 1);
         }
         assert_eq!(panel.widgets.iter().filter(|&&(id, _)| id == W_SET_ALL).count(), 1);
@@ -295,4 +295,81 @@ fn speed_controls_latch_clamp_and_reset_without_memory_commands() {
     assert_eq!(ui.take_speed_request(), Some(Speed::Normal));
     assert!(!ui.bulk_preview);
     assert!(take_commands().iter().all(|cmd| matches!(cmd, TrainerCmd::CancelBulk)));
+}
+
+fn category_results(count: usize) -> Vec<SearchResult> {
+    (0..count).map(|i| {
+        let mut analysis = crate::trainer::classify::Analysis::default();
+        analysis.category = if i < 250 { Category::Unknown } else { Category::Money };
+        SearchResult { addr: 0x1000 + i as u32 * 4, vtype: VType::I32,
+            bits: 135, changed: false, analysis }
+    }).collect()
+}
+
+#[test]
+fn categories_and_paging_use_all_hits_not_just_the_first_two_hundred() {
+    let _guard = INPUT_TEST_LOCK.lock().unwrap();
+    let hits = category_results(300);
+    let mut ui = TrainerUi::new();
+    ui.update_results(&hits, true);
+    assert_eq!(ui.total_results, 300);
+    assert_eq!(ui.category_counts[Category::Money.index()], 50);
+    assert_eq!(ui.category_counts[Category::Unknown.index()], 250);
+    assert_eq!(ui.results.len(), RESULT_ROWS);
+    take_commands();
+    activate_widget(&mut ui, W_CATEGORY);
+    assert_eq!(ui.filter, ResultFilter::Category(Category::Money));
+    assert!(ui.results.is_empty(), "stale page must not remain selectable");
+    assert!(matches!(take_commands().as_slice(), [TrainerCmd::CancelBulk, TrainerCmd::RefreshView]));
+    ui.update_results(&hits, false);
+    assert_eq!(ui.filtered_results, 50);
+    assert_eq!(ui.results[0].addr, hits[250].addr);
+    activate_widget(&mut ui, W_SCROLL_DOWN);
+    ui.update_results(&hits, false);
+    assert_eq!(ui.results[0].addr, hits[255].addr);
+    ui.scroll = usize::MAX;
+    ui.update_results(&hits, false);
+    assert_eq!(ui.results.last().unwrap().addr, hits[299].addr);
+    ui.update_results(&[], false);
+    assert_eq!(ui.scroll, 0);
+    assert!(ui.results.is_empty());
+    take_commands();
+}
+
+#[test]
+fn category_selection_cancels_preview_and_scopes_bulk_command() {
+    let _guard = INPUT_TEST_LOCK.lock().unwrap();
+    let mut ui = TrainerUi::new();
+    ui.bulk_preview = true;
+    ui.selected = Some(0x1234);
+    ui.selected_type = Some(VType::I32);
+    take_commands();
+    activate_widget(&mut ui, W_CATEGORY);
+    assert!(!ui.bulk_preview);
+    assert_eq!(ui.selected, None);
+    assert_eq!(ui.selected_type, None);
+    assert!(matches!(take_commands().as_slice(), [TrainerCmd::CancelBulk, TrainerCmd::RefreshView]));
+    activate_widget(&mut ui, W_SET_ALL);
+    assert!(matches!(take_commands().as_slice(), [TrainerCmd::SetAll {
+        filter: ResultFilter::Category(Category::Money), confirm: false, safe_mode: true, ..
+    }]));
+}
+
+#[test]
+fn selected_result_keeps_concrete_type_and_shows_reason() {
+    let _guard = INPUT_TEST_LOCK.lock().unwrap();
+    let mut hits = category_results(1);
+    hits.push(SearchResult { vtype: VType::U8, ..hits[0] });
+    let mut ui = TrainerUi::new();
+    ui.update_results(&hits, true);
+    take_commands();
+    activate_widget(&mut ui, W_RESULT_BASE + 1);
+    assert_eq!(ui.selected, Some(hits[1].addr));
+    assert_eq!(ui.selected_type, Some(VType::U8));
+    assert!(ui.status.contains(hits[1].analysis.description()));
+    ui.update_results(&hits, false);
+    assert_eq!(ui.selected_type, Some(VType::U8));
+    ui.update_results(&hits[..1], false);
+    assert_eq!(ui.selected, None);
+    take_commands();
 }

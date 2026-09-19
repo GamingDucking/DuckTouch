@@ -20,6 +20,7 @@ use crate::guest_clock::Speed;
 use crate::gles::gles11_raw as gles11;
 use crate::gles::{GLES, GLint, GLuint};
 use crate::trainer::{SearchResult, VType};
+use crate::trainer::classify::{Category, ResultFilter};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -33,8 +34,9 @@ pub enum TrainerCmd {
     Refine { vtype: VType, text: String },
     Reset,
     Set { vtype: VType, text: String },
-    SetAll { vtype: VType, text: String, confirm: bool, safe_mode: bool },
+    SetAll { vtype: VType, text: String, confirm: bool, safe_mode: bool, filter: ResultFilter },
     CancelBulk,
+    RefreshView,
     Freeze { vtype: VType, text: String },
     UnfreezeAll,
     Dump,
@@ -65,6 +67,10 @@ struct TrainerUi {
     vtype: VType,
     results: Vec<SearchResult>,
     total_results: usize,
+    filtered_results: usize,
+    category_counts: [usize; 6],
+    filter: ResultFilter,
+    selected_type: Option<VType>,
     selected: Option<u32>,
     scroll: usize,
     status: String,
@@ -79,6 +85,36 @@ struct TrainerUi {
 }
 
 impl TrainerUi {
+    /// Cache only the current page, but count/filter the complete result set.
+    /// This avoids both a huge UI copy and the old first-200 paging cutoff.
+    fn update_results(&mut self, results: &[SearchResult], reset: bool) {
+        if reset {
+            self.scroll = 0;
+            self.selected = None;
+            self.selected_type = None;
+        }
+        self.category_counts = [0; 6];
+        for result in results {
+            self.category_counts[result.analysis.category.index()] += 1;
+        }
+        self.total_results = results.len();
+        self.filtered_results = match self.filter {
+            ResultFilter::All => results.len(),
+            ResultFilter::Category(c) => self.category_counts[c.index()],
+        };
+        self.scroll = self.scroll.min(self.filtered_results.saturating_sub(RESULT_ROWS));
+        self.results = results.iter()
+            .filter(|r| self.filter.matches(r.analysis.category))
+            .skip(self.scroll).take(RESULT_ROWS).copied().collect();
+        if self.selected.is_some() && !self.results.iter().any(|r| {
+            Some(r.addr) == self.selected && Some(r.vtype) == self.selected_type
+        }) {
+            self.status = "SELECTION LEFT CURRENT PAGE".to_string();
+            self.selected = None;
+            self.selected_type = None;
+        }
+    }
+
     fn take_speed_request(&mut self) -> Option<Speed> {
         std::mem::take(&mut self.speed_dirty).then_some(self.speed)
     }
@@ -94,6 +130,10 @@ impl TrainerUi {
             vtype: VType::Auto,
             results: Vec::new(),
             total_results: 0,
+            filtered_results: 0,
+            category_counts: [0; 6],
+            filter: ResultFilter::All,
+            selected_type: None,
             selected: None,
             scroll: 0,
             status: String::new(),
@@ -129,7 +169,11 @@ pub fn reset_for_app(app_id: Option<&str>) {
     ui.set_text.clear();
     ui.results.clear();
     ui.total_results = 0;
+    ui.filtered_results = 0;
+    ui.category_counts = [0; 6];
+    ui.filter = ResultFilter::All;
     ui.selected = None;
+    ui.selected_type = None;
     ui.scroll = 0;
     ui.status.clear();
     ui.frozen_count = 0;
@@ -139,15 +183,9 @@ pub fn reset_for_app(app_id: Option<&str>) {
     ui.pending = None;
 }
 
-/// Live value refresh: replace the displayed values (and `changed` flags)
-/// without touching scroll position or selection.
-pub fn publish_live_values(results: &[crate::trainer::SearchResult]) {
-    let mut ui = UI.lock().unwrap();
-    if ui.results.is_empty() && results.is_empty() {
-        return;
-    }
-    ui.results = results.iter().copied().take(200).collect();
-    ui.total_results = results.len();
+/// Refresh the currently selected category/page without resetting its scroll.
+pub fn publish_live_values(results: &[SearchResult]) {
+    UI.lock().unwrap().update_results(results, false);
 }
 
 /// Consumed by Environment, which owns the per-app guest clock.
@@ -159,11 +197,13 @@ pub fn take_commands() -> Vec<TrainerCmd> {
     std::mem::take(&mut COMMANDS.lock().unwrap())
 }
 
-pub fn publish_results(results: &[SearchResult], total: usize) {
-    let mut ui = UI.lock().unwrap();
-    ui.results = results.iter().copied().take(200).collect();
-    ui.total_results = total;
-    ui.scroll = 0;
+pub fn publish_results(results: &[SearchResult], _total: usize) {
+    UI.lock().unwrap().update_results(results, true);
+}
+
+pub fn selected_result_type(addr: u32) -> Option<VType> {
+    let ui = UI.lock().unwrap();
+    if ui.selected == Some(addr) { ui.selected_type } else { None }
 }
 
 pub fn publish_status(status: String) {
@@ -203,6 +243,7 @@ const W_SAFE_MODE: u16 = 17;
 const W_SPEED_DOWN: u16 = 18;
 const W_SPEED_RESET: u16 = 19;
 const W_SPEED_UP: u16 = 20;
+const W_CATEGORY: u16 = 21;
 const W_SAVE: u16 = 13;
 const W_SCROLL_UP: u16 = 14;
 const W_SCROLL_DOWN: u16 = 15;
@@ -253,7 +294,7 @@ fn compute_layout(ui: &TrainerUi, viewport: (u32, u32, u32, u32)) -> Layout {
     let (_vx, _vy, vw, vh) = viewport;
     let (vx, vy, vw, vh) = (0.0_f32, 0.0_f32, vw as f32, vh as f32);
     // Fit the complete panel, including speed controls, in both orientations.
-    let s = (vh / 520.0).min(vw / 320.0).clamp(0.25, 4.0);
+    let s = (vh / 550.0).min(vw / 320.0).clamp(0.25, 4.0);
     let btn = 30.0 * s;
     let button = Rect {
         x: vx + vw - btn - 6.0 * s,
@@ -315,6 +356,9 @@ fn compute_layout(ui: &TrainerUi, viewport: (u32, u32, u32, u32)) -> Layout {
         for (i, id) in [W_SEARCH, W_REFINE, W_RESET].iter().enumerate() {
             push_widget(*id, px + 6.0 * s + (third + 4.0 * s) * i as f32, y, third, row_h, &mut widgets);
         }
+        y += row_h + 4.0 * s;
+        // Category selector: guesses always keep a question mark.
+        push_widget(W_CATEGORY, px + 6.0 * s, y, pw - 12.0 * s, row_h, &mut widgets);
         y += row_h + 4.0 * s;
         // Results header + scroll buttons.
         let results_header_y = y;
@@ -460,6 +504,19 @@ fn activate_widget(ui: &mut TrainerUi, id: u16) {
             };
             ui.speed_dirty = true;
         }
+        W_CATEGORY => {
+            ui.filter = ui.filter.next();
+            ui.scroll = 0;
+            ui.selected = None;
+            ui.selected_type = None;
+            ui.results.clear();
+            ui.filtered_results = match ui.filter {
+                ResultFilter::All => ui.total_results,
+                ResultFilter::Category(c) => ui.category_counts[c.index()],
+            };
+            ui.status = "Guesses only; not verified".to_string();
+            COMMANDS.lock().unwrap().push(TrainerCmd::RefreshView);
+        }
         W_FIELD_SEARCH => ui.focus = Focus::Search,
         W_FIELD_SET => ui.focus = Focus::Set,
         W_SEARCH => {
@@ -488,7 +545,7 @@ fn activate_widget(ui: &mut TrainerUi, id: u16) {
             let confirm = ui.bulk_preview;
             ui.bulk_preview = false;
             COMMANDS.lock().unwrap().push(TrainerCmd::SetAll {
-                vtype: ui.vtype, text, confirm, safe_mode: ui.safe_mode,
+                vtype: ui.vtype, text, confirm, safe_mode: ui.safe_mode, filter: ui.filter,
             });
         }
         W_FREEZE => {
@@ -507,18 +564,24 @@ fn activate_widget(ui: &mut TrainerUi, id: u16) {
         W_SAVE => {
             COMMANDS.lock().unwrap().push(TrainerCmd::SaveHack { vtype: ui.vtype });
         }
-        W_SCROLL_UP => ui.scroll = ui.scroll.saturating_sub(RESULT_ROWS),
-        W_SCROLL_DOWN => {
-            let last = ui.total_results.saturating_sub(RESULT_ROWS);
-            if ui.scroll + RESULT_ROWS < last + RESULT_ROWS && ui.scroll < last {
-                ui.scroll = (ui.scroll + RESULT_ROWS).min(last);
-            }
+        W_SCROLL_UP | W_SCROLL_DOWN => {
+            let last = ui.filtered_results.saturating_sub(RESULT_ROWS);
+            ui.scroll = if id == W_SCROLL_UP {
+                ui.scroll.saturating_sub(RESULT_ROWS)
+            } else {
+                (ui.scroll + RESULT_ROWS).min(last)
+            };
+            ui.results.clear();
+            ui.selected = None;
+            ui.selected_type = None;
+            COMMANDS.lock().unwrap().push(TrainerCmd::RefreshView);
         }
         id if (W_RESULT_BASE..W_RESULT_BASE + RESULT_ROWS as u16).contains(&id) => {
-            let idx = ui.scroll + (id - W_RESULT_BASE) as usize;
-            if idx < ui.results.len() {
-                ui.selected = Some(ui.results[idx].addr);
-                ui.status = format!("SELECTED 0x{:X}", ui.results[idx].addr);
+            let idx = (id - W_RESULT_BASE) as usize;
+            if let Some(result) = ui.results.get(idx) {
+                ui.selected = Some(result.addr);
+                ui.selected_type = Some(result.vtype);
+                ui.status = format!("{}: {}", result.analysis.category.label(), result.analysis.description());
             }
         }
         id if (W_KEY_BASE..W_KEY_BASE + 16).contains(&id) => {
@@ -1032,6 +1095,12 @@ unsafe fn build_scene(
                         rect.y + 5.0 * bs, size, COL_TEXT,
                     );
                 }
+                W_CATEGORY => {
+                    push_rect(&mut quads, *rect, COL_WIDGET);
+                    let label = format!("GROUP: {} ({})", ui_state.filter.label(), ui_state.filtered_results);
+                    push_text(&mut quads, atlas, &label,
+                        rect.x + 6.0 * bs, rect.y + 5.0 * bs, 11.0 * bs, COL_ACCENT);
+                }
                 W_FIELD_SEARCH | W_FIELD_SET => {
                     let focus_here = (*id == W_FIELD_SEARCH && ui_state.focus == Focus::Search)
                         || (*id == W_FIELD_SET && ui_state.focus == Focus::Set);
@@ -1110,9 +1179,9 @@ unsafe fn build_scene(
                 }
                 id if (W_RESULT_BASE..W_RESULT_BASE + RESULT_ROWS as u16).contains(&id) => {
                     let row_idx = (id - W_RESULT_BASE) as usize;
-                    let abs_idx = ui_state.scroll + row_idx;
-                    if let Some(result) = ui_state.results.get(abs_idx) {
-                        let selected = ui_state.selected == Some(result.addr);
+                    if let Some(result) = ui_state.results.get(row_idx) {
+                        let selected = ui_state.selected == Some(result.addr)
+                            && ui_state.selected_type == Some(result.vtype);
                         push_rect(
                             &mut quads,
                             *rect,
@@ -1125,12 +1194,16 @@ unsafe fn build_scene(
                             },
                         );
                         let text = format!(
-                            "0x{:08X} {} {}",
+                            "0x{:08X} {} {} {}",
                             result.addr,
                             result.vtype.name(),
-                            result.vtype.format(result.bits)
+                            result.vtype.format(result.bits),
+                            result.analysis.category.label(),
                         );
-                        push_text(&mut quads, atlas, &text, rect.x + 6.0 * bs, rect.y + 3.0 * bs, 11.0 * bs, COL_TEXT);
+                        let size = 10.0 * bs;
+                        let width = text_width(atlas, &text, size).max(1.0);
+                        let size = size * ((rect.w - 12.0 * bs) / width).min(1.0);
+                        push_text(&mut quads, atlas, &text, rect.x + 6.0 * bs, rect.y + 3.0 * bs, size, COL_TEXT);
                     }
                 }
                 _ => {}
@@ -1139,8 +1212,8 @@ unsafe fn build_scene(
 
         // Results header + counts, drawn between the header and the result rows.
         let res_label = format!(
-            "RESULTS {} FROZEN {}",
-            ui_state.total_results, ui_state.frozen_count
+            "HITS {}/{} FROZEN {}",
+            ui_state.filtered_results, ui_state.total_results, ui_state.frozen_count
         );
         push_text(&mut quads,
             atlas,
@@ -1154,12 +1227,15 @@ unsafe fn build_scene(
         // Status line at the bottom of the panel.
         if !ui_state.status.is_empty() {
             let status_y = panel.rect.y + panel.rect.h - 18.0 * bs;
+            let size = 11.0 * bs;
+            let width = text_width(atlas, &ui_state.status, size).max(1.0);
+            let size = size * ((panel.rect.w - 16.0 * bs) / width).min(1.0);
             push_text(&mut quads,
                 atlas,
                 &ui_state.status,
                 panel.rect.x + 8.0 * bs,
                 status_y,
-                11.0 * bs,
+                size,
                 COL_ACCENT,
             );
         }

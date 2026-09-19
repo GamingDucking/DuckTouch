@@ -28,6 +28,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 mod bulk;
+pub mod classify;
+use classify::{analyze_batch, Analysis, ResultFilter};
 use bulk::{apply_bulk, plan_bulk, BulkPlan};
 
 struct PendingBulk {
@@ -182,6 +184,7 @@ pub struct SearchResult {
     /// Set during a live-value refresh when the value at this address
     /// changed since the previous refresh (shown highlighted in the UI).
     pub changed: bool,
+    pub analysis: Analysis,
 }
 
 /// A hack patch: either applied once from a hack file, or continuously
@@ -202,6 +205,7 @@ struct TrainerState {
     results: Vec<SearchResult>,
     /// Whether a search has been performed (so "REFINE" is meaningful).
     searched: bool,
+    analysis_cursor: usize,
     pending_bulk: Option<PendingBulk>,
     /// One-shot patches already applied (from hack files).
     applied_hacks: HashSet<(u32, VType, u64)>,
@@ -308,12 +312,15 @@ impl Trainer {
         }
         match cmd {
             TrainerCmd::CancelBulk => {}
+            TrainerCmd::RefreshView => trainer_ui::publish_live_values(&self.state.results),
             TrainerCmd::Search { vtype, text } => {
                 let Some(_) = vtype.parse(&text) else {
                     trainer_ui::publish_status(format!("BAD VALUE: {}", text));
                     return;
                 };
-                let results = search_all(mem, vtype, &text, None);
+                let mut results = search_all(mem, vtype, &text, None);
+                self.state.analysis_cursor = 0;
+                analyze_batch(mem, &mut results, &mut self.state.analysis_cursor);
                 self.state.results = results.clone();
                 self.state.searched = true;
                 trainer_ui::publish_results(&results, results.len());
@@ -344,6 +351,7 @@ impl Trainer {
             }
             TrainerCmd::Reset => {
                 self.state.results.clear();
+                self.state.analysis_cursor = 0;
                 self.state.searched = false;
                 trainer_ui::publish_results(&[], 0);
                 trainer_ui::publish_status("SEARCH RESET".to_string());
@@ -359,6 +367,10 @@ impl Trainer {
                     return;
                 };
                 let ok = t.write_at(mem, addr, bits);
+                if ok {
+                    record_trainer_write(mem, &mut self.state.results, addr, t.size());
+                    trainer_ui::publish_live_values(&self.state.results);
+                }
                 trainer_ui::publish_status(if ok {
                     format!("SET 0x{:X} = {}", addr, t.format(bits))
                 } else {
@@ -366,10 +378,10 @@ impl Trainer {
                 });
                 log!("trainer: set 0x{:X} = {} ({})", addr, text, t.name());
             }
-            TrainerCmd::SetAll { vtype, text, confirm, safe_mode } => {
+            TrainerCmd::SetAll { vtype, text, confirm, safe_mode, filter } => {
                 let previous = self.state.pending_bulk.take();
                 trainer_ui::publish_bulk_preview(false);
-                let plan = match plan_bulk(mem, &self.state.results, vtype, &text, safe_mode) {
+                let plan = match plan_bulk(mem, &self.state.results, vtype, &text, safe_mode, filter) {
                     Ok(plan) => plan,
                     Err(reason) => {
                         trainer_ui::publish_status(reason.to_string());
@@ -428,7 +440,10 @@ impl Trainer {
                     bits,
                     freeze: true,
                 });
-                vtype.write_at(mem, addr, bits);
+                if vtype.write_at(mem, addr, bits) {
+                    record_trainer_write(mem, &mut self.state.results, addr, vtype.size());
+                    trainer_ui::publish_live_values(&self.state.results);
+                }
                 trainer_ui::publish_frozen(self.state.frozen.len());
                 trainer_ui::publish_status(format!("FREEZE 0x{:X}", addr));
             }
@@ -456,6 +471,9 @@ impl Trainer {
             }
             TrainerCmd::ApplyHack { addr, vtype, bits } => {
                 let ok = vtype.write_at(mem, addr, bits);
+                if ok {
+                    record_trainer_write(mem, &mut self.state.results, addr, vtype.size());
+                }
                 log!(
                     "trainer: hack {} 0x{:X}={} -> {}",
                     vtype.name(),
@@ -486,6 +504,9 @@ impl Trainer {
     fn result_type(&self, addr: u32, vtype: VType) -> VType {
         if vtype != VType::Auto {
             return vtype;
+        }
+        if let Some(t) = trainer_ui::selected_result_type(addr) {
+            return t;
         }
         self.state
             .results
@@ -595,7 +616,9 @@ impl Trainer {
         if !state.applied_hacks.insert((addr, vtype, bits)) {
             return; // already applied (e.g. duplicate line)
         }
-        vtype.write_at(mem, addr, bits);
+        if vtype.write_at(mem, addr, bits) {
+            record_trainer_write(mem, &mut state.results, addr, vtype.size());
+        }
         log!(
             "trainer: hack {} 0x{:X}={}",
             vtype.name(),
@@ -646,12 +669,26 @@ impl Trainer {
         if self.state.results.is_empty() {
             return;
         }
+        // Include aliases of frozen values, not only exact start addresses.
+        let frozen: HashSet<_> = self.state.frozen.iter().flat_map(|p| {
+            (0..p.vtype.size()).filter_map(move |offset| p.addr.checked_add(offset))
+        }).collect();
         for r in self.state.results.iter_mut() {
             if let Some(current) = r.vtype.read_at(mem, r.addr) {
+                if !frozen.is_empty() && (0..r.vtype.size()).filter_map(|offset| r.addr.checked_add(offset))
+                    .any(|addr| frozen.contains(&addr))
+                {
+                    r.analysis.reset_history();
+                } else {
+                    r.analysis.observe(r.vtype, r.bits, current);
+                }
                 r.changed = current != r.bits;
                 r.bits = current;
+            } else {
+                r.analysis = Analysis::default();
             }
         }
+        analyze_batch(mem, &mut self.state.results, &mut self.state.analysis_cursor);
         trainer_ui::publish_live_values(&self.state.results);
     }
 
@@ -680,10 +717,13 @@ impl Trainer {
         let count = results.len().min(MAX_DUMP_LINES);
         for result in &results[..count] {
             text.push_str(&format!(
-                "0x{:08X}\t{}\t{}\n",
+                "0x{:08X}\t{}\t{}\t{}\t{}\t{}\n",
                 result.addr,
-                VType::I32.format(result.bits),
-                format_bits_hex(result.bits)
+                result.vtype.name(),
+                result.vtype.format(result.bits),
+                format_bits_hex(result.bits),
+                result.analysis.category.label(),
+                result.analysis.description()
             ));
         }
         match std::fs::write(&path, text) {
@@ -779,6 +819,19 @@ fn parse_hack_value(text: &str) -> (VType, u64) {
     (VType::I32, 0)
 }
 
+/// Keep observations honest: edits performed by the trainer (including
+/// aliases of the edited byte range) are not evidence of in-game behaviour.
+fn record_trainer_write(mem: &Mem, results: &mut [SearchResult], addr: u32, size: u32) {
+    let end = addr as u64 + size as u64;
+    for r in results {
+        if (r.addr as u64) < end && (addr as u64) < r.addr as u64 + r.vtype.size() as u64 {
+            if let Some(bits) = r.vtype.read_at(mem, r.addr) { r.bits = bits; }
+            r.changed = false;
+            r.analysis.reset_history();
+        }
+    }
+}
+
 /// A fresh search and an empty refinement are different operations: an
 /// exhausted refinement must never silently restart a whole-memory search.
 fn search_all(
@@ -797,6 +850,7 @@ fn search_all(
                 vtype: t,
                 bits,
                 changed: false,
+                analysis: if t == result.vtype { result.analysis } else { Analysis::default() },
             })
         }).take(MAX_RESULTS).collect();
     }
@@ -868,6 +922,7 @@ fn scan_bits(mem: &Mem, vtype: VType, want_bits: u64) -> Vec<SearchResult> {
                     vtype,
                     bits: want_bits,
                     changed: false,
+                    analysis: Analysis::default(),
                 });
                 if results.len() >= MAX_RESULTS {
                     return results;
