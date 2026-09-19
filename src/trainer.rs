@@ -283,7 +283,7 @@ impl Trainer {
 
         // Pick up commands from the overlay UI.
         for cmd in trainer_ui::take_commands() {
-            let inspect = matches!(&cmd, TrainerCmd::InspectSelection | TrainerCmd::SelectChange { .. });
+            let inspect = matches!(&cmd, TrainerCmd::InspectSelection);
             self.handle_command(mem, cmd);
             if inspect { self.describe_selection(mem, objc); }
         }
@@ -324,6 +324,42 @@ impl Trainer {
         }
     }
 
+    fn refresh_watch_value(&self, mem: &Mem) {
+        let Some(target @ (addr, vtype)) = trainer_ui::watch_target() else { return; };
+        let found = self.state.results.iter().any(|r| r.addr == addr && r.vtype == vtype);
+        let live = mem.live_allocations().iter().any(|&(base, size)| {
+            base <= addr && addr as u64 + vtype.size() as u64 <= base as u64 + size as u64
+        });
+        trainer_ui::publish_watch_value(target, if found && live { vtype.read_at(mem, addr) } else { None });
+    }
+
+    /// Explicit address/type from WATCH, never the main editor's selection.
+    fn set_watch_value(&mut self, mem: &mut Mem, addr: u32, vtype: VType, text: &str) -> Result<u64, &'static str> {
+        if vtype == VType::Auto || !self.state.results.iter().any(|r| r.addr == addr && r.vtype == vtype) {
+            return Err("RESULT EXPIRED: SEARCH AGAIN");
+        }
+        let bits = vtype.parse(text).ok_or("BAD VALUE: CHECK TYPE / RANGE")?;
+        let mut allocations = mem.live_allocations();
+        allocations.sort_unstable_by_key(|a| a.0);
+        if bulk::containing_allocation(&allocations, addr, vtype.size()).is_none()
+            || vtype.read_at(mem, addr).is_none()
+        {
+            return Err("ADDRESS NO LONGER LIVE");
+        }
+        let end = addr as u64 + vtype.size() as u64;
+        if self.state.frozen.iter().any(|p| {
+            (p.addr as u64) < end && (addr as u64) < p.addr as u64 + p.vtype.size() as u64
+        }) {
+            return Err("FROZEN RANGE: UNFREEZE FIRST");
+        }
+        // A changing value is expected here. Validate identity/range, not
+        // equality with a historical event's old value.
+        if !vtype.write_at(mem, addr, bits) { return Err("WRITE FAILED"); }
+        self.state.snapshot = None;
+        record_trainer_write(mem, &mut self.state.results, addr, vtype.size());
+        Ok(bits)
+    }
+
     fn handle_command(&mut self, mem: &mut Mem, cmd: TrainerCmd) {
         if !matches!(&cmd, TrainerCmd::SetAll { .. }) {
             if self.state.pending_bulk.take().is_some() {
@@ -337,6 +373,17 @@ impl Trainer {
             self.state.snapshot = None;
         }
         match cmd {
+            TrainerCmd::WatchSet { addr, vtype, text } => {
+                let status = match self.set_watch_value(mem, addr, vtype, &text) {
+                    Ok(bits) => {
+                        trainer_ui::publish_live_values(&self.state.results);
+                        format!("SET 0x{:08X} = {}", addr, vtype.format(bits))
+                    }
+                    Err(reason) => reason.to_string(),
+                };
+                self.refresh_watch_value(mem);
+                trainer_ui::publish_watch_status((addr, vtype), status);
+            }
             TrainerCmd::Mark => {
                 if self.state.results.is_empty() {
                     trainer_ui::publish_status("SEARCH FIRST, THEN MARK".to_string());
@@ -361,23 +408,11 @@ impl Trainer {
                 self.state.activity = Activity::default();
                 trainer_ui::clear_activity();
             }
-            TrainerCmd::SelectChange { addr, vtype } => {
-                if let Some(r) = self.state.results.iter().find(|r| r.addr == addr && r.vtype == vtype) {
-                    let mut allocations = mem.live_allocations();
-                    allocations.sort_unstable_by_key(|a| a.0);
-                    if bulk::containing_allocation(&allocations, addr, vtype.size()).is_some()
-                        && r.vtype.read_at(mem, addr).is_some()
-                    {
-                        trainer_ui::focus_result(&self.state.results, addr, vtype);
-                    } else {
-                        trainer_ui::publish_status("ADDRESS NO LONGER READABLE".to_string());
-                    }
-                } else {
-                    trainer_ui::publish_status("RESULT NO LONGER IN SEARCH".to_string());
-                }
-            }
             TrainerCmd::CancelBulk | TrainerCmd::InspectSelection => {}
-            TrainerCmd::RefreshView => trainer_ui::publish_live_values(&self.state.results),
+            TrainerCmd::RefreshView => {
+                trainer_ui::publish_live_values(&self.state.results);
+                self.refresh_watch_value(mem);
+            }
             TrainerCmd::Search { vtype, text } => {
                 let Some(_) = vtype.parse(&text) else {
                     trainer_ui::publish_status(format!("BAD VALUE: {}", text));
@@ -788,6 +823,7 @@ impl Trainer {
         }
         self.state.activity_cursor = (self.state.activity_cursor + 67) % len;
         classify::analyze_batch_with_objects(mem, &mut self.state.results, &mut self.state.analysis_cursor, objc);
+        self.refresh_watch_value(mem);
         trainer_ui::publish_activity(&self.state.activity.entries, self.state.activity.changed_last_sample, len);
         trainer_ui::publish_live_values(&self.state.results);
     }

@@ -392,7 +392,12 @@ fn watch_window_is_independent_and_fits_portrait_and_landscape() {
         }
     }
     ui.open = true;
-    assert!(compute_layout(&ui, (0, 0, 320, 480)).monitor.is_none());
+    for viewport in [(0, 0, 320, 480), (100, 0, 480, 320)] {
+        let layout = compute_layout(&ui, viewport);
+        let panel = layout.panel.unwrap();
+        let monitor = layout.monitor.unwrap();
+        assert!(monitor.rect.x + monitor.rect.w <= panel.rect.x);
+    }
 }
 
 #[test]
@@ -404,15 +409,15 @@ fn watch_controls_pause_browse_and_select_without_writing() {
         before: 30, after: 29, at: std::time::Instant::now() }).collect();
     take_commands();
     activate_widget(&mut ui, W_WATCH);
-    assert!(ui.watch_open && !ui.open);
+    assert!(ui.watch_open && ui.open);
     activate_widget(&mut ui, W_WATCH_OLDER);
     assert!(ui.watch_paused);
     assert_eq!(ui.activity_scroll, RESULT_ROWS);
     take_commands();
     activate_widget(&mut ui, W_CHANGE_BASE);
     assert!(ui.open);
-    assert!(matches!(take_commands().as_slice(), [TrainerCmd::CancelBulk,
-        TrainerCmd::SelectChange { addr: 0x1014, vtype: VType::I32 }]));
+    assert_eq!(ui.watch_target, Some((0x1014, VType::I32)));
+    assert!(matches!(take_commands().as_slice(), [TrainerCmd::CancelBulk, TrainerCmd::RefreshView]));
     activate_widget(&mut ui, W_WATCH_PAUSE);
     assert!(!ui.watch_paused);
     assert_eq!(ui.activity_scroll, 0);
@@ -421,4 +426,62 @@ fn watch_controls_pause_browse_and_select_without_writing() {
     assert!(matches!(take_commands().as_slice(), [TrainerCmd::CancelBulk, TrainerCmd::Mark]));
     activate_widget(&mut ui, W_DECREASED);
     assert!(matches!(take_commands().as_slice(), [TrainerCmd::CancelBulk, TrainerCmd::Compare(WatchFilter::Decreased)]));
+}
+
+#[test]
+fn watch_edit_is_pinned_and_independent_of_main_selection_and_live_feed() {
+    let _guard = INPUT_TEST_LOCK.lock().unwrap();
+    let mut ui = TrainerUi::new();
+    ui.selected = Some(0x9999);
+    ui.selected_type = Some(VType::F32);
+    ui.activity.push(Change { addr: 0x1000, vtype: VType::I32,
+        before: 30, after: 29, at: std::time::Instant::now() });
+    take_commands();
+    activate_widget(&mut ui, W_CHANGE_BASE);
+    assert!(!ui.open, "WATCH must not open the main editor");
+    assert_eq!(ui.selected, Some(0x9999));
+    assert_eq!(ui.watch_target, Some((0x1000, VType::I32)));
+    ui.activity[0].addr = 0x2000; // incoming feed reordered
+    ui.watch_current = Some(28);
+    activate_widget(&mut ui, W_WATCH_KEY_BASE + 7); // CLR
+    activate_widget(&mut ui, W_WATCH_KEY_BASE + 8); // 7
+    assert_eq!(ui.watch_text, "7");
+    take_commands();
+    activate_widget(&mut ui, W_WATCH_SET);
+    assert!(matches!(take_commands().as_slice(), [TrainerCmd::CancelBulk,
+        TrainerCmd::WatchSet { addr: 0x1000, vtype: VType::I32, text }] if text == "7"));
+    ui.watch_current = None;
+    activate_widget(&mut ui, W_WATCH_SET);
+    assert!(matches!(take_commands().as_slice(), [TrainerCmd::CancelBulk]));
+    activate_widget(&mut ui, W_WATCH_DONE);
+    assert_eq!(ui.watch_target, None);
+    take_commands();
+}
+
+#[test]
+fn watch_inline_editor_fits_and_both_windows_have_distinct_hit_targets() {
+    let mut ui = TrainerUi::new();
+    ui.watch_open = true;
+    ui.watch_target = Some((0x1000, VType::I32));
+    for open in [false, true] {
+        ui.open = open;
+        for viewport in [(0, 100, 320, 480), (100, 0, 480, 320), (0, 0, 1920, 1080)] {
+            let layout = compute_layout(&ui, viewport);
+            let mut ids = std::collections::HashSet::new();
+            for panel in layout.panels() {
+                assert!(panel.rect.y + panel.rect.h <= viewport.3 as f32);
+                assert!(panel.rect.x + panel.rect.w <= viewport.2 as f32);
+                for &(id, r) in &panel.widgets {
+                    assert!(ids.insert(id), "duplicate id {id}");
+                    assert!(r.x >= panel.rect.x && r.x + r.w <= panel.rect.x + panel.rect.w + 0.001);
+                    assert!(r.y >= panel.rect.y && r.y + r.h <= panel.rect.y + panel.rect.h + 0.001);
+                    let x = r.x + r.w / 2.0;
+                    let y = r.y + r.h / 2.0;
+                    assert_eq!(layout.panels().flat_map(|p| &p.widgets).filter(|(_, rect)| rect.contains(x, y)).count(), 1);
+                }
+            }
+            assert!(ids.contains(&W_WATCH_SET));
+            assert!(ids.contains(&(W_WATCH_KEY_BASE + 8)));
+        }
+    }
 }

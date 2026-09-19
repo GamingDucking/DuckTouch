@@ -36,6 +36,7 @@ pub enum TrainerCmd {
     Refine { vtype: VType, text: String },
     Reset,
     Set { vtype: VType, text: String },
+    WatchSet { addr: u32, vtype: VType, text: String },
     SetAll { vtype: VType, text: String, confirm: bool, safe_mode: bool, filter: ResultFilter },
     CancelBulk,
     RefreshView,
@@ -43,7 +44,6 @@ pub enum TrainerCmd {
     Mark,
     Compare(WatchFilter),
     ClearActivity,
-    SelectChange { addr: u32, vtype: VType },
     Freeze { vtype: VType, text: String },
     UnfreezeAll,
     Dump,
@@ -95,6 +95,10 @@ struct TrainerUi {
     activity_changed: usize,
     activity_tracked: usize,
     activity_scroll: usize,
+    watch_target: Option<(u32, VType)>,
+    watch_current: Option<u64>,
+    watch_text: String,
+    watch_status: String,
 }
 
 impl TrainerUi {
@@ -102,6 +106,10 @@ impl TrainerUi {
     /// This avoids both a huge UI copy and the old first-200 paging cutoff.
     fn update_results(&mut self, results: &[SearchResult], reset: bool) {
         if reset {
+            self.watch_target = None;
+            self.watch_current = None;
+            self.watch_text.clear();
+            self.watch_status.clear();
             self.activity_tracked = results.len();
             self.scroll = 0;
             self.selected = None;
@@ -163,6 +171,10 @@ impl TrainerUi {
             activity_changed: 0,
             activity_tracked: 0,
             activity_scroll: 0,
+            watch_target: None,
+            watch_current: None,
+            watch_text: String::new(),
+            watch_status: String::new(),
         }
     }
 }
@@ -202,6 +214,10 @@ pub fn reset_for_app(app_id: Option<&str>) {
     ui.speed_dirty = false;
     ui.pending = None;
     ui.watch_open = false;
+    ui.watch_target = None;
+    ui.watch_current = None;
+    ui.watch_text.clear();
+    ui.watch_status.clear();
     ui.watch_paused = false;
     ui.activity.clear();
     ui.activity_changed = 0;
@@ -216,7 +232,9 @@ pub fn publish_live_values(results: &[SearchResult]) {
 
 pub fn publish_activity(changes: &VecDeque<Change>, changed: usize, tracked: usize) {
     let mut ui = UI.lock().unwrap();
-    if !ui.watch_paused {
+    // Do not let a live reorder replace the row under the user's finger.
+    let pressing_row = ui.pending.is_some_and(|id| (W_CHANGE_BASE..W_CHANGE_BASE + RESULT_ROWS as u16).contains(&id));
+    if !ui.watch_paused && !pressing_row {
         ui.activity_scroll = 0;
         ui.activity = changes.iter().copied().collect();
         ui.activity_changed = changed;
@@ -232,19 +250,18 @@ pub fn clear_activity() {
     ui.activity_tracked = ui.total_results;
 }
 
-pub fn focus_result(results: &[SearchResult], addr: u32, vtype: VType) {
+pub fn watch_target() -> Option<(u32, VType)> {
+    UI.lock().unwrap().watch_target
+}
+
+pub fn publish_watch_value(target: (u32, VType), value: Option<u64>) {
     let mut ui = UI.lock().unwrap();
-    if let Some(i) = results.iter().position(|r| r.addr == addr && r.vtype == vtype) {
-        ui.open = true;
-        ui.filter = ResultFilter::All;
-        ui.scroll = i;
-        ui.update_results(results, false);
-        ui.selected = Some(addr);
-        ui.selected_type = Some(vtype);
-        ui.vtype = vtype;
-        let r = &results[i];
-        ui.status = format!("{}: {}", r.analysis.category.label(), r.analysis.description());
-    }
+    if ui.watch_target == Some(target) { ui.watch_current = value; }
+}
+
+pub fn publish_watch_status(target: (u32, VType), status: String) {
+    let mut ui = UI.lock().unwrap();
+    if ui.watch_target == Some(target) { ui.watch_status = status; }
 }
 
 /// Consumed by Environment, which owns the per-app guest clock.
@@ -314,6 +331,10 @@ const W_WATCH_CLEAR: u16 = 29;
 const W_WATCH_CLOSE: u16 = 30;
 const W_WATCH_NEWER: u16 = 45;
 const W_WATCH_OLDER: u16 = 46;
+const W_WATCH_FIELD: u16 = 47;
+const W_WATCH_SET: u16 = 48;
+const W_WATCH_DONE: u16 = 49;
+const W_WATCH_KEY_BASE: u16 = 80; // + keypad index
 const W_CHANGE_BASE: u16 = 40; // + row index; below keypad IDs
 const W_SAVE: u16 = 13;
 const W_SCROLL_UP: u16 = 14;
@@ -350,6 +371,12 @@ struct Layout {
     monitor: Option<PanelLayout>,
 }
 
+impl Layout {
+    fn panels(&self) -> impl Iterator<Item = &PanelLayout> {
+        self.panel.iter().chain(self.monitor.iter())
+    }
+}
+
 struct PanelLayout {
     rect: Rect,
     widgets: Vec<(u16, Rect)>,
@@ -366,7 +393,7 @@ fn compute_layout(ui: &TrainerUi, viewport: (u32, u32, u32, u32)) -> Layout {
     let (_vx, _vy, vw, vh) = viewport;
     let (vx, vy, vw, vh) = (0.0_f32, 0.0_f32, vw as f32, vh as f32);
     // Fit the complete panel, including speed controls, in both orientations.
-    let s = (vh / 580.0).min(vw / 320.0).clamp(0.25, 4.0);
+    let s = (vh / 580.0).min(vw / if ui.watch_open && ui.open { 600.0 } else { 320.0 }).clamp(0.1, 4.0);
     let btn = 30.0 * s;
     let button = Rect {
         x: vx + vw - btn - 6.0 * s,
@@ -459,7 +486,7 @@ fn compute_layout(ui: &TrainerUi, viewport: (u32, u32, u32, u32)) -> Layout {
             push_widget(*id, px + 6.0 * s + (quarter + 4.0 * s) * i as f32, y, quarter, row_h, &mut widgets);
         }
         y += row_h + 4.0 * s;
-        // Read-only activity window plus dump/save.
+        // Activity window with inline editing, plus dump/save.
         let third = (pw - 12.0 * s - 8.0 * s) / 3.0;
         for (i, id) in [W_DUMP, W_SAVE, W_WATCH].iter().enumerate() {
             push_widget(*id, px + 6.0 * s + (third + 4.0 * s) * i as f32, y, third, row_h, &mut widgets);
@@ -475,10 +502,12 @@ fn compute_layout(ui: &TrainerUi, viewport: (u32, u32, u32, u32)) -> Layout {
     } else {
         None
     };
-    let monitor = if ui.watch_open && !ui.open {
+    let monitor = if ui.watch_open {
         // A compact independent window leaves the rest of the game touchable.
-        let ms = (vw / 360.0).min(vh / 360.0).clamp(0.25, 2.0);
-        let rect = Rect { x: 6.0 * ms, y: 42.0 * ms, w: 280.0 * ms, h: 218.0 * ms };
+        // Beside the editor when it is open; larger when watching the game.
+        let ms = if ui.open { s } else { (vw / 300.0).min(vh / 480.0).clamp(0.1, 2.0) };
+        let height = if ui.watch_target.is_some() { 428.0 } else { 218.0 };
+        let rect = Rect { x: 6.0 * ms, y: 42.0 * ms, w: 280.0 * ms, h: height * ms };
         let mut widgets = Vec::new();
         for (i, id) in [W_WATCH_PAUSE, W_WATCH_CLEAR, W_WATCH_CLOSE].iter().enumerate() {
             widgets.push((*id, Rect { x: rect.x + (128.0 + i as f32 * 48.0) * ms,
@@ -492,6 +521,24 @@ fn compute_layout(ui: &TrainerUi, viewport: (u32, u32, u32, u32)) -> Layout {
         for (i, id) in [W_WATCH_NEWER, W_WATCH_OLDER].iter().enumerate() {
             widgets.push((*id, Rect { x: rect.x + (4.0 + i as f32 * 138.0) * ms,
                 y: rect.y + 190.0 * ms, w: 134.0 * ms, h: 23.0 * ms }));
+        }
+        if ui.watch_target.is_some() {
+            for (id, x, width) in [(W_WATCH_FIELD, 4.0, 198.0), (W_WATCH_SET, 206.0, 70.0)] {
+                widgets.push((id, Rect { x: rect.x + x * ms, y: rect.y + 242.0 * ms,
+                    w: width * ms, h: 24.0 * ms }));
+            }
+            for (row, keys) in KEYPAD.iter().enumerate() {
+                for (col, key) in keys.iter().enumerate() {
+                    if key.is_some() {
+                        widgets.push((W_WATCH_KEY_BASE + (row * 4 + col) as u16,
+                            Rect { x: rect.x + (4.0 + col as f32 * 68.0) * ms,
+                                y: rect.y + (270.0 + row as f32 * 26.0) * ms,
+                                w: 66.0 * ms, h: 24.0 * ms }));
+                    }
+                }
+            }
+            widgets.push((W_WATCH_DONE, Rect { x: rect.x + 4.0 * ms,
+                y: rect.y + 378.0 * ms, w: 272.0 * ms, h: 23.0 * ms }));
         }
         Some(PanelLayout { rect, widgets, results_header_y: rect.y + 28.0 * ms })
     } else { None };
@@ -522,10 +569,8 @@ pub fn touch_down(abs: (f32, f32), viewport: (u32, u32, u32, u32)) -> bool {
         ui.pending = Some(W_BUTTON);
         return true;
     }
-    if let Some(panel) = layout.panel.as_ref().or(layout.monitor.as_ref()) {
-        if !panel.rect.contains(x, y) {
-            return false; // outside the panel: let the game have the touch
-        }
+    for panel in layout.panels() {
+        if !panel.rect.contains(x, y) { continue; }
         for (id, rect) in &panel.widgets {
             if rect.contains(x, y) {
                 ui.pending = Some(*id);
@@ -558,17 +603,14 @@ pub fn touch_up(abs: (f32, f32), viewport: (u32, u32, u32, u32)) -> bool {
     let (x, y) = (abs.0 - vx as f32, abs.1 - vy as f32);
     let Some(pending) = ui.pending.take() else {
         // Finger wasn't consumed on the way down.
-        if layout.button.contains(x, y) || layout.panel.as_ref().or(layout.monitor.as_ref()).map_or(false, |p| p.rect.contains(x, y)) {
+        if layout.button.contains(x, y) || layout.panels().any(|p| p.rect.contains(x, y)) {
             return true;
         }
         return false;
     };
     // Activate if the finger is released over the same widget.
     let hit = pending == W_BUTTON && layout.button.contains(x, y)
-        || layout
-            .panel
-            .as_ref().or(layout.monitor.as_ref())
-            .map_or(false, |p| p.widgets.iter().any(|(id, r)| *id == pending && r.contains(x, y)));
+        || layout.panels().any(|p| p.widgets.iter().any(|(id, r)| *id == pending && r.contains(x, y)));
     if hit {
         activate_widget(&mut ui, pending);
     }
@@ -584,7 +626,7 @@ fn activate_widget(ui: &mut TrainerUi, id: u16) {
     }
     match id {
         W_BUTTON => ui.open = !ui.open,
-        W_WATCH => { ui.watch_open = true; ui.open = false; }
+        W_WATCH => ui.watch_open = !ui.watch_open,
         W_WATCH_CLOSE => ui.watch_open = false,
         W_WATCH_PAUSE => {
             ui.watch_paused = !ui.watch_paused;
@@ -614,13 +656,42 @@ fn activate_widget(ui: &mut TrainerUi, id: u16) {
         }
         id if (W_CHANGE_BASE..W_CHANGE_BASE + RESULT_ROWS as u16).contains(&id) => {
             if let Some(change) = ui.activity.get(ui.activity_scroll + (id - W_CHANGE_BASE) as usize) {
-                ui.open = true;
-                ui.selected = None;
-                ui.selected_type = None;
-                ui.vtype = change.vtype;
-                COMMANDS.lock().unwrap().push(TrainerCmd::SelectChange {
-                    addr: change.addr, vtype: change.vtype,
-                });
+                // Pin identity, not row index: subsequent live events cannot
+                // redirect the edit to a different address or AUTO alias.
+                ui.watch_target = Some((change.addr, change.vtype));
+                ui.watch_current = None;
+                ui.watch_text = change.vtype.format(change.after);
+                ui.watch_status = "SET edits this address only; still risky".to_string();
+                COMMANDS.lock().unwrap().push(TrainerCmd::RefreshView);
+            }
+        }
+        W_WATCH_FIELD => {}
+        W_WATCH_DONE => {
+            ui.watch_target = None;
+            ui.watch_current = None;
+            ui.watch_text.clear();
+            ui.watch_status.clear();
+        }
+        W_WATCH_SET => {
+            if let Some((addr, vtype)) = ui.watch_target {
+                if ui.watch_current.is_some() {
+                    COMMANDS.lock().unwrap().push(TrainerCmd::WatchSet {
+                        addr, vtype, text: ui.watch_text.trim().to_string(),
+                    });
+                } else {
+                    ui.watch_status = "ADDRESS UNAVAILABLE: WAIT OR SEARCH AGAIN".to_string();
+                }
+            }
+        }
+        id if (W_WATCH_KEY_BASE..W_WATCH_KEY_BASE + 16).contains(&id) => {
+            let index = (id - W_WATCH_KEY_BASE) as usize;
+            if let Some(ch) = KEYPAD[index / 4][index % 4] {
+                match ch {
+                    '\u{8}' => { ui.watch_text.pop(); }
+                    '\u{4}' => ui.watch_text.clear(),
+                    _ if ui.watch_text.len() < 24 => ui.watch_text.push(ch),
+                    _ => {}
+                }
             }
         }
         W_CLOSE => ui.open = false,
@@ -1195,7 +1266,11 @@ unsafe fn build_scene(
             };
             if let Some(label) = label {
                 push_text(&mut quads, atlas, label, rect.x + 3.0 * ms, rect.y + 7.0 * ms, 9.0 * ms, COL_TEXT);
-            } else if let Some(change) = ui_state.activity.get(ui_state.activity_scroll + (id - W_CHANGE_BASE) as usize) {
+            } else if (W_CHANGE_BASE..W_CHANGE_BASE + RESULT_ROWS as u16).contains(&id) {
+                let Some(change) = ui_state.activity.get(ui_state.activity_scroll + (id - W_CHANGE_BASE) as usize) else { continue; };
+                if ui_state.watch_target == Some((change.addr, change.vtype)) {
+                    push_rect(&mut quads, rect, COL_SELECTED);
+                }
                 let fresh = !ui_state.watch_paused && change.at.elapsed().as_secs_f32() < 0.75;
                 let title = format!("0x{:08X} {}  {:.1}s ago", change.addr, change.vtype.name(), change.at.elapsed().as_secs_f32());
                 let values = format!("{} -> {}", change.vtype.format(change.before), change.vtype.format(change.after));
@@ -1206,6 +1281,34 @@ unsafe fn build_scene(
                         rect.y + (2.0 + line as f32 * 13.0) * ms, size,
                         if fresh { COL_ACCENT } else { COL_TEXT });
                 }
+            } else {
+                let label = match id {
+                    W_WATCH_FIELD => format!("NEW: {}_", ui_state.watch_text),
+                    W_WATCH_SET => "SET".to_string(),
+                    W_WATCH_DONE => "DONE (keep watching)".to_string(),
+                    id if (W_WATCH_KEY_BASE..W_WATCH_KEY_BASE + 16).contains(&id) => {
+                        let index = (id - W_WATCH_KEY_BASE) as usize;
+                        match KEYPAD[index / 4][index % 4] {
+                            Some('\u{8}') => "DEL".to_string(),
+                            Some('\u{4}') => "CLR".to_string(),
+                            Some(ch) => ch.to_string(), None => String::new(),
+                        }
+                    }
+                    _ => String::new(),
+                };
+                let size = 11.0 * ms;
+                let size = size * ((rect.w - 8.0 * ms) / text_width(atlas, &label, size).max(1.0)).min(1.0);
+                push_text(&mut quads, atlas, &label, rect.x + 4.0 * ms, rect.y + 6.0 * ms, size, COL_TEXT);
+            }
+        }
+        if let Some((addr, vtype)) = ui_state.watch_target {
+            let current = ui_state.watch_current.map(|v| vtype.format(v)).unwrap_or_else(|| "unavailable".to_string());
+            let target = format!("0x{:08X} {} NOW: {}", addr, vtype.name(), current);
+            for (y, text) in [(222.0, target.as_str()), (407.0, ui_state.watch_status.as_str())] {
+                let size = 10.0 * ms;
+                let size = size * ((monitor.rect.w - 10.0 * ms) / text_width(atlas, text, size).max(1.0)).min(1.0);
+                push_text(&mut quads, atlas, text, monitor.rect.x + 5.0 * ms,
+                    monitor.rect.y + y * ms, size, COL_ACCENT);
             }
         }
     }

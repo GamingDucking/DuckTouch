@@ -114,15 +114,34 @@ are rejected; allocation reuse with identical boundaries remains undetectable.
 
 ### WATCH: independent live-change window
 
-Tap **WATCH** in CE to close the editor and open a compact window over the game.
-It monitors **all stored search hits**, independent of GROUP, not arbitrary
+Tap **WATCH** in CE to toggle a separate window beside the main editor. Both
+windows fit side by side; closing the main editor leaves WATCH over the game
+with larger controls. It monitors **all stored search hits**, independent of GROUP, not arbitrary
 unsearched memory. Each row shows `address`, concrete `type`, `before -> after`,
 and seconds since observation. New changes light up; old rows retain their age
-instead of pretending to be happening now. Tap a row to select that exact
-address/type in the editor; selection is checked against the current search and
-live allocations. Touches outside the window still reach the game.
+instead of pretending to be happening now. Touches outside both windows still
+reach the game.
 
-- **PAUSE / RESUME** holds/releases the displayed feed, not the game.
+**Edit directly in WATCH:** tap a changed row. Its address/type is pinned below
+the feed, with a live **NOW** value, independent **NEW** input, numeric keypad
+(`CLR` clears, `DEL` deletes a character), and **SET**. Enter a number and tap
+SET: only that concrete address/type is targeted, never the main editor's
+selection or all feed rows. The feed keeps updating while typing; new events
+cannot redirect the pinned target or replace your input. The row under a held
+touch is kept stable until release. **DONE** collapses the inline editor.
+
+Before writing, the engine rechecks membership in the current search, concrete
+type, numeric range, readable live allocation and overlap with frozen patches.
+Frozen addresses require UNFRZ in the main editor first. A normal in-game value
+change does not block an explicit SET. The result/error appears in WATCH, and
+NOW is reread immediately. New searches/refinements/comparisons/reset clear the
+pinned edit. A successful edit invalidates MARK and resets affected observation
+histories. SET is still a manual memory edit, not a proof the address is safe:
+aliases share bytes, reused allocations cannot always be detected, and the game
+may overwrite the value on its next update.
+
+- **PAUSE / RESUME** holds/releases the displayed feed, not the game. The
+  pinned NOW value keeps refreshing even while the history feed is paused.
 - **OLDER / NEWER** browses recent entries and automatically holds the feed.
 - **CLEAR** clears history; **X** hides the window. CE still opens the editor.
 - The feed retains 64 distinct address/type pairs, coalescing repeated changes.
@@ -234,4 +253,5 @@ category-scoped bulk plans and invalidation after category changes.
 Additional regressions cover exact scalar field identification, pointer/type/
 offset rejection, repeated refill cycles, irregular timer rejection, explicit
 snapshot baselines, signed/float comparisons, bounded/coalesced activity feeds,
-trainer-write suppression, watch-window layout, and read-only UI commands.
+trainer-write suppression, side-by-side window layout, stable inline edit
+targets, read-only observation controls, and validated single-address writes.

@@ -450,3 +450,38 @@ fn mark_comparison_is_read_only_and_rebases_after_filtering() {
     trainer.handle_command(&mut mem, TrainerCmd::Compare(watch::WatchFilter::Changed));
     assert!(trainer.state.results.is_empty());
 }
+
+#[test]
+fn watch_write_uses_explicit_concrete_target_even_after_value_changes() {
+    let (mut mem, base) = memory(64);
+    let mut trainer = Trainer::new(true);
+    trainer.state.results = vec![result(&mut mem, base, VType::U8, "30"),
+        result(&mut mem, base + 8, VType::I32, "30")];
+    trainer.state.snapshot = Some(Snapshot::capture(&mem, &trainer.state.results));
+    VType::U8.write_at(&mut mem, base, 28);
+    let before = snapshot(&mem, base, 64);
+    assert_eq!(trainer.set_watch_value(&mut mem, base, VType::U8, "99"), Ok(99));
+    assert_eq!(snapshot(&mem, base + 1, 63), before[1..]);
+    assert_eq!(trainer.state.results[0].bits, 99);
+    assert!(trainer.state.snapshot.is_none());
+    trainer.refresh_live_values(&mut mem, None, 0.25);
+    assert!(trainer.state.activity.entries.is_empty(), "own writes are not game events");
+}
+
+#[test]
+fn watch_write_rejects_overflow_type_changes_frozen_aliases_and_expiry() {
+    let (mut mem, base) = memory(64);
+    let mut trainer = Trainer::new(true);
+    trainer.state.results = vec![result(&mut mem, base + 1, VType::U8, "30")];
+    let before = snapshot(&mem, base, 64);
+    assert!(trainer.set_watch_value(&mut mem, base + 1, VType::U8, "999").is_err());
+    assert!(trainer.set_watch_value(&mut mem, base + 1, VType::I32, "99").is_err());
+    assert!(trainer.set_watch_value(&mut mem, base + 1, VType::Auto, "99").is_err());
+    assert!(trainer.set_watch_value(&mut mem, base + 8, VType::U8, "99").is_err());
+    trainer.state.frozen.push(Patch { addr: base, vtype: VType::I32, bits: 0, freeze: true });
+    assert!(trainer.set_watch_value(&mut mem, base + 1, VType::U8, "99").is_err());
+    assert_eq!(snapshot(&mem, base, 64), before);
+    trainer.state.frozen.clear();
+    mem.free(MutVoidPtr::from_bits(base));
+    assert!(trainer.set_watch_value(&mut mem, base + 1, VType::U8, "99").is_err());
+}
