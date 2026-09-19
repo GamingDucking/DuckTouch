@@ -590,8 +590,11 @@ unsafe fn build_atlas(gles: &mut dyn GLES) -> Option<Atlas> {
         cell.u1 = u1_px / atlas_w_f;
         // v0 = top of the glyph band, v1 = bottom (matches the quad corners
         // in push_text, where v0 is used at the top edge).
-        cell.v0 = 1.0 - by as f32 / atlas_h_f;
-        cell.v1 = 1.0 - (by as f32 + dims.1 as f32) / atlas_h_f;
+        // The first row uploaded (bitmap row 0, the glyph band's top) is
+        // sampled at v = 0, so v simply grows downward through the bitmap:
+        // no `1 -` inversion here — that would flip every glyph upside down.
+        cell.v0 = by as f32 / atlas_h_f;
+        cell.v1 = (by as f32 + dims.1 as f32) / atlas_h_f;
         cell.draw_dx = 0.0;
         cell.draw_dy = origin.1 - min_y;
         cell.draw_w = dims.0 as f32;

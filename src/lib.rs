@@ -39,7 +39,7 @@ mod crash_handler;
 mod debug;
 mod dyld;
 mod environment;
-mod font;
+pub mod font;
 mod frameworks;
 mod fs;
 mod gdb;
