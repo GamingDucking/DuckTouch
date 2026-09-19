@@ -268,6 +268,7 @@ pub const DYLIB_LIST: &[&super::HostDylib] = &[
     &frameworks::image_io::DYLIB,
     &frameworks::photos::DYLIB,
     &frameworks::quick_look::DYLIB,
+    &frameworks::watch_connectivity::DYLIB,
     &frameworks::xsapitcui::DYLIB,
 ];
 
