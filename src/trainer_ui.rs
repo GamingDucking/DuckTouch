@@ -843,6 +843,9 @@ pub unsafe fn draw_es2(
             drop(stored);
             *OVERLAY_PROGRAM.lock().unwrap() = None;
             *OVERLAY_VBO.lock().unwrap() = None;
+            // The solid-quad texture is context-owned too. Reusing its old
+            // name can sample an unrelated texture in the new context.
+            *OVERLAY_WHITE_TEX.lock().unwrap() = None;
             invalidate_atlas();
         }
     }
@@ -1073,6 +1076,12 @@ unsafe fn render_gles1(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quad
     gles.GetIntegerv(gles11::ACTIVE_TEXTURE, &mut old_active_texture);
     let mut old_texture: GLint = 0;
     gles.GetIntegerv(gles11::TEXTURE_BINDING_2D, &mut old_texture);
+    let mut old_tex_env_mode: GLint = 0;
+    gles.GetTexEnviv(gles11::TEXTURE_ENV, gles11::TEXTURE_ENV_MODE, &mut old_tex_env_mode);
+    // The presenter uses REPLACE for the game frame; glyphs instead need
+    // their atlas coverage multiplied by the overlay's text colour.
+    let tex_env_mode = gles11::MODULATE as GLint;
+    gles.TexEnviv(gles11::TEXTURE_ENV, gles11::TEXTURE_ENV_MODE, &tex_env_mode);
 
     gles.MatrixMode(gles11::PROJECTION);
     gles.PushMatrix();
@@ -1087,6 +1096,11 @@ unsafe fn render_gles1(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quad
     gles.Enable(gles11::BLEND);
     gles.BlendFunc(gles11::SRC_ALPHA, gles11::ONE_MINUS_SRC_ALPHA);
 
+    // present_frame leaves TEXTURE_2D enabled with the game frame bound
+    // (unless the cursor/FPS overlay happened to disable it). Establish the
+    // untextured state before using 0 as our solid-quad cache sentinel, or
+    // the first rectangle — the GG button — samples a miniature game frame.
+    gles.Disable(gles11::TEXTURE_2D);
     let mut bound_tex: GLuint = 0;
     for q in quads {
         let (r, g, b, a) = q.col;
@@ -1117,6 +1131,7 @@ unsafe fn render_gles1(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quad
     }
 
     // Restore state.
+    gles.TexEnviv(gles11::TEXTURE_ENV, gles11::TEXTURE_ENV_MODE, &old_tex_env_mode);
     gles.BindTexture(gles11::TEXTURE_2D, old_texture as _);
     gles.ActiveTexture(old_active_texture as _);
     gles.Disable(gles11::BLEND);
@@ -1421,3 +1436,6 @@ fn text_width(atlas: &Atlas, text: &str, px_size: f32) -> f32 {
         })
         .sum()
 }
+
+#[cfg(test)]
+mod tests;
