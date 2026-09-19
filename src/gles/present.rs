@@ -105,6 +105,12 @@ pub unsafe fn present_frame(
     // drawing), so clearing DEPTH|STENCIL is a wasted full-viewport pass —
     // noticeable at scale-hack 4x on software rasterizers.
     gles.Clear(gles11::COLOR_BUFFER_BIT);
+    // Keep the window's alpha channel at the 1.0 the clear just wrote. The
+    // frame texture's alpha is meaningless for an opaque CAEAGLLayer, but a
+    // window surface with an alpha channel may be blended by the OS
+    // compositor (Android's SurfaceFlinger), which would show through
+    // wherever the app left alpha < 1.
+    gles.ColorMask(gles11::TRUE, gles11::TRUE, gles11::TRUE, gles11::FALSE);
     gles.BindBuffer(gles11::ARRAY_BUFFER, 0);
     // Stretch the full rendered frame to fill the active host viewport.
     //
@@ -197,6 +203,8 @@ pub unsafe fn present_frame(
             }
         }
     }
+
+    gles.ColorMask(gles11::TRUE, gles11::TRUE, gles11::TRUE, gles11::TRUE);
 }
 
 // --- Tiny bitmap font & overlay drawing implementation ---

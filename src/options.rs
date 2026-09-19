@@ -57,6 +57,87 @@ impl Default for CorruptionOptions {
     }
 }
 
+/// How `-[EAGLContext presentRenderbuffer:]` gets a rendered frame onto the
+/// host window when the app draws into a fullscreen `CAEAGLLayer`
+/// (`--present-mode=`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PresentMode {
+    /// Present on the GPU (copy the renderbuffer into a texture and draw a
+    /// quad into the window). If the first frames come out black even though
+    /// the renderbuffer has content, automatically fall back to `Readback`.
+    Auto,
+    /// Always present on the GPU, never fall back.
+    Direct,
+    /// Read the renderbuffer back to system RAM with `glReadPixels()` and
+    /// push it through the Core Animation compositor. Slow (a full GPU
+    /// pipeline stall plus two full-frame copies per frame), but it avoids
+    /// touching the app's GL state and is a useful workaround for broken
+    /// vendor OpenGL ES 1.1 drivers.
+    Readback,
+}
+
+impl PresentMode {
+    pub fn from_short_name(name: &str) -> Result<Self, ()> {
+        match name {
+            "auto" => Ok(Self::Auto),
+            "direct" => Ok(Self::Direct),
+            "readback" => Ok(Self::Readback),
+            _ => Err(()),
+        }
+    }
+}
+
+/// Which host OpenGL ES driver to load on Android (`--gl-driver=`). Has no
+/// effect on other platforms.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GlDriverPreference {
+    /// Use the bundled ANGLE driver for apps that may use OpenGL ES 1.1 (the
+    /// vendors' native ES 1.1 drivers are the buggy ones), and the vendor's
+    /// native driver for apps whose executable only imports OpenGL ES 2.0
+    /// shader entry points.
+    Auto,
+    /// Always use the bundled ANGLE driver (when it is available).
+    Angle,
+    /// Always use the vendor's native (system) OpenGL ES driver.
+    Native,
+}
+
+impl GlDriverPreference {
+    pub fn from_short_name(name: &str) -> Result<Self, ()> {
+        match name {
+            "auto" => Ok(Self::Auto),
+            "angle" => Ok(Self::Angle),
+            "native" | "system" => Ok(Self::Native),
+            _ => Err(()),
+        }
+    }
+}
+
+/// Whether host buffer swaps wait for the display's vertical refresh
+/// (`--vsync=`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum VsyncMode {
+    /// Android: off (the emulator paces frames itself and the Android
+    /// compositor already synchronises to the display, so a blocking swap only
+    /// adds stalls). Other platforms: leave the driver's default alone.
+    Auto,
+    /// Swap interval 1: every swap waits for the next vertical refresh.
+    On,
+    /// Swap interval 0: swaps never block.
+    Off,
+}
+
+impl VsyncMode {
+    pub fn from_short_name(name: &str) -> Result<Self, ()> {
+        match name {
+            "auto" => Ok(Self::Auto),
+            "on" | "1" => Ok(Self::On),
+            "off" | "0" => Ok(Self::Off),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Struct containing all user-configurable options.
 #[derive(Clone)]
 pub struct Options {
@@ -97,6 +178,27 @@ pub struct Options {
     pub print_fps: bool,
     pub fps_limit: Option<f64>,
     pub force_composition: bool,
+    /// See [PresentMode]. Can also be set with the `TOUCHHLE_PRESENT_MODE`
+    /// environment variable (the option takes precedence).
+    pub present_mode: PresentMode,
+    /// Issue a `glFinish()` before the presented renderbuffer is copied to
+    /// the window. Only needed for drivers that don't order the copy after
+    /// the app's draws correctly; costs a GPU pipeline stall per frame.
+    /// Can also be enabled with `TOUCHHLE_PRESENT_FINISH=1`.
+    pub present_finish: bool,
+    /// See [GlDriverPreference]. Can also be set with the
+    /// `TOUCHHLE_GL_DRIVER` environment variable (the option takes
+    /// precedence).
+    pub gl_driver: GlDriverPreference,
+    /// See [VsyncMode]. Can also be set with the `TOUCHHLE_VSYNC` environment
+    /// variable (the option takes precedence).
+    pub vsync: VsyncMode,
+    /// Android: give the emulator thread a higher scheduling priority and
+    /// report its per-frame CPU time to the OS performance hint manager
+    /// (ADPF), so the CPU governor keeps the core clocked for the emulated
+    /// workload instead of reacting to the idle time between frames. Can be
+    /// disabled with `--no-perf-hints` or `TOUCHHLE_PERF_HINTS=0`.
+    pub perf_hints: bool,
     /// Force EAGL `initWithAPI:` to create an OpenGL ES 2.0 context even when
     /// the app requested an OpenGL ES 1.1 context.
     ///
@@ -179,6 +281,24 @@ impl Default for Options {
             print_fps: false,
             fps_limit: Some(60.0),
             force_composition: false,
+            present_mode: std::env::var("TOUCHHLE_PRESENT_MODE")
+                .ok()
+                .and_then(|value| PresentMode::from_short_name(value.trim()).ok())
+                .unwrap_or(PresentMode::Auto),
+            present_finish: std::env::var_os("TOUCHHLE_PRESENT_FINISH")
+                .map(|value| value != "0")
+                .unwrap_or(false),
+            gl_driver: std::env::var("TOUCHHLE_GL_DRIVER")
+                .ok()
+                .and_then(|value| GlDriverPreference::from_short_name(value.trim()).ok())
+                .unwrap_or(GlDriverPreference::Auto),
+            vsync: std::env::var("TOUCHHLE_VSYNC")
+                .ok()
+                .and_then(|value| VsyncMode::from_short_name(value.trim()).ok())
+                .unwrap_or(VsyncMode::Auto),
+            perf_hints: std::env::var_os("TOUCHHLE_PERF_HINTS")
+                .map(|value| value != "0")
+                .unwrap_or(true),
             prefer_gles2_context: false,
             network_access: false,
             popup_errors: true,
@@ -404,6 +524,31 @@ impl Options {
             }
         } else if arg == "--force-composition" {
             self.force_composition = true;
+        } else if let Some(value) = arg.strip_prefix("--present-mode=") {
+            self.present_mode = PresentMode::from_short_name(value).map_err(|_| {
+                "Invalid value for --present-mode= (expected auto, direct or readback)"
+                    .to_string()
+            })?;
+        } else if arg == "--present-finish" {
+            self.present_finish = true;
+        } else if arg == "--no-present-finish" {
+            self.present_finish = false;
+        } else if let Some(value) = arg.strip_prefix("--gl-driver=") {
+            self.gl_driver = GlDriverPreference::from_short_name(value).map_err(|_| {
+                "Invalid value for --gl-driver= (expected auto, angle or native)".to_string()
+            })?;
+        } else if let Some(value) = arg.strip_prefix("--vsync=") {
+            self.vsync = VsyncMode::from_short_name(value).map_err(|_| {
+                "Invalid value for --vsync= (expected auto, on or off)".to_string()
+            })?;
+        } else if arg == "--vsync" {
+            self.vsync = VsyncMode::On;
+        } else if arg == "--no-vsync" {
+            self.vsync = VsyncMode::Off;
+        } else if arg == "--perf-hints" {
+            self.perf_hints = true;
+        } else if arg == "--no-perf-hints" {
+            self.perf_hints = false;
         } else if arg == "--prefer-gles2-context" {
             self.prefer_gles2_context = true;
         } else if arg == "--allow-network-access" {

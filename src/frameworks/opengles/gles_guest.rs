@@ -7,7 +7,7 @@
 //! Wrapper functions exposing OpenGL ES to the guest.
 
 use crate::dyld::{export_c_func, export_c_func_aliased, FunctionExports};
-use crate::frameworks::opengles::eagl::EAGLContextHostObject;
+use crate::frameworks::opengles::eagl::{EAGLContextHostObject, GLShadowState};
 use crate::gles::{gles11_raw as gles11, GLES};
 use crate::mem::{ConstPtr, ConstVoidPtr, GuestISize, GuestUSize, Mem, MutPtr, MutVoidPtr, Ptr};
 use crate::objc::nil;
@@ -93,6 +93,64 @@ where
         unsafe { gles.GetError() };
     }
     let res = f(gles.as_mut(), &mut env.mem);
+    if trace {
+        let err = unsafe { gles.GetError() };
+        if err != 0 {
+            log!(
+                "[--trace-gl-errors] glGetError() = {:#x} raised by host GLES call \
+                 dispatched from {}:{}",
+                err,
+                caller.file(),
+                caller.line()
+            );
+        }
+    }
+    #[allow(clippy::let_and_return)]
+    res
+}
+
+/// Like [with_ctx_and_mem], but the closure also gets the current context's
+/// [GLShadowState] (see its documentation). Use this for entry points that
+/// either change the mirrored state or want to consult it instead of asking
+/// the driver.
+#[track_caller]
+fn with_ctx_mem_and_shadow<T, U: Default>(env: &mut Environment, f: T) -> U
+where
+    T: FnOnce(&mut dyn GLES, &mut Mem, &mut GLShadowState) -> U,
+{
+    let Some(current_ctx) = *env
+        .framework_state
+        .opengles
+        .current_ctx_for_thread(env.current_thread)
+    else {
+        log_dbg!(
+            "Skipping GLES call without context (line {})",
+            std::panic::Location::caller().line()
+        );
+        return U::default();
+    };
+    let trace = env.options.trace_gl_errors;
+    let caller = std::panic::Location::caller();
+    let window = env
+        .window
+        .as_mut()
+        .expect("OpenGL ES is not supported in headless mode");
+    let host_obj = env.objc.borrow_mut::<EAGLContextHostObject>(current_ctx);
+    // Disjoint field borrows: the GL context box and the shadow state live
+    // side by side in the host object.
+    let shadow = &mut host_obj.shadow;
+    let Some(gles_ctx) = host_obj.gles_ctx.as_deref_mut() else {
+        log_dbg!(
+            "Skipping GLES call: current EAGLContext has no GLES backend (line {})",
+            caller.line()
+        );
+        return U::default();
+    };
+    let mut gles = gles_ctx.make_current(window);
+    if trace {
+        unsafe { gles.GetError() };
+    }
+    let res = f(gles.as_mut(), &mut env.mem, shadow);
     if trace {
         let err = unsafe { gles.GetError() };
         if err != 0 {
@@ -232,13 +290,27 @@ fn glGetError(env: &mut Environment) -> GLenum {
     })
 }
 fn glEnable(env: &mut Environment, cap: GLenum) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.Enable(cap) });
+    if cap == gles11::FOG {
+        with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+            shadow.fog_enabled = true;
+            gles.Enable(cap)
+        });
+    } else {
+        with_ctx_and_mem(env, |gles, _mem| unsafe { gles.Enable(cap) });
+    }
 }
 fn glIsEnabled(env: &mut Environment, cap: GLenum) -> GLboolean {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.IsEnabled(cap) })
 }
 fn glDisable(env: &mut Environment, cap: GLenum) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.Disable(cap) });
+    if cap == gles11::FOG {
+        with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+            shadow.fog_enabled = false;
+            gles.Disable(cap)
+        });
+    } else {
+        with_ctx_and_mem(env, |gles, _mem| unsafe { gles.Disable(cap) });
+    }
 }
 fn glClientActiveTexture(env: &mut Environment, texture: GLenum) {
     with_ctx_and_mem(env, |gles, _mem| unsafe {
@@ -690,20 +762,41 @@ fn glPointParameterxv(env: &mut Environment, pname: GLenum, params: ConstPtr<GLf
     })
 }
 
+/// Keep the fog range mirror (see [GLShadowState]) in sync with a
+/// `glFog{f,x}{,v}` call.
+fn shadow_fog_param(shadow: &mut GLShadowState, pname: GLenum, value: f32) {
+    match pname {
+        gles11::FOG_START => shadow.fog_start = value,
+        gles11::FOG_END => shadow.fog_end = value,
+        _ => (),
+    }
+}
 fn glFogf(env: &mut Environment, pname: GLenum, param: GLfloat) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.Fogf(pname, param) })
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        shadow_fog_param(shadow, pname, param);
+        gles.Fogf(pname, param)
+    })
 }
 fn glFogx(env: &mut Environment, pname: GLenum, param: GLfixed) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.Fogx(pname, param) })
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        shadow_fog_param(shadow, pname, param as f32 / 65536.0);
+        gles.Fogx(pname, param)
+    })
 }
 fn glFogfv(env: &mut Environment, pname: GLenum, params: ConstPtr<GLfloat>) {
-    with_ctx_and_mem(env, |gles, mem| {
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| {
+        if matches!(pname, gles11::FOG_START | gles11::FOG_END) {
+            shadow_fog_param(shadow, pname, mem.read(params));
+        }
         let params = mem.ptr_at(params, 4);
         unsafe { gles.Fogfv(pname, params) }
     })
 }
 fn glFogxv(env: &mut Environment, pname: GLenum, params: ConstPtr<GLfixed>) {
-    with_ctx_and_mem(env, |gles, mem| {
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| {
+        if matches!(pname, gles11::FOG_START | gles11::FOG_END) {
+            shadow_fog_param(shadow, pname, mem.read(params) as f32 / 65536.0);
+        }
         let params = mem.ptr_at(params, 4);
         unsafe { gles.Fogxv(pname, params) }
     })
@@ -794,14 +887,29 @@ fn glGenBuffers(env: &mut Environment, n: GLsizei, buffers: MutPtr<GLuint>) {
     })
 }
 fn glDeleteBuffers(env: &mut Environment, n: GLsizei, buffers: ConstPtr<GLuint>) {
-    with_ctx_and_mem(env, |gles, mem| {
+    if n <= 0 || buffers.is_null() {
+        // Nothing to delete (n < 0 would be GL_INVALID_VALUE on a real
+        // driver; don't turn it into a host-side panic).
+        return;
+    }
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| {
         let n_usize: GuestUSize = n.try_into().unwrap();
+        for i in 0..n_usize {
+            shadow.on_buffers_deleted(mem.read(buffers + i));
+        }
         let buffers = mem.ptr_at(buffers, n_usize);
         unsafe { gles.DeleteBuffers(n, buffers) }
     })
 }
 fn glBindBuffer(env: &mut Environment, target: GLenum, buffer: GLuint) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.BindBuffer(target, buffer) })
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        match target {
+            ARRAY_BUFFER => shadow.array_buffer = buffer,
+            ELEMENT_ARRAY_BUFFER => shadow.element_array_buffer = Some(buffer),
+            _ => (),
+        }
+        gles.BindBuffer(target, buffer)
+    })
 }
 fn glBufferData(
     env: &mut Environment,
@@ -860,21 +968,47 @@ fn glNormal3x(env: &mut Environment, nx: GLfixed, ny: GLfixed, nz: GLfixed) {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.Normal3x(nx, ny, nz) })
 }
 
+/// Is a buffer object bound to `GL_ARRAY_BUFFER` / `GL_ELEMENT_ARRAY_BUFFER`?
+///
+/// Answered from the [GLShadowState] mirror where possible. The element array
+/// binding lives in vertex array object state, so right after a VAO switch
+/// the mirror doesn't know it and we ask the driver once (and remember the
+/// answer until the next switch).
+unsafe fn buffer_is_bound(gles: &mut dyn GLES, shadow: &mut GLShadowState, target: GLenum) -> bool {
+    match target {
+        ARRAY_BUFFER => shadow.array_buffer != 0,
+        ELEMENT_ARRAY_BUFFER => {
+            if let Some(binding) = shadow.element_array_buffer {
+                binding != 0
+            } else {
+                let mut buffer_binding: GLint = 0;
+                gles.GetIntegerv(ELEMENT_ARRAY_BUFFER_BINDING, &mut buffer_binding);
+                // Internal state query: strict native drivers (e.g. Adreno
+                // GLES-CM) raise GL_INVALID_ENUM or GL_INVALID_OPERATION for
+                // these binding queries even though the returned value is
+                // valid. Swallow the error so the guest's error queue is not
+                // polluted.
+                let _ = gles.GetError();
+                shadow.element_array_buffer = Some(buffer_binding as GLuint);
+                buffer_binding != 0
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Translate the `pointer` argument of a `gl*Pointer` / `glDrawElements`
+/// call: if a buffer object is bound to `target`, it's an offset into that
+/// buffer and passes through unchanged; otherwise it's a guest pointer to
+/// client-side data that must become a host pointer.
 unsafe fn translate_pointer_or_offset_to_host(
     gles: &mut dyn GLES,
     mem: &Mem,
+    shadow: &mut GLShadowState,
     pointer_or_offset: ConstVoidPtr,
-    which_binding: GLenum,
+    target: GLenum,
 ) -> *const GLvoid {
-    let mut buffer_binding = 0;
-    gles.GetIntegerv(which_binding, &mut buffer_binding);
-    // Internal state query: strict native drivers (e.g. Adreno GLES-CM) raise
-    // GL_INVALID_ENUM or GL_INVALID_OPERATION for these binding queries even
-    // though the returned value is valid. Swallow the error so the guest's
-    // error queue is not polluted on every draw call (same rationale as
-    // clamp_fog_state_values).
-    let _ = gles.GetError();
-    if buffer_binding != 0 {
+    if buffer_is_bound(gles, shadow, target) {
         let offset = pointer_or_offset.to_bits();
         offset as usize as *const _
     } else if pointer_or_offset.is_null() {
@@ -915,16 +1049,14 @@ fn glColorPointer(
     stride: GLsizei,
     pointer: ConstVoidPtr,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        let pointer =
-            translate_pointer_or_offset_to_host(gles, mem, pointer, gles11::ARRAY_BUFFER_BINDING);
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let pointer = translate_pointer_or_offset_to_host(gles, mem, shadow, pointer, ARRAY_BUFFER);
         gles.ColorPointer(size, type_, stride, pointer)
     })
 }
 fn glNormalPointer(env: &mut Environment, type_: GLenum, stride: GLsizei, pointer: ConstVoidPtr) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        let pointer =
-            translate_pointer_or_offset_to_host(gles, mem, pointer, gles11::ARRAY_BUFFER_BINDING);
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let pointer = translate_pointer_or_offset_to_host(gles, mem, shadow, pointer, ARRAY_BUFFER);
         gles.NormalPointer(type_, stride, pointer)
     })
 }
@@ -935,9 +1067,8 @@ fn glTexCoordPointer(
     stride: GLsizei,
     pointer: ConstVoidPtr,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        let pointer =
-            translate_pointer_or_offset_to_host(gles, mem, pointer, gles11::ARRAY_BUFFER_BINDING);
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let pointer = translate_pointer_or_offset_to_host(gles, mem, shadow, pointer, ARRAY_BUFFER);
         gles.TexCoordPointer(size, type_, stride, pointer)
     })
 }
@@ -948,9 +1079,8 @@ fn glVertexPointer(
     stride: GLsizei,
     pointer: ConstVoidPtr,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        let pointer =
-            translate_pointer_or_offset_to_host(gles, mem, pointer, gles11::ARRAY_BUFFER_BINDING);
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let pointer = translate_pointer_or_offset_to_host(gles, mem, shadow, pointer, ARRAY_BUFFER);
         gles.VertexPointer(size, type_, stride, pointer)
     })
 }
@@ -964,9 +1094,8 @@ fn glPointSizePointerOES(
     stride: GLsizei,
     pointer: ConstVoidPtr,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        let pointer =
-            translate_pointer_or_offset_to_host(gles, mem, pointer, gles11::ARRAY_BUFFER_BINDING);
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let pointer = translate_pointer_or_offset_to_host(gles, mem, shadow, pointer, ARRAY_BUFFER);
         gles.PointSizePointerOES(type_, stride, pointer)
     })
 }
@@ -1220,8 +1349,10 @@ fn glPopGroupMarkerEXT(_env: &mut Environment) {
 }
 
 fn glBindVertexArrayOES(env: &mut Environment, array: GLuint) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
         if gles.supports_vao_oes() {
+            // The element array buffer binding is VAO state.
+            shadow.invalidate_vao_state();
             gles.BindVertexArrayOES(array);
         }
         // Otherwise no-op: without real VAO support all vertex state lives in
@@ -1229,8 +1360,10 @@ fn glBindVertexArrayOES(env: &mut Environment, array: GLuint) {
     });
 }
 fn glDeleteVertexArraysOES(env: &mut Environment, n: GLsizei, arrays: ConstPtr<GLuint>) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
         if gles.supports_vao_oes() {
+            // Deleting the bound VAO rebinds the default one.
+            shadow.invalidate_vao_state();
             let slice = mem.bytes_at(arrays.cast(), (n.max(0) as GuestUSize) * 4);
             gles.DeleteVertexArraysOES(n, slice.as_ptr().cast());
         }
@@ -1276,9 +1409,8 @@ fn glMatrixIndexPointerOES(
     stride: GLsizei,
     pointer: ConstVoidPtr,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        let pointer =
-            translate_pointer_or_offset_to_host(gles, mem, pointer, gles11::ARRAY_BUFFER_BINDING);
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let pointer = translate_pointer_or_offset_to_host(gles, mem, shadow, pointer, ARRAY_BUFFER);
         gles.MatrixIndexPointerOES(size, type_, stride, pointer)
     })
 }
@@ -1289,9 +1421,8 @@ fn glWeightPointerOES(
     stride: GLsizei,
     pointer: ConstVoidPtr,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        let pointer =
-            translate_pointer_or_offset_to_host(gles, mem, pointer, gles11::ARRAY_BUFFER_BINDING);
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let pointer = translate_pointer_or_offset_to_host(gles, mem, shadow, pointer, ARRAY_BUFFER);
         gles.WeightPointerOES(size, type_, stride, pointer)
     })
 }
@@ -1326,8 +1457,15 @@ fn glGetBufferPointervOES(
 /// queries return GL_INVALID_OPERATION and poison the error queue, so we only
 /// apply this on the GLES1-on-GL2 emulation backend where the queries are
 /// supported.
-unsafe fn guard_client_vertex_arrays(gles: &mut dyn GLES, mem: &Mem) -> Vec<GLuint> {
-    if !gles.is_gles1_on_gl2() {
+unsafe fn guard_client_vertex_arrays(
+    gles: &mut dyn GLES,
+    mem: &Mem,
+    shadow: &GLShadowState,
+) -> Vec<GLuint> {
+    // PERF: fixed-function-only apps never enable a generic vertex attribute
+    // array, so there is nothing to guard and no reason to spend 1 + 2×N
+    // driver queries per draw call on it.
+    if !shadow.generic_attribs_used || !gles.is_gles1_on_gl2() {
         return Vec::new();
     }
 
@@ -1446,9 +1584,9 @@ fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsize
         warn_invalid_draw_mode("glDrawArrays", mode);
         return;
     }
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        let disabled_arrays = guard_client_vertex_arrays(gles, mem);
-        let fog_state_backup = clamp_fog_state_values(gles);
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let disabled_arrays = guard_client_vertex_arrays(gles, mem, shadow);
+        let fog_state_backup = clamp_fog_state_values(gles, shadow);
         if crate::env_flag_cached!("TOUCHHLE_POTATO_NATIVE_GLES2_PC_STATE") {
             static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -1507,9 +1645,9 @@ fn glDrawElements(
         warn_invalid_draw_mode("glDrawElements", mode);
         return;
     }
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        let disabled_arrays = guard_client_vertex_arrays(gles, mem);
-        let fog_state_backup = clamp_fog_state_values(gles);
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let disabled_arrays = guard_client_vertex_arrays(gles, mem, shadow);
+        let fog_state_backup = clamp_fog_state_values(gles, shadow);
         if crate::env_flag_cached!("TOUCHHLE_POTATO_NATIVE_GLES2_PC_STATE") {
             static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -1525,12 +1663,8 @@ fn glDrawElements(
             gles.Disable(0x0b44); // GL_CULL_FACE
         }
 
-        let indices = translate_pointer_or_offset_to_host(
-            gles,
-            mem,
-            indices,
-            gles11::ELEMENT_ARRAY_BUFFER_BINDING,
-        );
+        let indices =
+            translate_pointer_or_offset_to_host(gles, mem, shadow, indices, ELEMENT_ARRAY_BUFFER);
         gles.DrawElements(mode, count, type_, indices);
         restore_fog_state_values(gles, fog_state_backup);
         for index in disabled_arrays {
@@ -3556,7 +3690,8 @@ fn glShaderSource(
     });
 }
 fn glEnableVertexAttribArray(env: &mut Environment, index: GLuint) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        shadow.generic_attribs_used = true;
         gles.EnableVertexAttribArray(index)
     });
 }
@@ -3578,10 +3713,8 @@ fn glVertexAttribPointer(
     // buffer (not as a pointer into client memory) and we can pass it through
     // as-is. Otherwise we need to translate the guest pointer to a host
     // pointer.
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        let mut bound: GLint = 0;
-        gles.GetIntegerv(gles11::ARRAY_BUFFER_BINDING, &mut bound);
-        let host_ptr = if bound == 0 {
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let host_ptr = if !buffer_is_bound(gles, shadow, ARRAY_BUFFER) {
             if pointer.is_null() {
                 std::ptr::null()
             } else {
@@ -4021,7 +4154,9 @@ fn glGenVertexArrays(env: &mut Environment, n: GLsizei, arrays: MutPtr<GLuint>) 
 fn glBindVertexArray(env: &mut Environment, array: GLuint) {
     let is_es3 = with_ctx_and_mem(env, |gles, _mem| gles.is_es3());
     if is_es3 {
-        with_ctx_and_mem(env, |gles, _mem| unsafe {
+        with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+            // The element array buffer binding is VAO state.
+            shadow.invalidate_vao_state();
             gles.BindVertexArray(array);
         });
     } else {
@@ -4031,7 +4166,8 @@ fn glBindVertexArray(env: &mut Environment, array: GLuint) {
 fn glDeleteVertexArrays(env: &mut Environment, n: GLsizei, arrays: ConstPtr<GLuint>) {
     let is_es3 = with_ctx_and_mem(env, |gles, _mem| gles.is_es3());
     if is_es3 {
-        with_ctx_and_mem(env, |gles, mem| unsafe {
+        with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+            shadow.invalidate_vao_state();
             let slice = mem.bytes_at(arrays.cast(), (n as GuestUSize) * 4);
             gles.DeleteVertexArrays(n, slice.as_ptr().cast());
         });
@@ -5432,29 +5568,28 @@ fn glProgramParameteri(env: &mut Environment, program: GLuint, pname: GLenum, va
     });
 }
 
-unsafe fn clamp_fog_state_values(gles: &mut dyn GLES) -> Option<(f32, f32)> {
-    // Some drivers (e.g. Mesa's GLES-CM 1.1 and several mobile GLES2
-    // implementations) raise GL_INVALID_ENUM for fog-state queries made
-    // around draw calls, which pollutes the GL error queue on *every*
-    // draw. The clamp only matters for the fog-division workaround on
-    // desktop GL, so swallow any error the queries raise and restore a
-    // clean error state for the caller.
-    let mut fog_enabled: GLboolean = 0;
-    gles.GetBooleanv(gles11::FOG, &mut fog_enabled);
-    if gles.GetError() != 0 {
-        // The driver rejected the fog query; skip the clamp entirely.
-        gles.GetError();
+/// Work around the fog-division-by-zero problem: with linear fog and
+/// `GL_FOG_START == GL_FOG_END`, the fog factor `(end - z) / (end - start)`
+/// is NaN. Apple's PowerVR driver tolerates that, desktop GL drivers turn it
+/// into garbage (black or fully fogged geometry), so nudge the range apart
+/// for the duration of the draw.
+///
+/// PERF: this used to query `GL_FOG`, `GL_FOG_START` and `GL_FOG_END` from the
+/// driver (plus two `glGetError()` round-trips to swallow the errors strict
+/// drivers raise) on every single draw call. The guest is the only thing that
+/// can change that state, so it's answered from the [GLShadowState] mirror
+/// now, which costs nothing when fog is off (the overwhelmingly common case).
+unsafe fn clamp_fog_state_values(
+    gles: &mut dyn GLES,
+    shadow: &GLShadowState,
+) -> Option<(f32, f32)> {
+    if !shadow.fog_enabled {
         return None;
     }
-    let mut fog_start: GLfloat = 0.0;
-    let mut fog_end: GLfloat = 0.0;
-    gles.GetFloatv(gles11::FOG_START, &mut fog_start);
-    gles.GetFloatv(gles11::FOG_END, &mut fog_end);
-    let _ = gles.GetError();
-    if fog_enabled != 0 && fog_start == fog_end {
+    let (fog_start, fog_end) = (shadow.fog_start, shadow.fog_end);
+    if fog_start == fog_end {
         let new_fog_start = fog_end - 0.001;
         gles.Fogf(gles11::FOG_START, new_fog_start);
-        gles.GetError();
         return Some((fog_start, fog_end));
     }
     None
