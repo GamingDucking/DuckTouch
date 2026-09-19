@@ -530,16 +530,21 @@ unsafe fn build_atlas(gles: &mut dyn GLES) -> Option<Atlas> {
     }
     let cell_h = max_y - min_y;
     let mut atlas_w = 0.0f32;
+    // Pixel-space U range of each glyph inside the atlas row. Converted to
+    // 0..1 UVs once the final atlas width is known (dividing by the running
+    // width here AND by the final width below would corrupt the coordinates).
+    let mut u_ranges_px: Vec<(f32, f32)> = Vec::with_capacity(ATLAS_CHARS.len());
     let mut cells: Vec<Option<GlyphCell>> = Vec::with_capacity(ATLAS_CHARS.len());
     for (_ch, advance, _origin, dims, _pixels) in &raw {
         let gw = if dims.0 > 0 { dims.0 as f32 } else { 0.0 };
         let u0 = atlas_w + 1.0; // 1px padding to avoid bleeding
         let u1 = u0 + gw;
+        u_ranges_px.push((u0, u1));
         cells.push(Some(GlyphCell {
-            u0: u0 / atlas_w.max(1.0),
+            u0: 0.0,
             v0: 0.0,
-            u1: u1 / atlas_w.max(1.0),
-            v1: cell_h / cell_h.max(1.0),
+            u1: 0.0,
+            v1: 0.0,
             advance: *advance,
             draw_dx: 0.0,
             draw_dy: 0.0,
@@ -552,13 +557,17 @@ unsafe fn build_atlas(gles: &mut dyn GLES) -> Option<Atlas> {
     let atlas_w = atlas_w.ceil() as usize;
     let atlas_h = cell_h.ceil() as usize;
     let mut bitmap = vec![0u8; atlas_w * atlas_h * 4];
-    for (cell, (_ch, _adv, origin, dims, pixels)) in cells.iter_mut().zip(raw.iter()) {
+    for (i, (cell, (_ch, _adv, origin, dims, pixels))) in
+        cells.iter_mut().zip(raw.iter()).enumerate()
+    {
         let Some(cell) = cell else { continue };
         if dims.0 <= 0 || dims.1 <= 0 {
             continue;
         }
-        let bx = (cell.u0 * atlas_w as f32).round() as usize;
-        let by = ((origin.1 - min_y).round() as usize).min(atlas_h - 1);
+        let (u0_px, u1_px) = u_ranges_px[i];
+        let bx = u0_px.round() as usize;
+        // Vertical placement of this glyph's bitmap inside the atlas.
+        let by = ((origin.1 - min_y).round() as usize).min(atlas_h.saturating_sub(1));
         for y in 0..dims.1 as usize {
             for x in 0..dims.0 as usize {
                 let coverage = pixels[y * dims.0 as usize + x];
@@ -571,8 +580,18 @@ unsafe fn build_atlas(gles: &mut dyn GLES) -> Option<Atlas> {
                 }
             }
         }
-        cell.u0 /= atlas_w as f32;
-        cell.u1 /= atlas_w as f32;
+        // Texture coordinates. GL textures have their origin at the BOTTOM
+        // left (the first byte of the uploaded data is v=0), while our bitmap
+        // has row 0 at the top — so v grows downwards through the bitmap as
+        // the coordinate DECREASES from 1.
+        let atlas_h_f = atlas_h as f32;
+        let atlas_w_f = atlas_w as f32;
+        cell.u0 = u0_px / atlas_w_f;
+        cell.u1 = u1_px / atlas_w_f;
+        // v0 = top of the glyph band, v1 = bottom (matches the quad corners
+        // in push_text, where v0 is used at the top edge).
+        cell.v0 = 1.0 - by as f32 / atlas_h_f;
+        cell.v1 = 1.0 - (by as f32 + dims.1 as f32) / atlas_h_f;
         cell.draw_dx = 0.0;
         cell.draw_dy = origin.1 - min_y;
         cell.draw_w = dims.0 as f32;
