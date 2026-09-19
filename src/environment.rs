@@ -164,6 +164,7 @@ pub struct Environment {
     /// Optional RTCV-style game-corruption engine. Always present, but only
     /// does anything when enabled via the `--corrupt*` options.
     corruptor: crate::corrupt::Corruptor,
+    trainer: crate::trainer::Trainer,
 }
 
 /// What to do next when executing this thread.
@@ -866,8 +867,10 @@ impl Environment {
             guest_control_flow_redirected: false,
             host_to_guest_stack_frames: Vec::new(),
             corruptor: crate::corrupt::Corruptor::default(),
+            trainer: crate::trainer::Trainer::new(false),
         };
 
+        env.trainer = crate::trainer::Trainer::new(!env.options.trainer_disabled);
         env.corruptor = crate::corrupt::Corruptor::new(env.options.corruption.clone());
         if env.corruptor.is_enabled() {
             log!(
@@ -1031,6 +1034,7 @@ impl Environment {
             guest_control_flow_redirected: false,
             host_to_guest_stack_frames: Vec::new(),
             corruptor: crate::corrupt::Corruptor::default(),
+            trainer: crate::trainer::Trainer::new(false),
         };
 
         env.set_up_initial_env_vars();
@@ -1099,6 +1103,7 @@ impl Environment {
             guest_control_flow_redirected: false,
             host_to_guest_stack_frames: Vec::new(),
             corruptor: crate::corrupt::Corruptor::default(),
+            trainer: crate::trainer::Trainer::new(false),
         }
     }
 
@@ -1688,6 +1693,17 @@ impl Environment {
                 let mut corruptor = std::mem::take(&mut self.corruptor);
                 corruptor.tick(&mut self.mem);
                 self.corruptor = corruptor;
+            }
+            // Game trainer (GameGuardian-style memory search/patch + on-screen
+            // UI). No-op unless enabled (default on for games).
+            {
+                let app_id = self.bundle.bundle_identifier().to_string();
+                let mut trainer = std::mem::replace(
+                    &mut self.trainer,
+                    crate::trainer::Trainer::new(false),
+                );
+                trainer.tick(&mut self.mem, Some(app_id.as_str()));
+                self.trainer = trainer;
             }
             let mut kill_current_thread = false;
             if let Some(w) = self.window.as_mut() {

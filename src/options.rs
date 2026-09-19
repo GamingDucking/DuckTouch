@@ -149,6 +149,8 @@ pub struct Options {
     /// `--device-family=auto` (from the host display) or via the explicit
     /// `--screen-size=WxH` override below.
     pub host_screen_size: Option<(u32, u32)>,
+    /// Disable the GameGuardian-style memory trainer overlay.
+    pub trainer_disabled: bool,
     pub initial_orientation: DeviceOrientation,
     /// iOS version reported to guest applications. `None` uses the latest compatibility version.
     pub ios_version: Option<(i32, i32, i32)>,
@@ -255,6 +257,7 @@ impl Default for Options {
     fn default() -> Self {
         Options {
             fullscreen: false,
+            trainer_disabled: false,
             device_family: None,
             auto_device_family: false,
             host_screen_size: None,
@@ -584,6 +587,10 @@ impl Options {
             self.corruption.enabled = true;
         } else if arg == "--no-corrupt-game" {
             self.corruption.enabled = false;
+        } else if arg == "--no-trainer" {
+            self.trainer_disabled = true;
+        } else if arg == "--trainer" {
+            self.trainer_disabled = false;
         } else if let Some(value) = arg.strip_prefix("--corrupt-interval=") {
             let frames: u32 = value
                 .parse()
