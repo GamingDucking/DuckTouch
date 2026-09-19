@@ -1021,8 +1021,11 @@ fn localized_info_plist_strings(env: &mut Environment, bundle: id) -> id {
         return dict;
     }
     // `load_strings_as_standard_format` returns a +1 dictionary; hand it
-    // back as an autoreleased one so both callers here behave alike.
-    autorelease(env, load_strings_as_standard_format(env, url))
+    // back as an autoreleased one so both callers here behave alike. (The
+    // value has to be bound to a local first: passing `env` to both calls in
+    // one expression would borrow it mutably twice, which E0499 rejects.)
+    let strings = load_strings_as_standard_format(env, url);
+    autorelease(env, strings)
 }
 
 /// Build the value of `-[NSBundle localizedInfoDictionary]` for a bundle.
