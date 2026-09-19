@@ -90,7 +90,7 @@ fn preview_skips_overflow_without_writing_anything() {
         result(&mut mem, base + 8, VType::U8, "100"),
     ];
     let before = snapshot(&mem, base, 64);
-    let plan = plan_bulk(&mem, &hits, VType::Auto, "999999").unwrap();
+    let plan = plan_bulk(&mem, &hits, VType::Auto, "999999", true).unwrap();
     assert_eq!((plan.writes.len(), plan.skipped), (1, 1));
     assert_eq!(snapshot(&mem, base, 64), before);
     assert_eq!(hits[0].bits, 100);
@@ -104,7 +104,7 @@ fn changing_ui_type_cannot_widen_a_bulk_write() {
     let (mut mem, base) = memory(64);
     let hits = [result(&mut mem, base, VType::U8, "100")];
     let before = snapshot(&mem, base, 64);
-    assert!(plan_bulk(&mem, &hits, VType::I32, "999999").is_err());
+    assert!(plan_bulk(&mem, &hits, VType::I32, "999999", true).is_err());
     assert_eq!(snapshot(&mem, base, 64), before);
 }
 
@@ -116,12 +116,12 @@ fn overlapping_results_are_all_skipped_not_arbitrarily_selected() {
     let good = result(&mut mem, base + 8, VType::I32, "600");
     let before = snapshot(&mem, base, 64);
     for hits in [[wide, narrow, good], [narrow, wide, good], [wide, wide, good]] {
-        let plan = plan_bulk(&mem, &hits, VType::Auto, "1000").unwrap();
+        let plan = plan_bulk(&mem, &hits, VType::Auto, "1000", true).unwrap();
         assert_eq!((plan.writes.len(), plan.skipped), (1, 2));
         assert_eq!(snapshot(&mem, base, 64), before);
     }
     let mut hits = [wide, narrow, good];
-    let plan = plan_bulk(&mem, &hits, VType::Auto, "1000").unwrap();
+    let plan = plan_bulk(&mem, &hits, VType::Auto, "1000", true).unwrap();
     assert_eq!(apply_bulk(&mut mem, &mut hits, &plan), Ok(1));
     assert_eq!(VType::I32.read_at(&mem, base), Some(600));
     assert_eq!(VType::I32.read_at(&mem, base + 8), Some(1000));
@@ -136,7 +136,7 @@ fn more_than_32_matches_are_previewed_and_written_without_truncation() {
         .map(|i| result(&mut mem, base + i as u32 * 4, VType::I32, "135"))
         .collect();
     let before = snapshot(&mem, base, size);
-    let plan = plan_bulk(&mem, &hits, VType::Auto, "999").unwrap();
+    let plan = plan_bulk(&mem, &hits, VType::Auto, "999", true).unwrap();
     assert_eq!((plan.writes.len(), plan.skipped), (COUNT, 0));
     assert_eq!(snapshot(&mem, base, size), before);
     assert_eq!(apply_bulk(&mut mem, &mut hits, &plan), Ok(COUNT));
@@ -151,7 +151,7 @@ fn changed_or_freed_memory_after_preview_prevents_every_write() {
         result(&mut mem, base, VType::I32, "600"),
         result(&mut mem, other, VType::I32, "600"),
     ];
-    let plan = plan_bulk(&mem, &hits, VType::Auto, "1000").unwrap();
+    let plan = plan_bulk(&mem, &hits, VType::Auto, "1000", true).unwrap();
     assert!(VType::I32.write_at(&mut mem, other, 601));
     assert!(apply_bulk(&mut mem, &mut hits, &plan).is_err());
     assert_eq!(VType::I32.read_at(&mem, base), Some(600));
@@ -172,7 +172,7 @@ fn ineligible_hits_are_filtered_and_counted() {
     let unchanged = result(&mut mem, base + 24, VType::I32, "1000");
     let mut hits = [good, unaligned, outside, stale, unchanged];
     let before = snapshot(&mem, base, 64);
-    let plan = plan_bulk(&mem, &hits, VType::Auto, "1000").unwrap();
+    let plan = plan_bulk(&mem, &hits, VType::Auto, "1000", true).unwrap();
     assert_eq!((plan.writes.len(), plan.skipped), (1, 4));
     assert_eq!(snapshot(&mem, base, 64), before);
     assert_eq!(apply_bulk(&mut mem, &mut hits, &plan), Ok(1));
@@ -187,7 +187,7 @@ fn valid_batch_preserves_types_neighbours_and_displayed_values() {
         result(&mut mem, base + 8, VType::U16, "600"),
         result(&mut mem, base + 16, VType::F32, "600"),
     ];
-    let plan = plan_bulk(&mem, &hits, VType::Auto, "1000").unwrap();
+    let plan = plan_bulk(&mem, &hits, VType::Auto, "1000", true).unwrap();
     assert_eq!(apply_bulk(&mut mem, &mut hits, &plan), Ok(3));
     for hit in hits {
         let expected = hit.vtype.parse("1000").unwrap();
@@ -204,15 +204,15 @@ fn invalid_memory_accesses_fail_without_a_panic_or_sink_write() {
         assert_eq!(VType::I32.read_at(&mem, addr), None);
         assert!(!VType::I32.write_at(&mut mem, addr, 123));
     }
-    assert!(plan_bulk(&mem, &[], VType::Auto, "1000").is_err());
+    assert!(plan_bulk(&mem, &[], VType::Auto, "1000", true).is_err());
 }
 
 fn bulk_command(text: &str, confirm: bool) -> TrainerCmd {
-    TrainerCmd::SetAll { vtype: VType::I32, text: text.to_string(), confirm }
+    TrainerCmd::SetAll { vtype: VType::I32, text: text.to_string(), confirm, safe_mode: true }
 }
 
 #[test]
-fn safe_all_requires_an_explicit_confirmation_of_the_preview() {
+fn set_all_requires_an_explicit_confirmation_of_the_preview() {
     let (mut mem, base) = memory(64);
     let mut trainer = Trainer::new(true);
     trainer.state.results = vec![result(&mut mem, base, VType::I32, "135")];
@@ -263,4 +263,66 @@ fn cancelled_or_expired_confirmation_cannot_write() {
     trainer.handle_command(&mut mem, bulk_command("999", true));
     assert_eq!(VType::I32.read_at(&mem, base), Some(135));
     assert!(trainer.state.pending_bulk.is_some());
+}
+
+
+#[test]
+fn safe_mode_filters_unaligned_hits_while_normal_mode_includes_them() {
+    let (mut mem, base) = memory(64);
+    let mut hits = [
+        result(&mut mem, base, VType::I32, "135"),
+        result(&mut mem, base + 9, VType::I32, "135"),
+    ];
+    let safe = plan_bulk(&mem, &hits, VType::I32, "999", true).unwrap();
+    assert_eq!((safe.writes.len(), safe.skipped), (1, 1));
+    let normal = plan_bulk(&mem, &hits, VType::I32, "999", false).unwrap();
+    assert_eq!((normal.writes.len(), normal.skipped), (2, 0));
+    assert_eq!(VType::I32.read_at(&mem, base + 9), Some(135));
+    assert_eq!(apply_bulk(&mut mem, &mut hits, &normal), Ok(2));
+    assert_eq!(VType::I32.read_at(&mem, base + 9), Some(999));
+}
+
+#[test]
+fn mode_change_cannot_confirm_another_modes_preview() {
+    let (mut mem, base) = memory(64);
+    let mut trainer = Trainer::new(true);
+    trainer.state.results = vec![result(&mut mem, base, VType::I32, "135")];
+    trainer.handle_command(&mut mem, bulk_command("999", false));
+    let normal_confirm = TrainerCmd::SetAll {
+        vtype: VType::I32, text: "999".to_string(), confirm: true, safe_mode: false,
+    };
+    trainer.handle_command(&mut mem, normal_confirm.clone());
+    assert_eq!(VType::I32.read_at(&mem, base), Some(135));
+    trainer.handle_command(&mut mem, normal_confirm);
+    assert_eq!(VType::I32.read_at(&mem, base), Some(999));
+}
+
+#[test]
+fn normal_mode_still_rejects_invalid_types_and_expired_addresses() {
+    let (mut mem, base) = memory(64);
+    let good = result(&mut mem, base, VType::I32, "135");
+    let narrow = result(&mut mem, base + 8, VType::U8, "135");
+    let invalid = SearchResult { addr: base + 64, ..good };
+    let before = snapshot(&mem, base, 64);
+    assert!(plan_bulk(&mem, &[good, narrow], VType::Auto, "999", false).is_err());
+    assert!(plan_bulk(&mem, &[good, invalid], VType::I32, "999", false).is_err());
+    assert_eq!(snapshot(&mem, base, 64), before);
+}
+
+#[test]
+fn normal_mode_reports_actual_contents_after_overlapping_writes() {
+    let (mut mem, base) = memory(64);
+    let wide = result(&mut mem, base, VType::I32, "135");
+    let narrow = SearchResult {
+        addr: base + 2, vtype: VType::U16, bits: 0, changed: false,
+    };
+    let mut hits = [wide, narrow];
+    assert!(plan_bulk(&mem, &hits, VType::Auto, "999", true).is_err());
+    let plan = plan_bulk(&mem, &hits, VType::Auto, "999", false).unwrap();
+    assert_eq!(apply_bulk(&mut mem, &mut hits, &plan), Ok(2));
+    assert_eq!(hits[0].bits, (999 << 16) | 999);
+    assert_eq!(hits[1].bits, 999);
+    for hit in hits {
+        assert_eq!(hit.vtype.read_at(&mem, hit.addr), Some(hit.bits));
+    }
 }

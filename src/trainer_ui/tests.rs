@@ -7,6 +7,8 @@
 use super::*;
 use crate::gles::{GLenum, GLfloat, GLsizei, GLvoid};
 
+static INPUT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 #[derive(Debug, PartialEq)]
 struct Draw {
     texture: Option<GLuint>,
@@ -179,6 +181,11 @@ fn panel_has_unique_actions_and_results_header_below_keypad() {
         assert_eq!(ids.len(), panel.widgets.len(), "duplicate widget IDs");
         assert_eq!(panel.widgets.iter().filter(|&&(id, _)| id == W_SET_ALL).count(), 1);
         assert_eq!(panel.widgets.iter().filter(|&&(id, _)| id == W_DUMP).count(), 1);
+        let toggle = panel.widgets.iter().find(|&&(id, _)| id == W_SAFE_MODE).unwrap().1;
+        let type_button = panel.widgets.iter().find(|&&(id, _)| id == W_TYPE).unwrap().1;
+        assert_eq!(toggle.y, type_button.y);
+        assert!(toggle.x >= type_button.x + type_button.w);
+        assert!(toggle.x + toggle.w <= panel.rect.x + panel.rect.w);
         let scroll = panel.widgets.iter().find(|&&(id, _)| id == W_SCROLL_UP).unwrap().1;
         assert_eq!(panel.results_header_y, scroll.y);
         for &(id, rect) in &panel.widgets {
@@ -190,7 +197,8 @@ fn panel_has_unique_actions_and_results_header_below_keypad() {
 }
 
 #[test]
-fn dump_and_safe_all_dispatch_distinct_commands() {
+fn dump_and_set_all_dispatch_distinct_commands() {
+    let _guard = INPUT_TEST_LOCK.lock().unwrap();
     let mut ui = TrainerUi::new();
     ui.set_text = "999".to_string();
     take_commands();
@@ -212,4 +220,42 @@ fn dump_and_safe_all_dispatch_distinct_commands() {
     activate_widget(&mut ui, W_TYPE);
     assert!(!ui.bulk_preview);
     assert!(matches!(take_commands().as_slice(), [TrainerCmd::CancelBulk]));
+}
+
+
+#[test]
+fn safe_mode_latches_and_is_sent_with_bulk_commands() {
+    let _guard = INPUT_TEST_LOCK.lock().unwrap();
+    let mut ui = TrainerUi::new();
+    ui.set_text = "999".to_string();
+    assert!(ui.safe_mode);
+    assert_eq!(safe_mode_colors(ui.safe_mode), (COL_SAFE_MODE_ON, COL_SAFE_MODE_TEXT));
+    take_commands();
+
+    ui.bulk_preview = true;
+    activate_widget(&mut ui, W_SAFE_MODE);
+    assert!(!ui.safe_mode);
+    assert!(!ui.bulk_preview);
+    assert_eq!(safe_mode_colors(ui.safe_mode), (COL_WIDGET, COL_TEXT));
+    assert!(matches!(take_commands().as_slice(), [TrainerCmd::CancelBulk]));
+    activate_widget(&mut ui, W_SET_ALL);
+    assert!(matches!(take_commands().as_slice(), [TrainerCmd::SetAll {
+        safe_mode: false, confirm: false, ..
+    }]));
+    assert!(!ui.safe_mode);
+
+    activate_widget(&mut ui, W_SAFE_MODE);
+    assert!(ui.safe_mode);
+    // Other controls and closing/reopening the panel do not unlatch it.
+    for id in [W_TYPE, W_FIELD_SET, W_CLOSE, W_BUTTON, W_RESET] {
+        activate_widget(&mut ui, id);
+        assert!(ui.safe_mode);
+        assert_eq!(safe_mode_colors(ui.safe_mode).0, COL_SAFE_MODE_ON);
+    }
+    take_commands();
+    activate_widget(&mut ui, W_SET_ALL);
+    assert!(matches!(take_commands().as_slice(), [TrainerCmd::SetAll {
+        safe_mode: true, confirm: false, ..
+    }]));
+    assert!(ui.safe_mode);
 }

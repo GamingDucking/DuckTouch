@@ -32,6 +32,7 @@ pub(super) struct BulkPlan {
     // Include the input even when two types happen to produce equal bits.
     requested_type: VType,
     text: String,
+    safe_mode: bool,
     pub(super) writes: Vec<BulkWrite>,
     pub(super) skipped: usize,
 }
@@ -54,6 +55,7 @@ pub(super) fn plan_bulk(
     results: &[SearchResult],
     requested_type: VType,
     text: &str,
+    safe_mode: bool,
 ) -> Result<BulkPlan, &'static str> {
     if results.is_empty() {
         return Err("NO RESULTS TO SET");
@@ -65,16 +67,30 @@ pub(super) fn plan_bulk(
     for (index, result) in results.iter().enumerate() {
         let t = result.vtype;
         if t == VType::Auto || (requested_type != VType::Auto && requested_type != t) {
+            if !safe_mode {
+                return Err("TYPE CHANGED: SEARCH AGAIN");
+            }
             continue;
         }
-        let Some(after) = t.parse(text) else { continue };
-        if result.addr % t.size() != 0 || after == result.bits {
+        let Some(after) = t.parse(text) else {
+            if !safe_mode {
+                return Err("VALUE OUT OF RANGE: CHECK TYPE");
+            }
+            continue;
+        };
+        if (safe_mode && result.addr % t.size() != 0) || after == result.bits {
             continue;
         }
         let Some(allocation) = containing_allocation(&allocations, result.addr, t.size()) else {
+            if !safe_mode {
+                return Err("EXPIRED ADDRESS: SEARCH AGAIN");
+            }
             continue;
         };
         if t.read_at(mem, result.addr) != Some(result.bits) {
+            if !safe_mode {
+                return Err("VALUES CHANGED: REFINE FIRST");
+            }
             continue;
         }
         candidates.push(BulkWrite {
@@ -88,8 +104,9 @@ pub(super) fn plan_bulk(
     }
     candidates.sort_unstable_by_key(|write| (write.addr, write.end()));
 
-    // Reject every member of an overlapping group, not an arbitrary winner.
-    // This also handles identical addresses and chains of overlapping ranges.
+    // Safe mode rejects every member of an overlapping group, not an
+    // arbitrary winner. With it off, the user explicitly opts into writing
+    // these matches too; bounds, type and confirmation checks still apply.
     let mut conflicts = vec![false; candidates.len()];
     let mut first = 0;
     while first < candidates.len() {
@@ -99,7 +116,7 @@ pub(super) fn plan_bulk(
             end = end.max(candidates[next].end());
             next += 1;
         }
-        if next > first + 1 {
+        if safe_mode && next > first + 1 {
             conflicts[first..next].fill(true);
         }
         first = next;
@@ -111,6 +128,7 @@ pub(super) fn plan_bulk(
         return Err("NO ELIGIBLE HITS: REFINE / CHECK TYPE");
     }
     Ok(BulkPlan {
+        safe_mode,
         requested_type,
         text: text.trim().to_string(),
         skipped: results.len() - writes.len(),
@@ -144,8 +162,12 @@ pub(super) fn apply_bulk(
         if !write.vtype.write_at(mem, write.addr, write.after) {
             return Err("WRITE FAILED (BAD ADDR?)");
         }
+    }
+    // In normal mode overlapping writes can overwrite each other. Display
+    // the actual final contents, not each intermediate requested value.
+    for write in &plan.writes {
         let result = &mut results[write.index];
-        result.bits = write.after;
+        result.bits = write.vtype.read_at(mem, write.addr).unwrap();
         result.changed = false;
     }
     Ok(plan.writes.len())

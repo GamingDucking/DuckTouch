@@ -32,7 +32,7 @@ pub enum TrainerCmd {
     Refine { vtype: VType, text: String },
     Reset,
     Set { vtype: VType, text: String },
-    SetAll { vtype: VType, text: String, confirm: bool },
+    SetAll { vtype: VType, text: String, confirm: bool, safe_mode: bool },
     CancelBulk,
     Freeze { vtype: VType, text: String },
     UnfreezeAll,
@@ -69,6 +69,8 @@ struct TrainerUi {
     status: String,
     frozen_count: usize,
     bulk_preview: bool,
+    /// Latched preference for this session, not the current touch state.
+    safe_mode: bool,
     /// Widget id pressed but not yet released (pending activation).
     pending: Option<u16>,
 }
@@ -90,6 +92,7 @@ impl TrainerUi {
             status: String::new(),
             frozen_count: 0,
             bulk_preview: false,
+            safe_mode: true,
             pending: None,
         }
     }
@@ -180,6 +183,7 @@ const W_FREEZE: u16 = 10;
 const W_UNFREEZE: u16 = 11;
 const W_SET_ALL: u16 = 12;
 const W_DUMP: u16 = 16;
+const W_SAFE_MODE: u16 = 17;
 const W_SAVE: u16 = 13;
 const W_SCROLL_UP: u16 = 14;
 const W_SCROLL_DOWN: u16 = 15;
@@ -254,8 +258,9 @@ fn compute_layout(ui: &TrainerUi, viewport: (u32, u32, u32, u32)) -> Layout {
         // Header row (title + close button).
         push_widget(W_CLOSE, px + pw - small_h - 4.0 * s, y, small_h, small_h, &mut widgets);
         y += small_h + 4.0 * s;
-        // Type row.
+        // Type and latched safe-mode toggle share a row.
         push_widget(W_TYPE, px + 6.0 * s, y, 110.0 * s, row_h, &mut widgets);
+        push_widget(W_SAFE_MODE, px + 120.0 * s, y, pw - 126.0 * s, row_h, &mut widgets);
         y += row_h + 4.0 * s;
         // Search value field.
         push_widget(W_FIELD_SEARCH, px + 6.0 * s, y, pw - 12.0 * s, row_h, &mut widgets);
@@ -414,6 +419,14 @@ fn activate_widget(ui: &mut TrainerUi, id: u16) {
         W_BUTTON => ui.open = !ui.open,
         W_CLOSE => ui.open = false,
         W_TYPE => ui.vtype = ui.vtype.next(),
+        W_SAFE_MODE => {
+            ui.safe_mode = !ui.safe_mode;
+            ui.status = if ui.safe_mode {
+                "SAFE MODE ON: FILTER BULK WRITES"
+            } else {
+                "SAFE MODE OFF: EXTRA CRASH RISK"
+            }.to_string();
+        }
         W_FIELD_SEARCH => ui.focus = Focus::Search,
         W_FIELD_SET => ui.focus = Focus::Set,
         W_SEARCH => {
@@ -442,7 +455,7 @@ fn activate_widget(ui: &mut TrainerUi, id: u16) {
             let confirm = ui.bulk_preview;
             ui.bulk_preview = false;
             COMMANDS.lock().unwrap().push(TrainerCmd::SetAll {
-                vtype: ui.vtype, text, confirm,
+                vtype: ui.vtype, text, confirm, safe_mode: ui.safe_mode,
             });
         }
         W_FREEZE => {
@@ -836,6 +849,16 @@ const COL_TEXT_DIM: (f32, f32, f32, f32) = (0.6, 0.6, 0.62, 1.0);
 const COL_ACCENT: (f32, f32, f32, f32) = (0.0, 0.75, 0.35, 0.92);
 const COL_SELECTED: (f32, f32, f32, f32) = (0.15, 0.3, 0.6, 1.0);
 const COL_CHANGED: (f32, f32, f32, f32) = (0.75, 0.55, 0.0, 0.95);
+const COL_SAFE_MODE_ON: (f32, f32, f32, f32) = (1.0, 0.8, 0.1, 1.0);
+const COL_SAFE_MODE_TEXT: (f32, f32, f32, f32) = (0.08, 0.07, 0.02, 1.0);
+
+fn safe_mode_colors(enabled: bool) -> ((f32, f32, f32, f32), (f32, f32, f32, f32)) {
+    if enabled {
+        (COL_SAFE_MODE_ON, COL_SAFE_MODE_TEXT)
+    } else {
+        (COL_WIDGET, COL_TEXT)
+    }
+}
 
 /// Entry point called from present_frame (CA composition and native ES 1.1
 /// present paths), in viewport pixel space. Renders with GLES 1.x
@@ -948,6 +971,18 @@ unsafe fn build_scene(
                     let label = format!("TYPE: {}", ui_state.vtype.name());
                     push_text(&mut quads, atlas, &label, rect.x + 6.0 * bs, rect.y + 5.0 * bs, 12.0 * bs, COL_TEXT);
                 }
+                W_SAFE_MODE => {
+                    let (background, foreground) = safe_mode_colors(ui_state.safe_mode);
+                    push_rect(&mut quads, *rect, background);
+                    let label = "SAFE MODE";
+                    let size = 11.0 * bs;
+                    let tw = text_width(atlas, label, size);
+                    push_text(&mut quads, atlas, label,
+                        rect.x + (rect.w - tw) / 2.0,
+                        rect.y + (rect.h - atlas.height * (size / FONT_PX)) / 2.0,
+                        size, foreground,
+                    );
+                }
                 W_FIELD_SEARCH | W_FIELD_SET => {
                     let focus_here = (*id == W_FIELD_SEARCH && ui_state.focus == Focus::Search)
                         || (*id == W_FIELD_SET && ui_state.focus == Focus::Set);
@@ -992,7 +1027,7 @@ unsafe fn build_scene(
                         W_REFINE => "REFINE",
                         W_RESET => "RESET",
                         W_SET => "SET",
-                        W_SET_ALL => if ui_state.bulk_preview { "CONFIRM" } else { "SAFE ALL" },
+                        W_SET_ALL => if ui_state.bulk_preview { "CONFIRM" } else { "SET ALL" },
                         W_FREEZE => "FREEZE",
                         W_UNFREEZE => "UNFRZ",
                         W_DUMP => "DUMP",

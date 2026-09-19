@@ -269,7 +269,7 @@ impl Trainer {
         }) {
             self.state.pending_bulk = None;
             trainer_ui::publish_bulk_preview(false);
-            trainer_ui::publish_status("PREVIEW EXPIRED: TAP SAFE ALL".to_string());
+            trainer_ui::publish_status("PREVIEW EXPIRED: TAP SET ALL".to_string());
         }
 
         // Pick up commands from the overlay UI.
@@ -366,10 +366,10 @@ impl Trainer {
                 });
                 log!("trainer: set 0x{:X} = {} ({})", addr, text, t.name());
             }
-            TrainerCmd::SetAll { vtype, text, confirm } => {
+            TrainerCmd::SetAll { vtype, text, confirm, safe_mode } => {
                 let previous = self.state.pending_bulk.take();
                 trainer_ui::publish_bulk_preview(false);
-                let plan = match plan_bulk(mem, &self.state.results, vtype, &text) {
+                let plan = match plan_bulk(mem, &self.state.results, vtype, &text, safe_mode) {
                     Ok(plan) => plan,
                     Err(reason) => {
                         trainer_ui::publish_status(reason.to_string());
@@ -388,14 +388,16 @@ impl Trainer {
                             trainer_ui::publish_status(format!(
                                 "WROTE {} SKIPPED {}", written, plan.skipped,
                             ));
-                            log!("trainer: safe bulk wrote {}, skipped {}", written, plan.skipped);
+                            log!("trainer: bulk wrote {}, skipped {}, safe mode {}", written, plan.skipped, safe_mode);
                         }
                         Err(reason) => trainer_ui::publish_status(reason.to_string()),
                     }
                 } else {
-                    trainer_ui::publish_status(format!(
-                        "CHECKED {} SKIP {}: STILL RISKY", plan.writes.len(), plan.skipped,
-                    ));
+                    trainer_ui::publish_status(if safe_mode {
+                        format!("CHECKED {} SKIP {}: STILL RISKY", plan.writes.len(), plan.skipped)
+                    } else {
+                        format!("SAFE OFF: {} WRITES / CRASH RISK", plan.writes.len())
+                    });
                     self.state.pending_bulk = Some(PendingBulk {
                         plan, created_at: Instant::now(),
                     });
