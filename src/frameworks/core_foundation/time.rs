@@ -54,8 +54,8 @@ pub type CFTimeZoneRef = CFTypeRef;
 
 // MARK: - Current time
 
-fn CFAbsoluteTimeGetCurrent(_env: &mut Environment) -> CFAbsoluteTime {
-    SystemTime::now()
+fn CFAbsoluteTimeGetCurrent(env: &mut Environment) -> CFAbsoluteTime {
+    env.guest_clock.system_time()
         .duration_since(apple_epoch())
         .unwrap()
         .as_secs_f64()

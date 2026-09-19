@@ -1664,7 +1664,7 @@ impl Window {
                     // TODO: handle out of order touches
                     let curr_timestamp = timestamp;
                     let abs_coords = finger_absolute_coords(self, (x, y));
-                    // The trainer overlay (GameGuardian-style) gets first
+                    // The trainer overlay (Cheat Engine-style) gets first
                     // dibs on touches that land on its button or panel.
                     let trainer_consumed = match event {
                         E::FingerDown { .. } => {

@@ -4,7 +4,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-//! GameGuardian-style on-screen trainer overlay: a small floating button in
+//! Cheat Engine-style on-screen trainer overlay: a small floating button in
 //! the top-right corner of the viewport opens a touch panel for searching and
 //! editing guest memory while a game is running.
 //!
@@ -16,6 +16,7 @@
 //! main loop thread, where `&mut Mem` is available.
 
 use crate::font::{Font, TextAlignment};
+use crate::guest_clock::Speed;
 use crate::gles::gles11_raw as gles11;
 use crate::gles::{GLES, GLint, GLuint};
 use crate::trainer::{SearchResult, VType};
@@ -71,11 +72,17 @@ struct TrainerUi {
     bulk_preview: bool,
     /// Latched preference for this session, not the current touch state.
     safe_mode: bool,
+    speed: Speed,
+    speed_dirty: bool,
     /// Widget id pressed but not yet released (pending activation).
     pending: Option<u16>,
 }
 
 impl TrainerUi {
+    fn take_speed_request(&mut self) -> Option<Speed> {
+        std::mem::take(&mut self.speed_dirty).then_some(self.speed)
+    }
+
     const fn new() -> TrainerUi {
         TrainerUi {
             enabled: true,
@@ -93,6 +100,8 @@ impl TrainerUi {
             frozen_count: 0,
             bulk_preview: false,
             safe_mode: true,
+            speed: Speed::Normal,
+            speed_dirty: false,
             pending: None,
         }
     }
@@ -125,6 +134,8 @@ pub fn reset_for_app(app_id: Option<&str>) {
     ui.status.clear();
     ui.frozen_count = 0;
     ui.bulk_preview = false;
+    ui.speed = Speed::Normal;
+    ui.speed_dirty = false;
     ui.pending = None;
 }
 
@@ -137,6 +148,11 @@ pub fn publish_live_values(results: &[crate::trainer::SearchResult]) {
     }
     ui.results = results.iter().copied().take(200).collect();
     ui.total_results = results.len();
+}
+
+/// Consumed by Environment, which owns the per-app guest clock.
+pub fn take_speed_request() -> Option<Speed> {
+    UI.lock().unwrap().take_speed_request()
 }
 
 pub fn take_commands() -> Vec<TrainerCmd> {
@@ -184,6 +200,9 @@ const W_UNFREEZE: u16 = 11;
 const W_SET_ALL: u16 = 12;
 const W_DUMP: u16 = 16;
 const W_SAFE_MODE: u16 = 17;
+const W_SPEED_DOWN: u16 = 18;
+const W_SPEED_RESET: u16 = 19;
+const W_SPEED_UP: u16 = 20;
 const W_SAVE: u16 = 13;
 const W_SCROLL_UP: u16 = 14;
 const W_SCROLL_DOWN: u16 = 15;
@@ -233,8 +252,8 @@ fn compute_layout(ui: &TrainerUi, viewport: (u32, u32, u32, u32)) -> Layout {
     // by the letterbox offset, tap targets misaligned with drawn keys).
     let (_vx, _vy, vw, vh) = viewport;
     let (vx, vy, vw, vh) = (0.0_f32, 0.0_f32, vw as f32, vh as f32);
-    // UI scale: reference height is 480 px (iPhone portrait).
-    let s = (vh / 480.0).clamp(0.75, 4.0);
+    // Fit the complete panel, including speed controls, in both orientations.
+    let s = (vh / 520.0).min(vw / 320.0).clamp(0.25, 4.0);
     let btn = 30.0 * s;
     let button = Rect {
         x: vx + vw - btn - 6.0 * s,
@@ -261,6 +280,12 @@ fn compute_layout(ui: &TrainerUi, viewport: (u32, u32, u32, u32)) -> Layout {
         // Type and latched safe-mode toggle share a row.
         push_widget(W_TYPE, px + 6.0 * s, y, 110.0 * s, row_h, &mut widgets);
         push_widget(W_SAFE_MODE, px + 120.0 * s, y, pw - 126.0 * s, row_h, &mut widgets);
+        y += row_h + 4.0 * s;
+        // Game speed: minus, current value (tap to reset), plus.
+        let speed_side = 38.0 * s;
+        push_widget(W_SPEED_DOWN, px + 6.0 * s, y, speed_side, row_h, &mut widgets);
+        push_widget(W_SPEED_RESET, px + 48.0 * s, y, pw - 96.0 * s, row_h, &mut widgets);
+        push_widget(W_SPEED_UP, px + pw - 44.0 * s, y, speed_side, row_h, &mut widgets);
         y += row_h + 4.0 * s;
         // Search value field.
         push_widget(W_FIELD_SEARCH, px + 6.0 * s, y, pw - 12.0 * s, row_h, &mut widgets);
@@ -426,6 +451,14 @@ fn activate_widget(ui: &mut TrainerUi, id: u16) {
             } else {
                 "SAFE MODE OFF: EXTRA CRASH RISK"
             }.to_string();
+        }
+        W_SPEED_DOWN | W_SPEED_RESET | W_SPEED_UP => {
+            ui.speed = match id {
+                W_SPEED_DOWN => ui.speed.step(false),
+                W_SPEED_UP => ui.speed.step(true),
+                _ => Speed::Normal,
+            };
+            ui.speed_dirty = true;
         }
         W_FIELD_SEARCH => ui.focus = Focus::Search,
         W_FIELD_SET => ui.focus = Focus::Set,
@@ -926,7 +959,7 @@ unsafe fn build_scene(
     let lit = ui_state.pending == Some(W_BUTTON) || ui_state.open;
     push_rect(&mut quads, layout.button, if lit { COL_WIDGET_LIT } else { COL_ACCENT });
     let bs = layout.scale;
-    let label = if ui_state.open { "X" } else { "GG" };
+    let label = if ui_state.open { "X" } else { "CE" };
     let tw = text_width(atlas, label, 12.0 * bs);
     push_text(&mut quads,
         atlas,
@@ -941,7 +974,7 @@ unsafe fn build_scene(
         push_rect(&mut quads, panel.rect, COL_PANEL);
 
         // Header.
-        let title = "GameGuardian";
+        let title = "Cheat Engine";
         push_text(&mut quads,
             atlas,
             title,
@@ -981,6 +1014,22 @@ unsafe fn build_scene(
                         rect.x + (rect.w - tw) / 2.0,
                         rect.y + (rect.h - atlas.height * (size / FONT_PX)) / 2.0,
                         size, foreground,
+                    );
+                }
+                W_SPEED_DOWN | W_SPEED_RESET | W_SPEED_UP => {
+                    push_rect(&mut quads, *rect, if *id == W_SPEED_RESET && ui_state.speed != Speed::Normal {
+                        COL_WIDGET_LIT
+                    } else { COL_WIDGET });
+                    let label = match *id {
+                        W_SPEED_DOWN => "-".to_string(),
+                        W_SPEED_UP => "+".to_string(),
+                        _ => format!("SPEED {}", ui_state.speed.label()),
+                    };
+                    let size = 12.0 * bs;
+                    let tw = text_width(atlas, &label, size);
+                    push_text(&mut quads, atlas, &label,
+                        rect.x + (rect.w - tw) / 2.0,
+                        rect.y + 5.0 * bs, size, COL_TEXT,
                     );
                 }
                 W_FIELD_SEARCH | W_FIELD_SET => {
@@ -1156,7 +1205,7 @@ unsafe fn render_gles1(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quad
     // present_frame leaves TEXTURE_2D enabled with the game frame bound
     // (unless the cursor/FPS overlay happened to disable it). Establish the
     // untextured state before using 0 as our solid-quad cache sentinel, or
-    // the first rectangle — the GG button — samples a miniature game frame.
+    // the first rectangle — the CE button — samples a miniature game frame.
     gles.Disable(gles11::TEXTURE_2D);
     let mut bound_tex: GLuint = 0;
     for q in quads {

@@ -1,4 +1,31 @@
-# Trainer: search and bulk editing
+# Cheat Engine overlay: memory editing and game speed
+
+This is HyperHLE's built-in trainer panel, not a connection to the external
+Cheat Engine desktop application. Quick Options calls it `Cheat Engine`, the
+floating button reads `CE`, and `--trainer` / `--no-trainer` remain compatible.
+
+## Game speed
+
+The panel has `-`, `SPEED 1x`, and `+` controls. Steps are **0.25x, 0.5x, 1x,
+2x and 4x**. Tap the centre button to return to 1x. The selection stays active
+when the panel is closed and resets to 1x when a new game environment starts.
+Speed is independent of SAFE MODE and does not write guessed memory addresses.
+
+The per-game virtual clock scales `mach_absolute_time`, `clock`,
+`gettimeofday`/`time`, Mach clock services, NSDate/CFAbsoluteTime,
+CACurrentMediaTime and NSProcessInfo uptime. Changing speed rebases the clock
+without a time jump: returning to 1x does not undo elapsed virtual time.
+NSTimer (including CADisplayLink) and explicit guest sleeps use virtual
+deadlines, so pending waits follow rate changes. The GLES frame-rate cap also
+scales, helping fixed-per-frame game loops.
+
+The host FPS counter, bulk-confirmation timeout, input polling and audio
+playback remain on real time. This is not audio time stretching or a CPU/JIT
+speed multiplier. Network/media clocks, condition-variable timeouts and other
+unmodelled timing paths are not universally accelerated. Behaviour depends on
+the game, vsync and device performance: 4x is a requested rate, not a guarantee
+of four times as many frames. Start with 0.5x or 2x; use 1x if audio/video or
+network timing falls out of sync. Speed controls fit in portrait and landscape.
 
 `SET ALL` edits memory matches, **not necessarily currency**. An unrelated
 counter, length or game-state flag can contain the same number. Even a single
@@ -89,6 +116,7 @@ are not subject to the bulk preview/filter and still require care.
 ## Regression tests
 
 ```sh
+RUSTFLAGS="-C link-arg=-latomic" cargo test --lib guest_clock::tests
 RUSTFLAGS="-C link-arg=-latomic" cargo test --lib trainer::tests
 RUSTFLAGS="-C link-arg=-latomic" cargo test --lib trainer_ui::tests
 ```

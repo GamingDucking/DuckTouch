@@ -24,7 +24,6 @@ use crate::mem::SafeRead;
 use crate::objc::{id, msg, msg_class, nil, objc_classes, release, retain, ClassExports};
 use crate::Environment;
 use std::collections::HashMap;
-use std::time::Instant;
 
 /// `NSOperatingSystemVersion` from `Foundation/NSProcessInfo.h`.
 ///
@@ -148,7 +147,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     assert_process_info_singleton(env, this);
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let uptime_ns = Instant::now()
+    let uptime_ns = env.guest_clock.now()
         .duration_since(env.startup_time)
         .as_nanos() as u64;
     let s = format!("1234-{}-{}", uptime_ns, n);
@@ -200,7 +199,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (NSTimeInterval)systemUptime {
     assert_process_info_singleton(env, this);
-    Instant::now().duration_since(env.startup_time).as_secs_f64()
+    env.guest_clock.now().duration_since(env.startup_time).as_secs_f64()
 }
 
 // =========================================================================

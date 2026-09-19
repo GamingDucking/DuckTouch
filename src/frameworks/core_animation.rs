@@ -31,7 +31,6 @@ use crate::frameworks::core_foundation::time::CFTimeInterval;
 use crate::frameworks::core_graphics::CGFloat;
 use crate::mem::SafeRead;
 use crate::Environment;
-use std::time::Instant;
 
 pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
     // Core Animation is considered its own framework, but it technically lives
@@ -70,12 +69,11 @@ pub struct State {
     gradients: ca_gradient_layer::State,
 }
 
-// This function should call mach_absolute_time() and convert the result into
-// seconds. Since in our implementation, mach_absolute_time() returns, in
-// nanoseconds, Instant::now, we can just do the same in seconds and save
-// the calls to the guest functions.
+// Use the same virtual monotonic clock as mach_absolute_time(), but return
+// seconds rather than nanoseconds. Both clocks remain continuous when the
+// user changes game speed.
 pub fn CACurrentMediaTime(env: &mut Environment) -> CFTimeInterval {
-    Instant::now()
+    env.guest_clock.now()
         .duration_since(env.startup_time)
         .as_secs_f64()
 }

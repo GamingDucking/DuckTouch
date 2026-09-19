@@ -45,7 +45,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: - Getting Current Date and Time
 
 + (NSTimeInterval)timeIntervalSinceReferenceDate {
-    SystemTime::now()
+    env.guest_clock.system_time()
         .duration_since(apple_epoch())
         .unwrap()
         .as_secs_f64()
@@ -64,7 +64,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     // As of 2024, this approximately corresponds to 20 years into the future.
     // While `distantFuture` docs are talking in terms of centuries,
     // this should be OK to use for our purposes.
-    let time_interval = SystemTime::now()
+    let time_interval = env.guest_clock.system_time()
         .duration_since(apple_epoch())
         .unwrap()
         .as_secs_f64() * 2.0;
@@ -122,7 +122,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)init {
     // "Date objects are immutable, representing an invariant time interval
     // relative to an absolute reference date (00:00:00 UTC on 1 January 2001)."
-    let time_interval = SystemTime::now()
+    let time_interval = env.guest_clock.system_time()
         .duration_since(apple_epoch())
         .unwrap()
         .as_secs_f64();
@@ -143,7 +143,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)initWithTimeIntervalSinceNow:(NSTimeInterval)secs {
-    let time_interval = SystemTime::now()
+    let time_interval = env.guest_clock.system_time()
         .duration_since(apple_epoch())
         .unwrap()
         .as_secs_f64();
@@ -200,7 +200,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (NSTimeInterval)timeIntervalSinceNow {
     let host_object = env.objc.borrow::<NSDateHostObject>(this);
-    let time_interval = SystemTime::now()
+    let time_interval = env.guest_clock.system_time()
         .duration_since(apple_epoch())
         .unwrap()
         .as_secs_f64();

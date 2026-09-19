@@ -179,6 +179,14 @@ fn panel_has_unique_actions_and_results_header_below_keypad() {
         let panel = compute_layout(&ui, viewport).panel.unwrap();
         let ids: std::collections::HashSet<_> = panel.widgets.iter().map(|&(id, _)| id).collect();
         assert_eq!(ids.len(), panel.widgets.len(), "duplicate widget IDs");
+        assert!(panel.rect.y + panel.rect.h <= viewport.3 as f32);
+        for &(id, rect) in &panel.widgets {
+            assert!(rect.w > 0.0 && rect.h > 0.0, "invalid widget {id}");
+            assert!(rect.y >= panel.rect.y && rect.y + rect.h <= panel.rect.y + panel.rect.h);
+        }
+        for id in [W_SPEED_DOWN, W_SPEED_RESET, W_SPEED_UP] {
+            assert_eq!(panel.widgets.iter().filter(|&&(widget, _)| widget == id).count(), 1);
+        }
         assert_eq!(panel.widgets.iter().filter(|&&(id, _)| id == W_SET_ALL).count(), 1);
         assert_eq!(panel.widgets.iter().filter(|&&(id, _)| id == W_DUMP).count(), 1);
         let toggle = panel.widgets.iter().find(|&&(id, _)| id == W_SAFE_MODE).unwrap().1;
@@ -258,4 +266,33 @@ fn safe_mode_latches_and_is_sent_with_bulk_commands() {
         safe_mode: true, confirm: false, ..
     }]));
     assert!(ui.safe_mode);
+}
+
+
+#[test]
+fn speed_controls_latch_clamp_and_reset_without_memory_commands() {
+    let _guard = INPUT_TEST_LOCK.lock().unwrap();
+    let mut ui = TrainerUi::new();
+    take_commands();
+    assert_eq!(ui.speed, Speed::Normal);
+    assert_eq!(ui.take_speed_request(), None);
+    activate_widget(&mut ui, W_SPEED_DOWN);
+    assert_eq!(ui.take_speed_request(), Some(Speed::Half));
+    assert_eq!(ui.take_speed_request(), None);
+    activate_widget(&mut ui, W_SPEED_DOWN);
+    activate_widget(&mut ui, W_SPEED_DOWN);
+    assert_eq!(ui.take_speed_request(), Some(Speed::Quarter));
+    for _ in 0..8 {
+        activate_widget(&mut ui, W_SPEED_UP);
+    }
+    assert_eq!(ui.take_speed_request(), Some(Speed::Quadruple));
+    activate_widget(&mut ui, W_CLOSE);
+    activate_widget(&mut ui, W_BUTTON);
+    assert_eq!(ui.speed, Speed::Quadruple);
+    assert_eq!(ui.take_speed_request(), None);
+    ui.bulk_preview = true;
+    activate_widget(&mut ui, W_SPEED_RESET);
+    assert_eq!(ui.take_speed_request(), Some(Speed::Normal));
+    assert!(!ui.bulk_preview);
+    assert!(take_commands().iter().all(|cmd| matches!(cmd, TrainerCmd::CancelBulk)));
 }

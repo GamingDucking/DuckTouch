@@ -3,7 +3,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
-//! In-emulator game trainer ("GameGuardian"-style), driven either by the
+//! In-emulator game trainer ("Cheat Engine"-style), driven either by the
 //! on-screen overlay UI (see [crate::trainer_ui]) or by text hack files.
 //!
 //! Hack files live under `touchHLE_hacks/` in the user data directory:
