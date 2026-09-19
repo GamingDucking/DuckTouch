@@ -1020,9 +1020,10 @@ unsafe fn build_scene(
                             },
                         );
                         let text = format!(
-                            "0x{:08X} {}",
+                            "0x{:08X} {} {}",
                             result.addr,
-                            ui_state.vtype.format(result.bits)
+                            result.vtype.name(),
+                            result.vtype.format(result.bits)
                         );
                         push_text(&mut quads, atlas, &text, rect.x + 6.0 * bs, rect.y + 3.0 * bs, 11.0 * bs, COL_TEXT);
                     }

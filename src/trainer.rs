@@ -21,7 +21,7 @@
 //! `# freeze` comment, which makes the trainer re-assert the value
 //! continuously.
 
-use crate::mem::{ConstVoidPtr, GuestUSize, Mem, MutPtr};
+use crate::mem::{ConstVoidPtr, GuestUSize, Mem};
 use crate::trainer_ui::{self, TrainerCmd};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -69,21 +69,34 @@ impl VType {
         Self::ALL[(idx + 1) % Self::ALL.len()]
     }
 
-    /// Parse user input text into the raw little-endian bit pattern.
+    /// Parse a value without silently truncating it to the target width.
+    /// Hex input denotes raw bits; decimal F32 input denotes a float value.
     pub fn parse(self, text: &str) -> Option<u64> {
         let text = text.trim();
-        let parsed = if text.starts_with('-') {
-            let v: i64 = text.parse().ok()?;
-            v as u64
-        } else if let Some(hex) = text
-            .strip_prefix("0x")
-            .or_else(|| text.strip_prefix("0X"))
-        {
-            u64::from_str_radix(hex, 16).ok()?
-        } else {
-            text.parse::<u64>().ok()?
+        if self == VType::Auto {
+            return auto_types().iter().find_map(|t| t.parse(text));
+        }
+        if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+            let bits = u64::from_str_radix(hex, 16).ok()?;
+            return (bits == self.mask_bits(bits)).then_some(bits);
+        }
+        let bits = match self {
+            VType::Auto => unreachable!(),
+            VType::U8 => text.parse::<u8>().ok()? as u64,
+            VType::I8 => text.parse::<i8>().ok()? as u64,
+            VType::U16 => text.parse::<u16>().ok()? as u64,
+            VType::I16 => text.parse::<i16>().ok()? as u64,
+            VType::U32 => text.parse::<u32>().ok()? as u64,
+            VType::I32 => text.parse::<i32>().ok()? as u64,
+            VType::F32 => {
+                let value = text.parse::<f32>().ok()?;
+                if !value.is_finite() {
+                    return None;
+                }
+                value.to_bits() as u64
+            }
         };
-        Some(self.mask_bits(parsed))
+        Some(self.mask_bits(bits))
     }
 
     fn mask_bits(self, value: u64) -> u64 {
@@ -132,25 +145,22 @@ impl VType {
 
     /// Read the raw bits at `addr` for this type.
     pub fn read_at(self, mem: &Mem, addr: u32) -> Option<u64> {
-        let bytes = mem.get_bytes_fallible(
-            ConstVoidPtr::from_bits(addr as _),
-            self.size(),
-        )?;
-        Some(Self::read_le(bytes, 0, self.size() as usize))
+        if addr < mem.null_segment_size() {
+            return None;
+        }
+        let bytes = mem.get_bytes_fallible(ConstVoidPtr::from_bits(addr), self.size())?;
+        let bytes = bytes.get(..self.size() as usize)?;
+        Some(Self::read_le(bytes, 0, bytes.len()))
     }
 
-    /// Write raw bits at `addr` for this type.
+    /// Write raw bits without falling back to Mem's invalid-address sink.
     pub fn write_at(self, mem: &mut Mem, addr: u32, bits: u64) -> bool {
-        match self {
-            VType::Auto => mem.write(MutPtr::<i32>::from_bits(addr as _), bits as i32), // fallback; callers resolve first
-            VType::U8 => mem.write(MutPtr::<u8>::from_bits(addr as _), bits as u8),
-            VType::I8 => mem.write(MutPtr::<i8>::from_bits(addr as _), bits as i8),
-            VType::U16 => mem.write(MutPtr::<u16>::from_bits(addr as _), bits as u16),
-            VType::I16 => mem.write(MutPtr::<i16>::from_bits(addr as _), bits as i16),
-            VType::U32 => mem.write(MutPtr::<u32>::from_bits(addr as _), bits as u32),
-            VType::I32 => mem.write(MutPtr::<i32>::from_bits(addr as _), bits as i32),
-            VType::F32 => mem.write(MutPtr::<f32>::from_bits(addr as _), f32::from_bits(bits as u32)),
-        }
+        let Some(bytes) = mem.get_bytes_fallible_mut(
+            ConstVoidPtr::from_bits(addr), self.size(),
+        ) else {
+            return false;
+        };
+        bytes.copy_from_slice(&bits.to_le_bytes()[..self.size() as usize]);
         true
     }
 }
@@ -208,6 +218,9 @@ const GLOBAL_HACKS_FILE: &str = "hacks.txt";
 const MAX_SCAN_ALLOCATION: GuestUSize = 64 * 1024 * 1024;
 /// Hard cap on stored search results (memory + UI sanity).
 const MAX_RESULTS: usize = 500_000;
+/// A guardrail, not a guarantee that the matches actually represent currency.
+/// Never silently edit just the first N hits of an ambiguous search.
+const MAX_BULK_WRITES: usize = 32;
 /// Cap on dump file lines.
 const MAX_DUMP_LINES: usize = 200_000;
 
@@ -273,11 +286,11 @@ impl Trainer {
     fn handle_command(&mut self, mem: &mut Mem, cmd: TrainerCmd) {
         match cmd {
             TrainerCmd::Search { vtype, text } => {
-                let Some(bits) = vtype.parse(&text) else {
+                let Some(_) = vtype.parse(&text) else {
                     trainer_ui::publish_status(format!("BAD VALUE: {}", text));
                     return;
                 };
-                let results = search_all(mem, vtype, bits, &[]);
+                let results = search_all(mem, vtype, &text, None);
                 self.state.results = results.clone();
                 self.state.searched = true;
                 trainer_ui::publish_results(&results, results.len());
@@ -293,11 +306,11 @@ impl Trainer {
                     trainer_ui::publish_status("NO PRIOR SEARCH".to_string());
                     return;
                 }
-                let Some(bits) = vtype.parse(&text) else {
+                let Some(_) = vtype.parse(&text) else {
                     trainer_ui::publish_status(format!("BAD VALUE: {}", text));
                     return;
                 };
-                let results = search_all(mem, vtype, bits, &self.state.results);
+                let results = search_all(mem, vtype, &text, Some(&self.state.results));
                 self.state.results = results.clone();
                 trainer_ui::publish_results(&results, results.len());
                 trainer_ui::publish_status(format!(
@@ -331,24 +344,17 @@ impl Trainer {
                 log!("trainer: set 0x{:X} = {} ({})", addr, text, t.name());
             }
             TrainerCmd::SetAll { vtype, text } => {
-                let results = self.state.results.clone();
-                if results.is_empty() {
-                    trainer_ui::publish_status("NO RESULTS TO SET".to_string());
-                    return;
-                }
-                let mut written = 0usize;
-                for result in &results {
-                    let t = if vtype == VType::Auto { result.vtype } else { vtype };
-                    let Some(bits) = t.parse(&text) else {
-                        trainer_ui::publish_status(format!("BAD VALUE: {}", text));
-                        return;
-                    };
-                    if t.write_at(mem, result.addr, bits) {
-                        written += 1;
+                match set_all(mem, &mut self.state.results, vtype, &text) {
+                    Ok(written) => {
+                        trainer_ui::publish_live_values(&self.state.results);
+                        trainer_ui::publish_status(format!("SET ALL: {} ADDRS", written));
+                        log!("trainer: set all {} -> {} addrs", text, written);
+                    }
+                    Err(reason) => {
+                        trainer_ui::publish_status(reason.to_string());
+                        log!("trainer: set all blocked: {}", reason);
                     }
                 }
-                trainer_ui::publish_status(format!("SET ALL: {} ADDRS", written));
-                log!("trainer: set all {} -> {} addrs", text, written);
             }
             TrainerCmd::Freeze { vtype, text } => {
                 let Some(addr) = trainer_ui::selected_address() else {
@@ -725,70 +731,107 @@ fn parse_hack_value(text: &str) -> (VType, u64) {
     (VType::I32, 0)
 }
 
-/// Search memory for `want_bits` (little-endian) of `vtype`. If `previous`
-/// is non-empty, only addresses from that list are re-checked (refine).
+/// A fresh search and an empty refinement are different operations: an
+/// exhausted refinement must never silently restart a whole-memory search.
 fn search_all(
     mem: &Mem,
     vtype: VType,
-    want_bits: u64,
-    previous: &[SearchResult],
+    text: &str,
+    previous: Option<&[SearchResult]>,
 ) -> Vec<SearchResult> {
-    if vtype == VType::Auto {
-        if previous.is_empty() {
-            return auto_search_fresh(mem, want_bits);
-        }
-        return auto_search_refine(mem, want_bits, previous);
+    if let Some(previous) = previous {
+        return previous.iter().filter_map(|result| {
+            let t = if vtype == VType::Auto { result.vtype } else { vtype };
+            let wanted = t.parse(text)?;
+            let bits = t.read_at(mem, result.addr)?;
+            (bits == wanted).then_some(SearchResult {
+                addr: result.addr,
+                vtype: t,
+                bits,
+                changed: false,
+            })
+        }).take(MAX_RESULTS).collect();
     }
-    let size = vtype.size() as usize;
+    if vtype != VType::Auto {
+        return vtype.parse(text).map_or_else(Vec::new, |bits| scan_bits(mem, vtype, bits));
+    }
+
     let mut results = Vec::new();
-    if !previous.is_empty() {
-        for result in previous {
-            if let Some(bits) = vtype.read_at(mem, result.addr) {
-                if bits == want_bits {
-                    results.push(SearchResult {
-                        addr: result.addr,
-                        vtype,
-                        bits,
-                        changed: false,
-                    });
-                    if results.len() >= MAX_RESULTS {
-                        break;
-                    }
-                }
-            }
-        }
-        return results;
-    }
-    for (addr, alloc_size) in mem.live_allocations() {
-        if alloc_size < size as GuestUSize || alloc_size > MAX_SCAN_ALLOCATION {
-            continue;
-        }
-        let bytes = match mem.get_bytes_fallible(
-            ConstVoidPtr::from_bits(addr as _),
-            alloc_size,
-        ) {
-            Some(bytes) => bytes,
-            None => continue,
-        };
-        let base = addr as u32;
-        let last = bytes.len() - size;
-        let mut offset = 0usize;
-        while offset <= last {
-            if VType::read_le(bytes, offset, size) == want_bits {
-                results.push(SearchResult {
-                    addr: base + offset as u32,
-                    vtype,
-                    bits: want_bits,
-                    changed: false,
-                });
+    let mut seen = HashSet::new();
+    for &t in auto_types() {
+        // E.g. searching for 600 must not also search for U8(88), and
+        // F32(600) must use 600.0's IEEE bits, not the integer bit pattern.
+        let Some(pattern) = t.parse(text) else { continue };
+        for hit in scan_bits(mem, t, pattern) {
+            if seen.insert((hit.addr, hit.bits)) {
+                results.push(hit);
                 if results.len() >= MAX_RESULTS {
                     return results;
                 }
             }
-            offset += 1;
         }
     }
     results
+}
+
+/// Validate the entire batch before touching memory. This avoids partial
+/// edits when a later result has an incompatible type, range or address.
+/// It cannot determine whether a match is currency or an unrelated field.
+fn set_all(
+    mem: &mut Mem,
+    results: &mut [SearchResult],
+    requested_type: VType,
+    text: &str,
+) -> Result<usize, &'static str> {
+    if results.is_empty() {
+        return Err("NO RESULTS TO SET");
+    }
+    if results.len() > MAX_BULK_WRITES {
+        return Err("TOO MANY HITS (MAX 32): REFINE");
+    }
+    let allocations = mem.live_allocations();
+    let mut writes = Vec::with_capacity(results.len());
+    let mut ranges = Vec::with_capacity(results.len());
+    for result in results.iter() {
+        // Changing the UI type after searching must not widen a one-byte
+        // hit into a four-byte write over neighbouring game fields.
+        let t = result.vtype;
+        if t == VType::Auto || (requested_type != VType::Auto && requested_type != t) {
+            return Err("TYPE CHANGED: SEARCH AGAIN");
+        }
+        let bits = t.parse(text).ok_or("VALUE OUT OF RANGE: CHECK TYPE")?;
+        let start = result.addr as u64;
+        let end = start + t.size() as u64;
+        if result.addr % t.size() != 0 {
+            return Err("UNALIGNED HITS: USE SINGLE SET");
+        }
+        if !allocations.iter().any(|&(base, size)| {
+            start >= base as u64 && end <= base as u64 + size as u64
+        }) {
+            return Err("EXPIRED ADDRESS: SEARCH AGAIN");
+        }
+        if t.read_at(mem, result.addr) != Some(result.bits) {
+            return Err("VALUES CHANGED: REFINE FIRST");
+        }
+        writes.push(bits);
+        ranges.push((start, end));
+    }
+    ranges.sort_unstable();
+    if ranges.windows(2).any(|pair| pair[1].0 < pair[0].1) {
+        return Err("OVERLAPPING HITS: REFINE TYPE");
+    }
+
+    // The trainer runs on the main loop thread; the guest cannot execute
+    // between validation and these writes. All byte ranges were checked by
+    // read_at above and lie in live allocations, outside the null segment.
+    for (result, bits) in results.iter_mut().zip(writes) {
+        if !result.vtype.write_at(mem, result.addr, bits) {
+            return Err("WRITE FAILED (BAD ADDR?)");
+        }
+        result.bits = bits;
+        result.changed = false;
+    }
+    Ok(results.len())
 }
 
 /// Directory for hack/dump files: `<user data>/touchHLE_hacks/`.
@@ -809,67 +852,15 @@ fn auto_types() -> &'static [VType] {
     ]
 }
 
-/// Auto fresh search: scan memory once per concrete type. `want_bits` is the
-/// masked bit pattern of the *first* concrete type that parsed the input, so
-/// re-derive per-type patterns from the raw text instead.
-fn auto_search_fresh(mem: &Mem, want_bits: u64) -> Vec<SearchResult> {
-    let mut results: Vec<SearchResult> = Vec::new();
-    let mut seen: std::collections::HashSet<(u32, u64)> = std::collections::HashSet::new();
-    for t in auto_types() {
-        // Search with each type's own bit width; `want_bits` is only a hint —
-        // derive the per-type pattern by re-masking (widths differ).
-        let pattern = match t {
-            VType::U8 | VType::I8 => want_bits & 0xFF,
-            VType::U16 | VType::I16 => want_bits & 0xFFFF,
-            VType::U32 | VType::I32 | VType::F32 => want_bits & 0xFFFFFFFF,
-            VType::Auto => want_bits,
-        };
-        for hit in scan_bits(mem, *t, pattern) {
-            if seen.insert((hit.addr, hit.bits)) {
-                results.push(hit);
-                if results.len() >= MAX_RESULTS {
-                    return results;
-                }
-            }
-        }
-    }
-    results
-}
-
-/// Auto refine: per-result, re-check using that result's own type.
-fn auto_search_refine(mem: &Mem, want_bits: u64, previous: &[SearchResult]) -> Vec<SearchResult> {
-    let mut results = Vec::new();
-    for result in previous {
-        let Some(bits) = result.vtype.read_at(mem, result.addr) else {
-            continue;
-        };
-        let pattern = match result.vtype {
-            VType::U8 | VType::I8 => want_bits & 0xFF,
-            VType::U16 | VType::I16 => want_bits & 0xFFFF,
-            VType::U32 | VType::I32 | VType::F32 => want_bits & 0xFFFFFFFF,
-            VType::Auto => want_bits,
-        };
-        if bits == pattern {
-            results.push(SearchResult {
-                addr: result.addr,
-                vtype: result.vtype,
-                bits,
-                changed: false,
-            });
-            if results.len() >= MAX_RESULTS {
-                break;
-            }
-        }
-    }
-    results
-}
-
 /// Single-type byte scan (the concrete-type part of `search_all`).
 fn scan_bits(mem: &Mem, vtype: VType, want_bits: u64) -> Vec<SearchResult> {
     let size = vtype.size() as usize;
     let mut results = Vec::new();
     for (addr, alloc_size) in mem.live_allocations() {
-        if alloc_size < size as GuestUSize || alloc_size > MAX_SCAN_ALLOCATION {
+        if addr < mem.null_segment_size()
+            || alloc_size < size as GuestUSize
+            || alloc_size > MAX_SCAN_ALLOCATION
+        {
             continue;
         }
         let bytes = match mem.get_bytes_fallible(
@@ -899,3 +890,6 @@ fn scan_bits(mem: &Mem, vtype: VType, want_bits: u64) -> Vec<SearchResult> {
     }
     results
 }
+
+#[cfg(test)]
+mod tests;
