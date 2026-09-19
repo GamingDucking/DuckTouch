@@ -7,7 +7,7 @@
 use super::*;
 use crate::mem::{MutVoidPtr, PAGE_SIZE};
 
-fn memory(size: u32) -> (Mem, u32) {
+pub(super) fn memory(size: u32) -> (Mem, u32) {
     let mut mem = Mem::new();
     mem.set_null_segment_size(PAGE_SIZE);
     let ptr = mem.alloc(size);
@@ -15,7 +15,7 @@ fn memory(size: u32) -> (Mem, u32) {
     (mem, ptr.to_bits())
 }
 
-fn result(mem: &mut Mem, addr: u32, vtype: VType, value: &str) -> SearchResult {
+pub(super) fn result(mem: &mut Mem, addr: u32, vtype: VType, value: &str) -> SearchResult {
     let bits = vtype.parse(value).unwrap();
     assert!(vtype.write_at(mem, addr, bits));
     SearchResult { addr, vtype, bits, changed: false, analysis: Analysis::default() }
@@ -390,7 +390,7 @@ fn trainer_writes_reset_observations_for_overlapping_aliases() {
     use classify::Category;
     let (mut mem, base) = memory(64);
     let mut hits = [result(&mut mem, base + 1, VType::U8, "27")];
-    for (old, new) in [(30, 29), (29, 28), (28, 27)] {
+    for (old, new) in [(30, 29), (29, 28), (28, 27), (27, 30), (30, 29), (29, 28), (28, 27), (27, 30)] {
         hits[0].analysis.observe(VType::U8, old, new);
     }
     assert_eq!(hits[0].analysis.category, Category::Ammo);
@@ -409,7 +409,44 @@ fn frozen_aliases_do_not_teach_ammo_patterns() {
     trainer.state.frozen.push(Patch { addr: base, vtype: VType::I32, bits: 0, freeze: true });
     for value in [29, 28, 27] {
         VType::U8.write_at(&mut mem, base + 1, value);
-        trainer.refresh_live_values(&mut mem);
+        trainer.refresh_live_values(&mut mem, None, 0.25);
     }
     assert_eq!(trainer.state.results[0].analysis.category, Category::Unknown);
+}
+
+#[test]
+fn activity_reports_before_after_but_not_trainer_writes_or_frozen_aliases() {
+    let (mut mem, base) = memory(64);
+    let mut trainer = Trainer::new(true);
+    trainer.state.results = vec![result(&mut mem, base, VType::I32, "30")];
+    VType::I32.write_at(&mut mem, base, 29);
+    trainer.refresh_live_values(&mut mem, None, 0.25);
+    let change = trainer.state.activity.entries[0];
+    assert_eq!((change.addr, change.before, change.after), (base, 30, 29));
+    trainer.state.activity = Activity::default();
+    trainer.handle_command(&mut mem, TrainerCmd::ApplyHack { addr: base, vtype: VType::I32, bits: 28 });
+    trainer.refresh_live_values(&mut mem, None, 0.25);
+    assert!(trainer.state.activity.entries.is_empty());
+    trainer.state.frozen.push(Patch { addr: base, vtype: VType::I32, bits: 28, freeze: true });
+    VType::I32.write_at(&mut mem, base, 27);
+    trainer.refresh_live_values(&mut mem, None, 0.25);
+    assert!(trainer.state.activity.entries.is_empty());
+}
+
+#[test]
+fn mark_comparison_is_read_only_and_rebases_after_filtering() {
+    let (mut mem, base) = memory(64);
+    let mut trainer = Trainer::new(true);
+    trainer.state.results = vec![result(&mut mem, base, VType::I32, "30"),
+        result(&mut mem, base + 8, VType::I32, "30")];
+    trainer.handle_command(&mut mem, TrainerCmd::Mark);
+    VType::I32.write_at(&mut mem, base, 29);
+    trainer.refresh_live_values(&mut mem, None, 0.25);
+    let before = snapshot(&mem, base, 64);
+    trainer.handle_command(&mut mem, TrainerCmd::Compare(watch::WatchFilter::Decreased));
+    assert_eq!(trainer.state.results.len(), 1);
+    assert_eq!(trainer.state.results[0].addr, base);
+    assert_eq!(snapshot(&mem, base, 64), before);
+    trainer.handle_command(&mut mem, TrainerCmd::Compare(watch::WatchFilter::Changed));
+    assert!(trainer.state.results.is_empty());
 }

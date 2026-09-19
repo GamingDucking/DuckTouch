@@ -40,7 +40,7 @@ pub(super) struct BulkPlan {
 
 /// Allocations are disjoint and sorted by base. Avoid an O(hits * allocations)
 /// scan now that a bulk operation can cover all stored search results.
-fn containing_allocation(
+pub(super) fn containing_allocation(
     allocations: &[Allocation],
     addr: u32,
     size: u32,

@@ -78,6 +78,8 @@ enum Evidence {
     SmoothDrops,
     TextAndChanges,
     ConflictingText,
+    ScalarField,
+    ReloadCycles,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -88,6 +90,11 @@ pub struct Analysis {
     inspected: bool,
     unit_drops: u8,
     smooth_drops: u8,
+    field_mask: u8,
+    reloads: u8,
+    peak: u16,
+    last_rate: f32,
+    quiet_seconds: f32,
 }
 
 impl Analysis {
@@ -97,10 +104,12 @@ impl Analysis {
             Evidence::Pending => "Pending scan; not verified",
             Evidence::None => "No useful evidence",
             Evidence::NearbyText => "Nearby word; low confidence",
-            Evidence::UnitDrops => "Repeated -1; low confidence",
+            Evidence::UnitDrops => "Unit drops; purpose ambiguous",
             Evidence::SmoothDrops => "Float countdown; low confidence",
             Evidence::TextAndChanges => "Word + changes; medium confidence",
             Evidence::ConflictingText => "Conflicting words; unknown",
+            Evidence::ScalarField => "Exact typed ObjC field; stronger hint",
+            Evidence::ReloadCycles => "Repeated depletion/refill; low confidence",
         }
     }
 
@@ -108,29 +117,64 @@ impl Analysis {
     pub fn reset_history(&mut self) {
         self.unit_drops = 0;
         self.smooth_drops = 0;
+        self.reloads = 0;
+        self.peak = 0;
+        self.last_rate = 0.0;
+        self.quiet_seconds = 0.0;
         self.update_hint();
     }
 
     pub fn observe(&mut self, t: VType, before: u64, after: u64) {
+        self.observe_timed(t, before, after, 0.25);
+    }
+
+    pub fn observe_timed(&mut self, t: VType, before: u64, after: u64, seconds: f32) {
+        self.quiet_seconds = (self.quiet_seconds + seconds.max(0.0)).min(60.0);
         if before == after { return; }
+        let elapsed = self.quiet_seconds.max(0.001);
+        self.quiet_seconds = 0.0;
         let a = number(t, before);
         let b = number(t, after);
-        self.unit_drops = if t != VType::F32 && a <= 300.0 && a >= 1.0 && b == a - 1.0 {
-            self.unit_drops.saturating_add(1)
-        } else { 0 };
-        self.smooth_drops = if t == VType::F32 && a.is_finite() && b.is_finite()
+        let unit_drop = t != VType::F32 && (1.0..=300.0).contains(&a) && b == a - 1.0;
+        if unit_drop {
+            if self.unit_drops == 0 {
+                if self.peak != a as u16 { self.reloads = 0; }
+                self.peak = a as u16;
+            }
+            self.unit_drops = self.unit_drops.saturating_add(1);
+        } else {
+            if self.unit_drops >= 3 && b == self.peak as f64 && b > a {
+                self.reloads = self.reloads.saturating_add(1);
+            } else {
+                self.reloads = 0;
+            }
+            self.unit_drops = 0;
+        }
+        let rate = ((a - b) / elapsed as f64) as f32;
+        if t == VType::F32 && a.is_finite() && b.is_finite()
             && b >= 0.0 && a <= 86400.0 && a > b && a - b <= 2.0
             && (a.fract() != 0.0 || b.fract() != 0.0)
         {
-            self.smooth_drops.saturating_add(1)
-        } else { 0 };
+            self.smooth_drops = if self.last_rate > 0.0
+                && (0.7..=1.3).contains(&(rate / self.last_rate))
+            { self.smooth_drops.saturating_add(1) } else { 1 };
+            self.last_rate = rate;
+        } else {
+            self.smooth_drops = 0;
+            self.last_rate = 0.0;
+        }
         self.update_hint();
     }
 
     fn update_hint(&mut self) {
         self.category = Category::Unknown;
         self.evidence = if self.inspected { Evidence::None } else { Evidence::Pending };
-        if self.text_mask.count_ones() > 1 {
+        if self.field_mask.count_ones() == 1 {
+            self.category = Category::ALL[self.field_mask.trailing_zeros() as usize];
+            self.evidence = Evidence::ScalarField;
+            return;
+        }
+        if self.field_mask.count_ones() > 1 || self.text_mask.count_ones() > 1 {
             self.evidence = Evidence::ConflictingText;
             return;
         }
@@ -138,20 +182,22 @@ impl Analysis {
             .find(|c| self.text_mask & (1 << c.index()) != 0)
         {
             self.category = category;
-            self.evidence = if (category == Category::Ammo && self.unit_drops >= 3)
-                || (category == Category::Timer && self.smooth_drops >= 3)
+            self.evidence = if (category == Category::Ammo && self.reloads >= 2)
+                || (category == Category::Timer && self.smooth_drops >= 6)
             { Evidence::TextAndChanges } else { Evidence::NearbyText };
-        } else if self.unit_drops >= 3 {
+        } else if self.reloads >= 2 {
             self.category = Category::Ammo;
-            self.evidence = Evidence::UnitDrops;
-        } else if self.smooth_drops >= 3 {
+            self.evidence = Evidence::ReloadCycles;
+        } else if self.smooth_drops >= 6 {
             self.category = Category::Timer;
             self.evidence = Evidence::SmoothDrops;
+        } else if self.unit_drops >= 3 {
+            self.evidence = Evidence::UnitDrops;
         }
     }
 }
 
-fn number(t: VType, bits: u64) -> f64 {
+pub(super) fn number(t: VType, bits: u64) -> f64 {
     match t {
         VType::Auto => f64::NAN,
         VType::U8 => bits as u8 as f64,
@@ -168,7 +214,7 @@ fn word_category(word: &[u8]) -> Option<Category> {
     let groups: &[(Category, &[&[u8]])] = &[
         (Category::Money, &[b"money", b"coins", b"coin", b"gold", b"cash", b"currency", b"gems", b"credits", b"moneycount", b"coincount", b"currentcoins"]),
         (Category::Ammo, &[b"ammo", b"ammunition", b"ammocount", b"currentammo", b"bullets", b"bulletcount", b"magazine"]),
-        (Category::Health, &[b"health", b"hitpoints", b"maxhealth", b"currenthealth"]),
+        (Category::Health, &[b"health", b"healthpoints", b"hitpoints", b"maxhealth", b"currenthealth"]),
         (Category::Score, &[b"score", b"highscore", b"points"]),
         (Category::Timer, &[b"timer", b"countdown", b"cooldown", b"remainingtime"]),
     ];
@@ -208,10 +254,47 @@ fn word_mask(bytes: &[u8]) -> u8 {
     mask
 }
 
+/// Field identifiers can use camelCase, underscores, or acronym suffixes.
+fn field_mask(name: &str) -> u8 {
+    if let Some(category) = word_category(name.trim_matches('_').as_bytes()) {
+        return 1 << category.index();
+    }
+    let mut normalized = Vec::with_capacity(130);
+    normalized.push(0);
+    let bytes = name.as_bytes();
+    if bytes.len() > 128 { return 0; }
+    for (i, &byte) in bytes.iter().enumerate() {
+        if i > 0 && byte.is_ascii_uppercase() && bytes[i - 1].is_ascii_lowercase() {
+            normalized.push(b'_');
+        }
+        normalized.push(byte);
+    }
+    normalized.push(0);
+    let mut mask = ascii_word_mask(&normalized);
+    for word in normalized.split(|b| !b.is_ascii_alphanumeric()) {
+        if word.eq_ignore_ascii_case(b"hp") { mask |= 1 << Category::Health.index(); }
+    }
+    mask
+}
+
+pub(super) fn encoding(t: VType) -> u8 {
+    match t {
+        VType::I8 => b'c', VType::U8 => b'C', VType::I16 => b's', VType::U16 => b'S',
+        VType::I32 => b'i', VType::U32 => b'I', VType::F32 => b'f', VType::Auto => 0,
+    }
+}
+
 /// Incremental bounded inspection: at most 1024 results and 128 neighbouring
 /// bytes each per tick, staying inside the same currently-live allocation.
 /// No arbitrary pointer chasing, guest execution or write probes.
 pub(super) fn analyze_batch(mem: &Mem, results: &mut [SearchResult], cursor: &mut usize) {
+    analyze_batch_with_objects(mem, results, cursor, None);
+}
+
+pub(super) fn analyze_batch_with_objects(
+    mem: &Mem, results: &mut [SearchResult], cursor: &mut usize,
+    objc: Option<&crate::objc::ObjC>,
+) {
     if results.is_empty() { *cursor = 0; return; }
     let mut allocations = mem.live_allocations();
     allocations.sort_unstable_by_key(|&(base, _)| base);
@@ -237,6 +320,9 @@ pub(super) fn analyze_batch(mem: &Mem, results: &mut [SearchResult], cursor: &mu
             }
             Some(mask)
         });
+        result.analysis.field_mask = allocation.and_then(|(base, size)| {
+            objc?.diagnostic_scalar_field(mem, base, size, addr, result.vtype.size(), encoding(result.vtype))
+        }).map_or(0, field_mask);
         if let Some(mask) = mask {
             result.analysis.inspected = true;
             result.analysis.text_mask = mask;

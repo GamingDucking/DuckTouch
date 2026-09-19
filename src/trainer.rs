@@ -29,6 +29,8 @@ use std::time::{Duration, Instant};
 
 mod bulk;
 pub mod classify;
+pub mod watch;
+use watch::{Activity, Change, Snapshot};
 use classify::{analyze_batch, Analysis, ResultFilter};
 use bulk::{apply_bulk, plan_bulk, BulkPlan};
 
@@ -206,6 +208,9 @@ struct TrainerState {
     /// Whether a search has been performed (so "REFINE" is meaningful).
     searched: bool,
     analysis_cursor: usize,
+    snapshot: Option<Snapshot>,
+    activity: Activity,
+    activity_cursor: usize,
     pending_bulk: Option<PendingBulk>,
     /// One-shot patches already applied (from hack files).
     applied_hacks: HashSet<(u32, VType, u64)>,
@@ -250,7 +255,7 @@ impl Trainer {
 
     /// Called from the main loop. `app_id` is the identifier of the
     /// currently running app, if any.
-    pub fn tick(&mut self, mem: &mut Mem, app_id: Option<&str>) {
+    pub fn tick(&mut self, mem: &mut Mem, app_id: Option<&str>, objc: &crate::objc::ObjC) {
         if !self.enabled {
             return;
         }
@@ -278,7 +283,9 @@ impl Trainer {
 
         // Pick up commands from the overlay UI.
         for cmd in trainer_ui::take_commands() {
+            let inspect = matches!(&cmd, TrainerCmd::InspectSelection | TrainerCmd::SelectChange { .. });
             self.handle_command(mem, cmd);
+            if inspect { self.describe_selection(mem, objc); }
         }
 
         // Re-assert frozen values ~20 times per second.
@@ -291,8 +298,9 @@ impl Trainer {
         // second, flagging addresses whose value changed since last time —
         // spend coins in-game and the matching row lights up.
         if self.last_value_refresh.elapsed() >= Duration::from_millis(250) {
+            let seconds = self.last_value_refresh.elapsed().as_secs_f32();
             self.last_value_refresh = Instant::now();
-            self.refresh_live_values(mem);
+            self.refresh_live_values(mem, Some(objc), seconds);
         }
 
         // Watch hack files for external edits (e.g. edited over ADB or a
@@ -303,6 +311,19 @@ impl Trainer {
         }
     }
 
+    /// Show the actual matched field name when runtime metadata is available.
+    fn describe_selection(&self, mem: &Mem, objc: &crate::objc::ObjC) {
+        let Some(addr) = trainer_ui::selected_address() else { return; };
+        let Some(t) = trainer_ui::selected_result_type(addr) else { return; };
+        if let Some((base, size)) = mem.live_allocations().into_iter().find(|&(base, size)| {
+            base <= addr && addr as u64 + t.size() as u64 <= base as u64 + size as u64
+        }) {
+            if let Some(name) = objc.diagnostic_scalar_field(mem, base, size, addr, t.size(), classify::encoding(t)) {
+                trainer_ui::publish_status(format!("FIELD {} [{}]; verify in game", name, t.name()));
+            }
+        }
+    }
+
     fn handle_command(&mut self, mem: &mut Mem, cmd: TrainerCmd) {
         if !matches!(&cmd, TrainerCmd::SetAll { .. }) {
             if self.state.pending_bulk.take().is_some() {
@@ -310,8 +331,52 @@ impl Trainer {
             }
             trainer_ui::publish_bulk_preview(false);
         }
+        // A comparison experiment must not include the trainer's own edits.
+        if matches!(&cmd, TrainerCmd::Set { .. } | TrainerCmd::SetAll { .. }
+            | TrainerCmd::Freeze { .. } | TrainerCmd::ApplyHack { .. }) {
+            self.state.snapshot = None;
+        }
         match cmd {
-            TrainerCmd::CancelBulk => {}
+            TrainerCmd::Mark => {
+                if self.state.results.is_empty() {
+                    trainer_ui::publish_status("SEARCH FIRST, THEN MARK".to_string());
+                } else {
+                    self.state.snapshot = Some(Snapshot::capture(mem, &self.state.results));
+                    trainer_ui::publish_status("MARKED: PLAY, THEN CHANGED / SAME / UP / DOWN".to_string());
+                }
+            }
+            TrainerCmd::Compare(filter) => {
+                let Some(snapshot) = self.state.snapshot.take() else {
+                    trainer_ui::publish_status("TAP MARK BEFORE THE GAME ACTION".to_string());
+                    return;
+                };
+                snapshot.retain(mem, &mut self.state.results, filter);
+                self.state.snapshot = Some(Snapshot::capture(mem, &self.state.results));
+                self.state.activity = Activity::default();
+                trainer_ui::clear_activity();
+                trainer_ui::publish_results(&self.state.results, self.state.results.len());
+                trainer_ui::publish_status(format!("KEPT {}: BASELINE UPDATED", self.state.results.len()));
+            }
+            TrainerCmd::ClearActivity => {
+                self.state.activity = Activity::default();
+                trainer_ui::clear_activity();
+            }
+            TrainerCmd::SelectChange { addr, vtype } => {
+                if let Some(r) = self.state.results.iter().find(|r| r.addr == addr && r.vtype == vtype) {
+                    let mut allocations = mem.live_allocations();
+                    allocations.sort_unstable_by_key(|a| a.0);
+                    if bulk::containing_allocation(&allocations, addr, vtype.size()).is_some()
+                        && r.vtype.read_at(mem, addr).is_some()
+                    {
+                        trainer_ui::focus_result(&self.state.results, addr, vtype);
+                    } else {
+                        trainer_ui::publish_status("ADDRESS NO LONGER READABLE".to_string());
+                    }
+                } else {
+                    trainer_ui::publish_status("RESULT NO LONGER IN SEARCH".to_string());
+                }
+            }
+            TrainerCmd::CancelBulk | TrainerCmd::InspectSelection => {}
             TrainerCmd::RefreshView => trainer_ui::publish_live_values(&self.state.results),
             TrainerCmd::Search { vtype, text } => {
                 let Some(_) = vtype.parse(&text) else {
@@ -321,6 +386,9 @@ impl Trainer {
                 let mut results = search_all(mem, vtype, &text, None);
                 self.state.analysis_cursor = 0;
                 analyze_batch(mem, &mut results, &mut self.state.analysis_cursor);
+                self.state.snapshot = None;
+                self.state.activity = Activity::default();
+                trainer_ui::clear_activity();
                 self.state.results = results.clone();
                 self.state.searched = true;
                 trainer_ui::publish_results(&results, results.len());
@@ -341,6 +409,9 @@ impl Trainer {
                     return;
                 };
                 let results = search_all(mem, vtype, &text, Some(&self.state.results));
+                self.state.snapshot = None;
+                self.state.activity = Activity::default();
+                trainer_ui::clear_activity();
                 self.state.results = results.clone();
                 trainer_ui::publish_results(&results, results.len());
                 trainer_ui::publish_status(format!(
@@ -350,6 +421,9 @@ impl Trainer {
                 ));
             }
             TrainerCmd::Reset => {
+                self.state.snapshot = None;
+                self.state.activity = Activity::default();
+                trainer_ui::clear_activity();
                 self.state.results.clear();
                 self.state.analysis_cursor = 0;
                 self.state.searched = false;
@@ -617,6 +691,7 @@ impl Trainer {
             return; // already applied (e.g. duplicate line)
         }
         if vtype.write_at(mem, addr, bits) {
+            state.snapshot = None;
             record_trainer_write(mem, &mut state.results, addr, vtype.size());
         }
         log!(
@@ -665,7 +740,7 @@ impl Trainer {
     /// the updated list to the UI, marking rows whose value changed since the
     /// previous refresh. This makes the right address "light up" when the
     /// in-game value changes (e.g. coins are spent).
-    fn refresh_live_values(&mut self, mem: &mut Mem) {
+    fn refresh_live_values(&mut self, mem: &mut Mem, objc: Option<&crate::objc::ObjC>, seconds: f32) {
         if self.state.results.is_empty() {
             return;
         }
@@ -673,14 +748,37 @@ impl Trainer {
         let frozen: HashSet<_> = self.state.frozen.iter().flat_map(|p| {
             (0..p.vtype.size()).filter_map(move |offset| p.addr.checked_add(offset))
         }).collect();
-        for r in self.state.results.iter_mut() {
+        self.state.activity.changed_last_sample = 0;
+        let now = Instant::now();
+        let mut allocations = mem.live_allocations();
+        allocations.sort_unstable_by_key(|a| a.0);
+        let len = self.state.results.len();
+        // Rotate traversal so a flood is not permanently biased to high addresses.
+        for step in 0..len {
+            let i = (self.state.activity_cursor + step) % len;
+            let r = &mut self.state.results[i];
+            if bulk::containing_allocation(&allocations, r.addr, r.vtype.size()).is_none() {
+                r.analysis = Analysis::default();
+                r.changed = false;
+                continue;
+            }
             if let Some(current) = r.vtype.read_at(mem, r.addr) {
                 if !frozen.is_empty() && (0..r.vtype.size()).filter_map(|offset| r.addr.checked_add(offset))
                     .any(|addr| frozen.contains(&addr))
                 {
                     r.analysis.reset_history();
                 } else {
-                    r.analysis.observe(r.vtype, r.bits, current);
+                    if current != r.bits {
+                        // Bound feed work even if every stored hit is changing.
+                        if self.state.activity.changed_last_sample < 256 {
+                            self.state.activity.record(Change {
+                                addr: r.addr, vtype: r.vtype, before: r.bits, after: current, at: now,
+                            });
+                        } else {
+                            self.state.activity.changed_last_sample += 1;
+                        }
+                    }
+                    r.analysis.observe_timed(r.vtype, r.bits, current, seconds);
                 }
                 r.changed = current != r.bits;
                 r.bits = current;
@@ -688,7 +786,9 @@ impl Trainer {
                 r.analysis = Analysis::default();
             }
         }
-        analyze_batch(mem, &mut self.state.results, &mut self.state.analysis_cursor);
+        self.state.activity_cursor = (self.state.activity_cursor + 67) % len;
+        classify::analyze_batch_with_objects(mem, &mut self.state.results, &mut self.state.analysis_cursor, objc);
+        trainer_ui::publish_activity(&self.state.activity.entries, self.state.activity.changed_last_sample, len);
         trainer_ui::publish_live_values(&self.state.results);
     }
 

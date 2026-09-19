@@ -67,21 +67,77 @@ The classifier reads at most 64 neighbouring bytes on each side of a value,
 inside the same live allocation. It checks complete, case-insensitive English
 keywords in ASCII or ASCII-compatible UTF-16LE; clipped words and the searched
 value's own bytes are excluded. Conflicting keyword categories stay Unknown.
-It does not follow pointers, execute guest code, or probe addresses with writes.
+It does not follow arbitrary pointer chains, execute guest code, or probe
+addresses with writes.
 Inspection is incremental (at most 1,024 hits per refresh); large searches take
 several refreshes to classify. Unknown also includes not-yet-inspected results.
 
-During live refresh, three observed unit decrements of a small nonnegative
-integer can suggest Ammo; three small fractional float decreases can suggest
-Timer. Neither pattern proves what a value represents: health, money and other
-counters may behave identically. A matching keyword plus pattern is medium
-confidence at most. Money/Health/Score currently depend on nearby keywords,
-not on a number being large or an address having a particular shape. Trainer
-writes reset affected observation histories, and frozen ranges/aliases do not
-contribute behavioural evidence. Refinement preserves hints for unchanged types.
+### Deeper analysis: typed fields and multi-event patterns
+
+For registered Objective-C objects the trainer now checks runtime field
+metadata: the allocation base must be a known object, the exact field offset
+must match, and the declared scalar type and size must match the search result.
+Inherited fields are checked too (bounded to 16 classes / 256 fields per lookup).
+Pointers, object references, aggregates and unknown encodings are excluded.
+Names such as `_coins`, `playerAmmo`, `currentHP` and `healthPoints` can therefore
+identify a field even when no readable string is next to its numeric value.
+This stronger hint takes precedence over unrelated nearby words. Tapping a
+result shows the actual field name when available. No guest messages are sent.
+
+Plain repeated `-1` changes are now **ambiguous**, not automatically Ammo.
+An Ammo pattern requires at least two observed cycles of three or more unit
+decrements followed by a refill to the same small integer capacity. A Timer
+pattern needs six fractional float decreases at a roughly consistent rate,
+using elapsed host time and accounting for unchanged samples between changes.
+Irregular jumps reset the pattern. Matching nearby words can corroborate the
+patterns, but patterns alone are still low-confidence hints, not identification.
+Trainer edits reset histories and frozen ranges/aliases do not provide evidence.
+
+### MARK: narrow addresses using an actual game action
+
+This often works better than guessing labels, particularly in C/C++ games:
+
+1. Search for the current displayed number; use **GROUP: All** initially.
+2. Tap **MARK** to snapshot the complete stored result set.
+3. Return to the game (or open WATCH) and spend currency, fire, or take damage.
+4. Open CE and tap **DOWN**, **UP**, **CHANGED**, or **SAME** to retain only
+   results whose values decreased, increased, changed, or stayed the same.
+5. Repeat with another action. Each successful comparison advances the baseline
+   to the surviving results' current values; ordinary live refresh never moves it.
+
+The comparison filters the search, not just the visible page/category, and
+writes nothing. Numeric comparisons honour signed integers and float values.
+No MARK means no filtering; an exhausted comparison never restarts a search.
+New searches, value refinements, reset, trainer edits/hack reloads and bulk
+preview invalidate the experiment (MARK again). Freed/unreadable addresses
+are rejected; allocation reuse with identical boundaries remains undetectable.
+
+### WATCH: independent live-change window
+
+Tap **WATCH** in CE to close the editor and open a compact window over the game.
+It monitors **all stored search hits**, independent of GROUP, not arbitrary
+unsearched memory. Each row shows `address`, concrete `type`, `before -> after`,
+and seconds since observation. New changes light up; old rows retain their age
+instead of pretending to be happening now. Tap a row to select that exact
+address/type in the editor; selection is checked against the current search and
+live allocations. Touches outside the window still reach the game.
+
+- **PAUSE / RESUME** holds/releases the displayed feed, not the game.
+- **OLDER / NEWER** browses recent entries and automatically holds the feed.
+- **CLEAR** clears history; **X** hides the window. CE still opens the editor.
+- The feed retains 64 distinct address/type pairs, coalescing repeated changes.
+  It shows five per page, counts all changed hits per sample, and processes at
+  most 256 feed events per sample with a rotating traversal when overloaded.
+  The header says `(sampled)` when the feed cannot retain every changed hit.
+- Sampling remains every ~250 ms of host time. Intermediate writes or changes
+  that return to their previous value between samples may be missed. This is
+  not a CPU write breakpoint or a complete memory-access trace.
+- Trainer writes, frozen aliases, and expired allocations are not reported as
+  game-change events. Search/refine/reset and comparisons clear the old feed.
 
 Most games will still have many Unknown results: field names may be stripped,
-stored elsewhere, encrypted, or absent. Hints can be wrong or become stale;
+stored elsewhere, encrypted, or absent. C/C++ objects have no Objective-C
+field metadata, and host-only values are not guest-memory scalar fields. Hints can be wrong or become stale;
 allocation reuse is not reliably detectable. **A Money? label does not prove
 currency or make a write safe.** Verify with legitimate in-game changes and
 refinement; back up saves before editing.
@@ -161,6 +217,8 @@ are not subject to the bulk preview/filter and still require care.
 RUSTFLAGS="-C link-arg=-latomic" cargo test --lib guest_clock::tests
 RUSTFLAGS="-C link-arg=-latomic" cargo test --lib trainer::tests
 RUSTFLAGS="-C link-arg=-latomic" cargo test --lib trainer::classify::tests
+RUSTFLAGS="-C link-arg=-latomic" cargo test --lib trainer::watch::tests
+RUSTFLAGS="-C link-arg=-latomic" cargo test --lib objc::properties::trainer_metadata_tests
 RUSTFLAGS="-C link-arg=-latomic" cargo test --lib trainer_ui::tests
 ```
 
@@ -172,3 +230,8 @@ not replace testing against real games on the target device. Classification test
 also cover keyword boundaries/conflicts, read-only allocation-bounded inspection,
 behavioural hints, incremental batches, frozen/edit suppression, full-set paging,
 category-scoped bulk plans and invalidation after category changes.
+
+Additional regressions cover exact scalar field identification, pointer/type/
+offset rejection, repeated refill cycles, irregular timer rejection, explicit
+snapshot baselines, signed/float comparisons, bounded/coalesced activity feeds,
+trainer-write suppression, watch-window layout, and read-only UI commands.

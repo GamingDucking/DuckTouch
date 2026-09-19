@@ -20,6 +20,8 @@ use crate::guest_clock::Speed;
 use crate::gles::gles11_raw as gles11;
 use crate::gles::{GLES, GLint, GLuint};
 use crate::trainer::{SearchResult, VType};
+use crate::trainer::watch::{Change, WatchFilter};
+use std::collections::VecDeque;
 use crate::trainer::classify::{Category, ResultFilter};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -37,6 +39,11 @@ pub enum TrainerCmd {
     SetAll { vtype: VType, text: String, confirm: bool, safe_mode: bool, filter: ResultFilter },
     CancelBulk,
     RefreshView,
+    InspectSelection,
+    Mark,
+    Compare(WatchFilter),
+    ClearActivity,
+    SelectChange { addr: u32, vtype: VType },
     Freeze { vtype: VType, text: String },
     UnfreezeAll,
     Dump,
@@ -82,6 +89,12 @@ struct TrainerUi {
     speed_dirty: bool,
     /// Widget id pressed but not yet released (pending activation).
     pending: Option<u16>,
+    watch_open: bool,
+    watch_paused: bool,
+    activity: Vec<Change>,
+    activity_changed: usize,
+    activity_tracked: usize,
+    activity_scroll: usize,
 }
 
 impl TrainerUi {
@@ -89,6 +102,7 @@ impl TrainerUi {
     /// This avoids both a huge UI copy and the old first-200 paging cutoff.
     fn update_results(&mut self, results: &[SearchResult], reset: bool) {
         if reset {
+            self.activity_tracked = results.len();
             self.scroll = 0;
             self.selected = None;
             self.selected_type = None;
@@ -143,6 +157,12 @@ impl TrainerUi {
             speed: Speed::Normal,
             speed_dirty: false,
             pending: None,
+            watch_open: false,
+            watch_paused: false,
+            activity: Vec::new(),
+            activity_changed: 0,
+            activity_tracked: 0,
+            activity_scroll: 0,
         }
     }
 }
@@ -181,11 +201,50 @@ pub fn reset_for_app(app_id: Option<&str>) {
     ui.speed = Speed::Normal;
     ui.speed_dirty = false;
     ui.pending = None;
+    ui.watch_open = false;
+    ui.watch_paused = false;
+    ui.activity.clear();
+    ui.activity_changed = 0;
+    ui.activity_tracked = 0;
+    ui.activity_scroll = 0;
 }
 
 /// Refresh the currently selected category/page without resetting its scroll.
 pub fn publish_live_values(results: &[SearchResult]) {
     UI.lock().unwrap().update_results(results, false);
+}
+
+pub fn publish_activity(changes: &VecDeque<Change>, changed: usize, tracked: usize) {
+    let mut ui = UI.lock().unwrap();
+    if !ui.watch_paused {
+        ui.activity_scroll = 0;
+        ui.activity = changes.iter().copied().collect();
+        ui.activity_changed = changed;
+        ui.activity_tracked = tracked;
+    }
+}
+
+pub fn clear_activity() {
+    let mut ui = UI.lock().unwrap();
+    ui.activity.clear();
+    ui.activity_scroll = 0;
+    ui.activity_changed = 0;
+    ui.activity_tracked = ui.total_results;
+}
+
+pub fn focus_result(results: &[SearchResult], addr: u32, vtype: VType) {
+    let mut ui = UI.lock().unwrap();
+    if let Some(i) = results.iter().position(|r| r.addr == addr && r.vtype == vtype) {
+        ui.open = true;
+        ui.filter = ResultFilter::All;
+        ui.scroll = i;
+        ui.update_results(results, false);
+        ui.selected = Some(addr);
+        ui.selected_type = Some(vtype);
+        ui.vtype = vtype;
+        let r = &results[i];
+        ui.status = format!("{}: {}", r.analysis.category.label(), r.analysis.description());
+    }
 }
 
 /// Consumed by Environment, which owns the per-app guest clock.
@@ -244,6 +303,18 @@ const W_SPEED_DOWN: u16 = 18;
 const W_SPEED_RESET: u16 = 19;
 const W_SPEED_UP: u16 = 20;
 const W_CATEGORY: u16 = 21;
+const W_WATCH: u16 = 22;
+const W_MARK: u16 = 23;
+const W_CHANGED: u16 = 24;
+const W_SAME: u16 = 25;
+const W_INCREASED: u16 = 26;
+const W_DECREASED: u16 = 27;
+const W_WATCH_PAUSE: u16 = 28;
+const W_WATCH_CLEAR: u16 = 29;
+const W_WATCH_CLOSE: u16 = 30;
+const W_WATCH_NEWER: u16 = 45;
+const W_WATCH_OLDER: u16 = 46;
+const W_CHANGE_BASE: u16 = 40; // + row index; below keypad IDs
 const W_SAVE: u16 = 13;
 const W_SCROLL_UP: u16 = 14;
 const W_SCROLL_DOWN: u16 = 15;
@@ -276,6 +347,7 @@ struct Layout {
     scale: f32,
     button: Rect,
     panel: Option<PanelLayout>,
+    monitor: Option<PanelLayout>,
 }
 
 struct PanelLayout {
@@ -294,7 +366,7 @@ fn compute_layout(ui: &TrainerUi, viewport: (u32, u32, u32, u32)) -> Layout {
     let (_vx, _vy, vw, vh) = viewport;
     let (vx, vy, vw, vh) = (0.0_f32, 0.0_f32, vw as f32, vh as f32);
     // Fit the complete panel, including speed controls, in both orientations.
-    let s = (vh / 550.0).min(vw / 320.0).clamp(0.25, 4.0);
+    let s = (vh / 580.0).min(vw / 320.0).clamp(0.25, 4.0);
     let btn = 30.0 * s;
     let button = Rect {
         x: vx + vw - btn - 6.0 * s,
@@ -357,6 +429,12 @@ fn compute_layout(ui: &TrainerUi, viewport: (u32, u32, u32, u32)) -> Layout {
             push_widget(*id, px + 6.0 * s + (third + 4.0 * s) * i as f32, y, third, row_h, &mut widgets);
         }
         y += row_h + 4.0 * s;
+        // Explicit before/after comparison: independent of live refresh.
+        let fifth = (pw - 12.0 * s - 8.0 * s) / 5.0;
+        for (i, id) in [W_MARK, W_CHANGED, W_SAME, W_INCREASED, W_DECREASED].iter().enumerate() {
+            push_widget(*id, px + 6.0 * s + (fifth + 2.0 * s) * i as f32, y, fifth, row_h, &mut widgets);
+        }
+        y += row_h + 4.0 * s;
         // Category selector: guesses always keep a question mark.
         push_widget(W_CATEGORY, px + 6.0 * s, y, pw - 12.0 * s, row_h, &mut widgets);
         y += row_h + 4.0 * s;
@@ -381,10 +459,10 @@ fn compute_layout(ui: &TrainerUi, viewport: (u32, u32, u32, u32)) -> Layout {
             push_widget(*id, px + 6.0 * s + (quarter + 4.0 * s) * i as f32, y, quarter, row_h, &mut widgets);
         }
         y += row_h + 4.0 * s;
-        // Dump / save row.
-        let half = (pw - 12.0 * s - 4.0 * s) / 2.0;
-        for (i, id) in [W_DUMP, W_SAVE].iter().enumerate() {
-            push_widget(*id, px + 6.0 * s + (half + 4.0 * s) * i as f32, y, half, row_h, &mut widgets);
+        // Read-only activity window plus dump/save.
+        let third = (pw - 12.0 * s - 8.0 * s) / 3.0;
+        for (i, id) in [W_DUMP, W_SAVE, W_WATCH].iter().enumerate() {
+            push_widget(*id, px + 6.0 * s + (third + 4.0 * s) * i as f32, y, third, row_h, &mut widgets);
         }
         y += row_h + 4.0 * s;
         // Status line (not interactive).
@@ -397,7 +475,27 @@ fn compute_layout(ui: &TrainerUi, viewport: (u32, u32, u32, u32)) -> Layout {
     } else {
         None
     };
-    Layout { scale: s, button, panel }
+    let monitor = if ui.watch_open && !ui.open {
+        // A compact independent window leaves the rest of the game touchable.
+        let ms = (vw / 360.0).min(vh / 360.0).clamp(0.25, 2.0);
+        let rect = Rect { x: 6.0 * ms, y: 42.0 * ms, w: 280.0 * ms, h: 218.0 * ms };
+        let mut widgets = Vec::new();
+        for (i, id) in [W_WATCH_PAUSE, W_WATCH_CLEAR, W_WATCH_CLOSE].iter().enumerate() {
+            widgets.push((*id, Rect { x: rect.x + (128.0 + i as f32 * 48.0) * ms,
+                y: rect.y + 3.0 * ms, w: 46.0 * ms, h: 23.0 * ms }));
+        }
+        for row in 0..RESULT_ROWS {
+            widgets.push((W_CHANGE_BASE + row as u16, Rect { x: rect.x + 4.0 * ms,
+                y: rect.y + (42.0 + row as f32 * 29.0) * ms,
+                w: rect.w - 8.0 * ms, h: 28.0 * ms }));
+        }
+        for (i, id) in [W_WATCH_NEWER, W_WATCH_OLDER].iter().enumerate() {
+            widgets.push((*id, Rect { x: rect.x + (4.0 + i as f32 * 138.0) * ms,
+                y: rect.y + 190.0 * ms, w: 134.0 * ms, h: 23.0 * ms }));
+        }
+        Some(PanelLayout { rect, widgets, results_header_y: rect.y + 28.0 * ms })
+    } else { None };
+    Layout { scale: s, button, panel, monitor }
 }
 
 // ---------------------------------------------------------------------------
@@ -424,7 +522,7 @@ pub fn touch_down(abs: (f32, f32), viewport: (u32, u32, u32, u32)) -> bool {
         ui.pending = Some(W_BUTTON);
         return true;
     }
-    if let Some(panel) = &layout.panel {
+    if let Some(panel) = layout.panel.as_ref().or(layout.monitor.as_ref()) {
         if !panel.rect.contains(x, y) {
             return false; // outside the panel: let the game have the touch
         }
@@ -460,7 +558,7 @@ pub fn touch_up(abs: (f32, f32), viewport: (u32, u32, u32, u32)) -> bool {
     let (x, y) = (abs.0 - vx as f32, abs.1 - vy as f32);
     let Some(pending) = ui.pending.take() else {
         // Finger wasn't consumed on the way down.
-        if layout.button.contains(x, y) || layout.panel.as_ref().map_or(false, |p| p.rect.contains(x, y)) {
+        if layout.button.contains(x, y) || layout.panel.as_ref().or(layout.monitor.as_ref()).map_or(false, |p| p.rect.contains(x, y)) {
             return true;
         }
         return false;
@@ -469,7 +567,7 @@ pub fn touch_up(abs: (f32, f32), viewport: (u32, u32, u32, u32)) -> bool {
     let hit = pending == W_BUTTON && layout.button.contains(x, y)
         || layout
             .panel
-            .as_ref()
+            .as_ref().or(layout.monitor.as_ref())
             .map_or(false, |p| p.widgets.iter().any(|(id, r)| *id == pending && r.contains(x, y)));
     if hit {
         activate_widget(&mut ui, pending);
@@ -486,6 +584,45 @@ fn activate_widget(ui: &mut TrainerUi, id: u16) {
     }
     match id {
         W_BUTTON => ui.open = !ui.open,
+        W_WATCH => { ui.watch_open = true; ui.open = false; }
+        W_WATCH_CLOSE => ui.watch_open = false,
+        W_WATCH_PAUSE => {
+            ui.watch_paused = !ui.watch_paused;
+            ui.activity_scroll = 0;
+        }
+        W_WATCH_NEWER | W_WATCH_OLDER => {
+            ui.watch_paused = true;
+            ui.activity_scroll = if id == W_WATCH_NEWER {
+                ui.activity_scroll.saturating_sub(RESULT_ROWS)
+            } else {
+                (ui.activity_scroll + RESULT_ROWS).min(ui.activity.len().saturating_sub(RESULT_ROWS))
+            };
+        }
+        W_WATCH_CLEAR => {
+            ui.activity.clear();
+            ui.activity_scroll = 0;
+            ui.activity_changed = 0;
+            COMMANDS.lock().unwrap().push(TrainerCmd::ClearActivity);
+        }
+        W_MARK => COMMANDS.lock().unwrap().push(TrainerCmd::Mark),
+        W_CHANGED | W_SAME | W_INCREASED | W_DECREASED => {
+            let filter = match id {
+                W_CHANGED => WatchFilter::Changed, W_SAME => WatchFilter::Same,
+                W_INCREASED => WatchFilter::Increased, _ => WatchFilter::Decreased,
+            };
+            COMMANDS.lock().unwrap().push(TrainerCmd::Compare(filter));
+        }
+        id if (W_CHANGE_BASE..W_CHANGE_BASE + RESULT_ROWS as u16).contains(&id) => {
+            if let Some(change) = ui.activity.get(ui.activity_scroll + (id - W_CHANGE_BASE) as usize) {
+                ui.open = true;
+                ui.selected = None;
+                ui.selected_type = None;
+                ui.vtype = change.vtype;
+                COMMANDS.lock().unwrap().push(TrainerCmd::SelectChange {
+                    addr: change.addr, vtype: change.vtype,
+                });
+            }
+        }
         W_CLOSE => ui.open = false,
         W_TYPE => ui.vtype = ui.vtype.next(),
         W_SAFE_MODE => {
@@ -582,6 +719,7 @@ fn activate_widget(ui: &mut TrainerUi, id: u16) {
                 ui.selected = Some(result.addr);
                 ui.selected_type = Some(result.vtype);
                 ui.status = format!("{}: {}", result.analysis.category.label(), result.analysis.description());
+                COMMANDS.lock().unwrap().push(TrainerCmd::InspectSelection);
             }
         }
         id if (W_KEY_BASE..W_KEY_BASE + 16).contains(&id) => {
@@ -1033,6 +1171,45 @@ unsafe fn build_scene(
         COL_TEXT,
     );
 
+    if let Some(monitor) = &layout.monitor {
+        let ms = monitor.rect.w / 280.0;
+        push_rect(&mut quads, monitor.rect, COL_PANEL);
+        push_text(&mut quads, atlas, if ui_state.watch_paused { "CHANGES PAUSED" } else { "LIVE CHANGES" },
+            monitor.rect.x + 5.0 * ms, monitor.rect.y + 9.0 * ms, 10.0 * ms, COL_ACCENT);
+        let counts = if ui_state.activity_tracked == 0 {
+            "Search a value first; then play".to_string()
+        } else {
+            format!("{} changed / {} tracked{}", ui_state.activity_changed, ui_state.activity_tracked,
+                if ui_state.activity_changed > 256 { " (sampled)" } else { "" })
+        };
+        let size = 9.0 * ms;
+        let size = size * ((monitor.rect.w - 10.0 * ms) / text_width(atlas, &counts, size).max(1.0)).min(1.0);
+        push_text(&mut quads, atlas, &counts, monitor.rect.x + 5.0 * ms,
+            monitor.results_header_y + 2.0 * ms, size, COL_TEXT_DIM);
+        for &(id, rect) in &monitor.widgets {
+            push_rect(&mut quads, rect, COL_WIDGET);
+            let label = match id {
+                W_WATCH_PAUSE => Some(if ui_state.watch_paused { "RESUME" } else { "PAUSE" }),
+                W_WATCH_CLEAR => Some("CLEAR"), W_WATCH_CLOSE => Some("X"),
+                W_WATCH_NEWER => Some("< NEWER"), W_WATCH_OLDER => Some("OLDER >"), _ => None,
+            };
+            if let Some(label) = label {
+                push_text(&mut quads, atlas, label, rect.x + 3.0 * ms, rect.y + 7.0 * ms, 9.0 * ms, COL_TEXT);
+            } else if let Some(change) = ui_state.activity.get(ui_state.activity_scroll + (id - W_CHANGE_BASE) as usize) {
+                let fresh = !ui_state.watch_paused && change.at.elapsed().as_secs_f32() < 0.75;
+                let title = format!("0x{:08X} {}  {:.1}s ago", change.addr, change.vtype.name(), change.at.elapsed().as_secs_f32());
+                let values = format!("{} -> {}", change.vtype.format(change.before), change.vtype.format(change.after));
+                for (line, text) in [title, values].iter().enumerate() {
+                    let size = 10.0 * ms;
+                    let size = size * ((rect.w - 10.0 * ms) / text_width(atlas, text, size).max(1.0)).min(1.0);
+                    push_text(&mut quads, atlas, text, rect.x + 4.0 * ms,
+                        rect.y + (2.0 + line as f32 * 13.0) * ms, size,
+                        if fresh { COL_ACCENT } else { COL_TEXT });
+                }
+            }
+        }
+    }
+
     if let Some(panel) = &layout.panel {
         push_rect(&mut quads, panel.rect, COL_PANEL);
 
@@ -1138,7 +1315,7 @@ unsafe fn build_scene(
                         );
                     }
                 }
-                W_SEARCH | W_REFINE | W_RESET | W_SET | W_SET_ALL | W_FREEZE | W_UNFREEZE | W_DUMP | W_SAVE => {
+                W_SEARCH | W_REFINE | W_RESET | W_SET | W_SET_ALL | W_FREEZE | W_UNFREEZE | W_DUMP | W_SAVE | W_WATCH | W_MARK | W_CHANGED | W_SAME | W_INCREASED | W_DECREASED => {
                     push_rect(&mut quads, *rect, COL_WIDGET);
                     let label: &str = match *id {
                         W_SEARCH => "SEARCH",
@@ -1149,10 +1326,17 @@ unsafe fn build_scene(
                         W_FREEZE => "FREEZE",
                         W_UNFREEZE => "UNFRZ",
                         W_DUMP => "DUMP",
-                        W_SAVE => "SAVE HACK",
+                        W_SAVE => "SAVE",
+                        W_WATCH => "WATCH",
+                        W_MARK => "MARK",
+                        W_CHANGED => "CHANGED",
+                        W_SAME => "SAME",
+                        W_INCREASED => "UP",
+                        W_DECREASED => "DOWN",
                         _ => "",
                     };
                     let size = 12.0 * bs;
+                    let size = size * ((rect.w - 6.0 * bs) / text_width(atlas, label, size).max(1.0)).min(1.0);
                     let tw = text_width(atlas, label, size);
                     push_text(&mut quads,
                         atlas,
@@ -1167,6 +1351,7 @@ unsafe fn build_scene(
                     push_rect(&mut quads, *rect, COL_WIDGET);
                     let label: &str = if *id == W_SCROLL_UP { "^" } else { "v" };
                     let size = 12.0 * bs;
+                    let size = size * ((rect.w - 6.0 * bs) / text_width(atlas, label, size).max(1.0)).min(1.0);
                     let tw = text_width(atlas, label, size);
                     push_text(&mut quads,
                         atlas,

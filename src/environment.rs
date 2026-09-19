@@ -1723,7 +1723,7 @@ impl Environment {
                     &mut self.trainer,
                     crate::trainer::Trainer::new(false),
                 );
-                trainer.tick(&mut self.mem, Some(app_id.as_str()));
+                trainer.tick(&mut self.mem, Some(app_id.as_str()), &self.objc);
                 self.trainer = trainer;
                 if let Some(speed) = crate::trainer_ui::take_speed_request() {
                     self.guest_clock.set_speed(speed);

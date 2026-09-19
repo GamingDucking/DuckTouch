@@ -373,3 +373,52 @@ fn selected_result_keeps_concrete_type_and_shows_reason() {
     assert_eq!(ui.selected, None);
     take_commands();
 }
+
+#[test]
+fn watch_window_is_independent_and_fits_portrait_and_landscape() {
+    let mut ui = TrainerUi::new();
+    ui.watch_open = true;
+    for viewport in [(0, 100, 320, 480), (100, 0, 480, 320), (0, 0, 1920, 1080)] {
+        let layout = compute_layout(&ui, viewport);
+        assert!(layout.panel.is_none());
+        let monitor = layout.monitor.unwrap();
+        assert!(monitor.rect.x + monitor.rect.w <= viewport.2 as f32);
+        assert!(monitor.rect.y + monitor.rect.h <= viewport.3 as f32);
+        let ids: std::collections::HashSet<_> = monitor.widgets.iter().map(|w| w.0).collect();
+        assert_eq!(ids.len(), monitor.widgets.len());
+        for &(_, r) in &monitor.widgets {
+            assert!(r.x >= monitor.rect.x && r.x + r.w <= monitor.rect.x + monitor.rect.w);
+            assert!(r.y >= monitor.rect.y && r.y + r.h <= monitor.rect.y + monitor.rect.h);
+        }
+    }
+    ui.open = true;
+    assert!(compute_layout(&ui, (0, 0, 320, 480)).monitor.is_none());
+}
+
+#[test]
+fn watch_controls_pause_browse_and_select_without_writing() {
+    let _guard = INPUT_TEST_LOCK.lock().unwrap();
+    let mut ui = TrainerUi::new();
+    ui.open = true;
+    ui.activity = (0..12).map(|i| Change { addr: 0x1000 + 4 * i, vtype: VType::I32,
+        before: 30, after: 29, at: std::time::Instant::now() }).collect();
+    take_commands();
+    activate_widget(&mut ui, W_WATCH);
+    assert!(ui.watch_open && !ui.open);
+    activate_widget(&mut ui, W_WATCH_OLDER);
+    assert!(ui.watch_paused);
+    assert_eq!(ui.activity_scroll, RESULT_ROWS);
+    take_commands();
+    activate_widget(&mut ui, W_CHANGE_BASE);
+    assert!(ui.open);
+    assert!(matches!(take_commands().as_slice(), [TrainerCmd::CancelBulk,
+        TrainerCmd::SelectChange { addr: 0x1014, vtype: VType::I32 }]));
+    activate_widget(&mut ui, W_WATCH_PAUSE);
+    assert!(!ui.watch_paused);
+    assert_eq!(ui.activity_scroll, 0);
+    take_commands();
+    activate_widget(&mut ui, W_MARK);
+    assert!(matches!(take_commands().as_slice(), [TrainerCmd::CancelBulk, TrainerCmd::Mark]));
+    activate_widget(&mut ui, W_DECREASED);
+    assert!(matches!(take_commands().as_slice(), [TrainerCmd::CancelBulk, TrainerCmd::Compare(WatchFilter::Decreased)]));
+}

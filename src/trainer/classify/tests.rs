@@ -39,14 +39,19 @@ fn arbitrary_addresses_and_initial_values_remain_unknown() {
 }
 
 #[test]
-fn unit_decrements_are_only_a_low_confidence_ammo_guess() {
+fn unit_decrements_alone_are_ambiguous_but_reload_cycles_add_evidence() {
     let mut a = Analysis::default();
     for (old, new) in [(30, 29), (29, 28), (28, 27)] {
         a.observe(VType::I32, old, new);
     }
-    assert_eq!(a.category, Category::Ammo);
+    assert_eq!(a.category, Category::Unknown);
     assert_eq!(a.evidence, Evidence::UnitDrops);
-    assert!(a.description().contains("low confidence"));
+    a.observe(VType::I32, 27, 30);
+    for (old, new) in [(30, 29), (29, 28), (28, 27), (27, 30)] {
+        a.observe(VType::I32, old, new);
+    }
+    assert_eq!(a.category, Category::Ammo);
+    assert_eq!(a.evidence, Evidence::ReloadCycles);
     a.text_mask = word_mask(b"\0ammo\0");
     a.update_hint();
     assert_eq!(a.evidence, Evidence::TextAndChanges);
@@ -62,7 +67,7 @@ fn unit_decrements_are_only_a_low_confidence_ammo_guess() {
 #[test]
 fn timer_guess_needs_repeated_fractional_float_decreases() {
     let mut a = Analysis::default();
-    for (old, new) in [(3.5f32, 3.25f32), (3.25, 3.0), (3.0, 2.75)] {
+    for (old, new) in [(3.5f32, 3.25f32), (3.25, 3.0), (3.0, 2.75), (2.75, 2.5), (2.5, 2.25), (2.25, 2.0)] {
         a.observe(VType::F32, old.to_bits() as u64, new.to_bits() as u64);
     }
     assert_eq!(a.category, Category::Timer);
@@ -131,4 +136,29 @@ fn filter_cycle_reaches_each_category_then_all() {
         }
     }
     assert_eq!(filter.next(), ResultFilter::All);
+}
+
+#[test]
+fn field_names_are_stronger_than_unrelated_neighbouring_words() {
+    assert_eq!(field_mask("_playerMoney"), 1 << Category::Money.index());
+    assert_eq!(field_mask("currentAmmo"), 1 << Category::Ammo.index());
+    assert_eq!(field_mask("currentHP"), 1 << Category::Health.index());
+    assert_eq!(field_mask("healthPoints"), 1 << Category::Health.index());
+    let mut a = Analysis { field_mask: field_mask("_coins"),
+        text_mask: word_mask(b"\0health timer\0"), ..Analysis::default() };
+    a.update_hint();
+    assert_eq!(a.category, Category::Money);
+    assert_eq!(a.evidence, Evidence::ScalarField);
+}
+
+#[test]
+fn irregular_float_changes_do_not_look_like_a_steady_timer() {
+    let mut a = Analysis::default();
+    let mut value = 20.5f32;
+    for step in 0..12 {
+        let next = value - if step % 2 == 0 { 0.1 } else { 1.5 };
+        a.observe_timed(VType::F32, value.to_bits() as u64, next.to_bits() as u64, 0.25);
+        assert_eq!(a.category, Category::Unknown);
+        value = next;
+    }
 }
