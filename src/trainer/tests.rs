@@ -83,82 +83,100 @@ fn empty_refine_never_restarts_a_search() {
 }
 
 #[test]
-fn bulk_range_failure_does_not_partially_write() {
+fn preview_skips_overflow_without_writing_anything() {
     let (mut mem, base) = memory(64);
     let mut hits = [
         result(&mut mem, base, VType::I32, "100"),
         result(&mut mem, base + 8, VType::U8, "100"),
     ];
     let before = snapshot(&mem, base, 64);
-    assert!(set_all(&mut mem, &mut hits, VType::Auto, "999999").is_err());
+    let plan = plan_bulk(&mem, &hits, VType::Auto, "999999").unwrap();
+    assert_eq!((plan.writes.len(), plan.skipped), (1, 1));
     assert_eq!(snapshot(&mem, base, 64), before);
     assert_eq!(hits[0].bits, 100);
+    assert_eq!(apply_bulk(&mut mem, &mut hits, &plan), Ok(1));
+    assert_eq!(VType::I32.read_at(&mem, base), Some(999999));
+    assert_eq!(snapshot(&mem, base + 4, 60), before[4..]);
 }
 
 #[test]
 fn changing_ui_type_cannot_widen_a_bulk_write() {
     let (mut mem, base) = memory(64);
-    let mut hits = [result(&mut mem, base, VType::U8, "100")];
+    let hits = [result(&mut mem, base, VType::U8, "100")];
     let before = snapshot(&mem, base, 64);
-    assert!(set_all(&mut mem, &mut hits, VType::I32, "999999").is_err());
+    assert!(plan_bulk(&mem, &hits, VType::I32, "999999").is_err());
     assert_eq!(snapshot(&mem, base, 64), before);
 }
 
 #[test]
-fn overlapping_results_are_rejected_before_writing() {
+fn overlapping_results_are_all_skipped_not_arbitrarily_selected() {
     let (mut mem, base) = memory(64);
     let wide = result(&mut mem, base, VType::I32, "600");
     let narrow = SearchResult { vtype: VType::U16, ..wide };
+    let good = result(&mut mem, base + 8, VType::I32, "600");
     let before = snapshot(&mem, base, 64);
-    for mut hits in [[wide, narrow], [narrow, wide], [wide, wide]] {
-        assert!(set_all(&mut mem, &mut hits, VType::Auto, "1000").is_err());
+    for hits in [[wide, narrow, good], [narrow, wide, good], [wide, wide, good]] {
+        let plan = plan_bulk(&mem, &hits, VType::Auto, "1000").unwrap();
+        assert_eq!((plan.writes.len(), plan.skipped), (1, 2));
         assert_eq!(snapshot(&mem, base, 64), before);
     }
+    let mut hits = [wide, narrow, good];
+    let plan = plan_bulk(&mem, &hits, VType::Auto, "1000").unwrap();
+    assert_eq!(apply_bulk(&mut mem, &mut hits, &plan), Ok(1));
+    assert_eq!(VType::I32.read_at(&mem, base), Some(600));
+    assert_eq!(VType::I32.read_at(&mem, base + 8), Some(1000));
 }
 
 #[test]
-fn broad_search_is_blocked_not_truncated_to_a_subset() {
-    let size = (MAX_BULK_WRITES as u32 + 1) * 4;
+fn more_than_32_matches_are_previewed_and_written_without_truncation() {
+    const COUNT: usize = 1325;
+    let size = (COUNT * 4) as u32;
     let (mut mem, base) = memory(size);
-    let mut hits: Vec<_> = (0..=MAX_BULK_WRITES)
-        .map(|i| result(&mut mem, base + i as u32 * 4, VType::I32, "600"))
+    let mut hits: Vec<_> = (0..COUNT)
+        .map(|i| result(&mut mem, base + i as u32 * 4, VType::I32, "135"))
         .collect();
     let before = snapshot(&mem, base, size);
-    assert!(set_all(&mut mem, &mut hits, VType::Auto, "1000").is_err());
+    let plan = plan_bulk(&mem, &hits, VType::Auto, "999").unwrap();
+    assert_eq!((plan.writes.len(), plan.skipped), (COUNT, 0));
     assert_eq!(snapshot(&mem, base, size), before);
-    hits.pop();
-    assert_eq!(set_all(&mut mem, &mut hits, VType::Auto, "1000"), Ok(MAX_BULK_WRITES));
-    assert_eq!(VType::I32.read_at(&mem, base + MAX_BULK_WRITES as u32 * 4), Some(600));
+    assert_eq!(apply_bulk(&mut mem, &mut hits, &plan), Ok(COUNT));
+    assert!(hits.iter().all(|hit| VType::I32.read_at(&mem, hit.addr) == Some(999)));
 }
 
 #[test]
-fn stale_and_freed_results_do_not_partially_write() {
+fn changed_or_freed_memory_after_preview_prevents_every_write() {
     let (mut mem, base) = memory(64);
     let other = mem.alloc(64).to_bits();
     let mut hits = [
         result(&mut mem, base, VType::I32, "600"),
         result(&mut mem, other, VType::I32, "600"),
     ];
+    let plan = plan_bulk(&mem, &hits, VType::Auto, "1000").unwrap();
     assert!(VType::I32.write_at(&mut mem, other, 601));
-    assert!(set_all(&mut mem, &mut hits, VType::Auto, "1000").is_err());
+    assert!(apply_bulk(&mut mem, &mut hits, &plan).is_err());
     assert_eq!(VType::I32.read_at(&mem, base), Some(600));
+    assert!(VType::I32.write_at(&mut mem, other, 600));
     mem.free(MutVoidPtr::from_bits(other));
-    assert!(set_all(&mut mem, &mut hits, VType::Auto, "1000").is_err());
+    assert!(apply_bulk(&mut mem, &mut hits, &plan).is_err());
     assert_eq!(VType::I32.read_at(&mem, base), Some(600));
 }
 
 #[test]
-fn unaligned_and_out_of_allocation_hits_are_blocked() {
+fn ineligible_hits_are_filtered_and_counted() {
     let (mut mem, base) = memory(64);
     let good = result(&mut mem, base, VType::I32, "600");
     let unaligned = result(&mut mem, base + 9, VType::I32, "600");
     let outside = SearchResult { addr: base + 64, ..good };
-    for bad in [unaligned, outside] {
-        let mut hits = [good, bad];
-        let before = snapshot(&mem, base, 64);
-        assert!(set_all(&mut mem, &mut hits, VType::Auto, "1000").is_err());
-        assert_eq!(snapshot(&mem, base, 64), before);
-    }
+    let stale = result(&mut mem, base + 16, VType::I32, "600");
+    assert!(VType::I32.write_at(&mut mem, stale.addr, 601));
+    let unchanged = result(&mut mem, base + 24, VType::I32, "1000");
+    let mut hits = [good, unaligned, outside, stale, unchanged];
+    let before = snapshot(&mem, base, 64);
+    let plan = plan_bulk(&mem, &hits, VType::Auto, "1000").unwrap();
+    assert_eq!((plan.writes.len(), plan.skipped), (1, 4));
+    assert_eq!(snapshot(&mem, base, 64), before);
+    assert_eq!(apply_bulk(&mut mem, &mut hits, &plan), Ok(1));
+    assert_eq!(snapshot(&mem, base + 4, 60), before[4..]);
 }
 
 #[test]
@@ -169,7 +187,8 @@ fn valid_batch_preserves_types_neighbours_and_displayed_values() {
         result(&mut mem, base + 8, VType::U16, "600"),
         result(&mut mem, base + 16, VType::F32, "600"),
     ];
-    assert_eq!(set_all(&mut mem, &mut hits, VType::Auto, "1000"), Ok(3));
+    let plan = plan_bulk(&mem, &hits, VType::Auto, "1000").unwrap();
+    assert_eq!(apply_bulk(&mut mem, &mut hits, &plan), Ok(3));
     for hit in hits {
         let expected = hit.vtype.parse("1000").unwrap();
         assert_eq!(hit.bits, expected);
@@ -185,5 +204,63 @@ fn invalid_memory_accesses_fail_without_a_panic_or_sink_write() {
         assert_eq!(VType::I32.read_at(&mem, addr), None);
         assert!(!VType::I32.write_at(&mut mem, addr, 123));
     }
-    assert!(set_all(&mut mem, &mut [], VType::Auto, "1000").is_err());
+    assert!(plan_bulk(&mem, &[], VType::Auto, "1000").is_err());
+}
+
+fn bulk_command(text: &str, confirm: bool) -> TrainerCmd {
+    TrainerCmd::SetAll { vtype: VType::I32, text: text.to_string(), confirm }
+}
+
+#[test]
+fn safe_all_requires_an_explicit_confirmation_of_the_preview() {
+    let (mut mem, base) = memory(64);
+    let mut trainer = Trainer::new(true);
+    trainer.state.results = vec![result(&mut mem, base, VType::I32, "135")];
+    trainer.handle_command(&mut mem, bulk_command("999", false));
+    assert!(trainer.state.pending_bulk.is_some());
+    assert_eq!(VType::I32.read_at(&mem, base), Some(135));
+    // Two rapid clicks queued before the UI shows CONFIRM are only previews.
+    trainer.handle_command(&mut mem, bulk_command("999", false));
+    assert_eq!(VType::I32.read_at(&mem, base), Some(135));
+    trainer.handle_command(&mut mem, bulk_command("999", true));
+    assert_eq!(VType::I32.read_at(&mem, base), Some(999));
+    assert!(trainer.state.pending_bulk.is_none());
+}
+
+#[test]
+fn changed_values_or_input_require_a_new_confirmation() {
+    let (mut mem, base) = memory(64);
+    let mut trainer = Trainer::new(true);
+    trainer.state.results = vec![
+        result(&mut mem, base, VType::I32, "135"),
+        result(&mut mem, base + 8, VType::I32, "135"),
+    ];
+    trainer.handle_command(&mut mem, bulk_command("999", false));
+    assert!(VType::I32.write_at(&mut mem, base + 8, 136));
+    trainer.handle_command(&mut mem, bulk_command("999", true));
+    assert_eq!(VType::I32.read_at(&mem, base), Some(135));
+    let plan = &trainer.state.pending_bulk.as_ref().unwrap().plan;
+    assert_eq!((plan.writes.len(), plan.skipped), (1, 1));
+    trainer.handle_command(&mut mem, bulk_command("1000", true));
+    assert_eq!(VType::I32.read_at(&mem, base), Some(135));
+    trainer.handle_command(&mut mem, bulk_command("1000", true));
+    assert_eq!(VType::I32.read_at(&mem, base), Some(1000));
+    assert_eq!(VType::I32.read_at(&mem, base + 8), Some(136));
+}
+
+#[test]
+fn cancelled_or_expired_confirmation_cannot_write() {
+    let (mut mem, base) = memory(64);
+    let mut trainer = Trainer::new(true);
+    trainer.state.results = vec![result(&mut mem, base, VType::I32, "135")];
+    trainer.handle_command(&mut mem, bulk_command("999", false));
+    trainer.handle_command(&mut mem, TrainerCmd::CancelBulk);
+    assert!(trainer.state.pending_bulk.is_none());
+    trainer.handle_command(&mut mem, bulk_command("999", true));
+    assert_eq!(VType::I32.read_at(&mem, base), Some(135));
+    trainer.state.pending_bulk.as_mut().unwrap().created_at =
+        Instant::now() - BULK_CONFIRM_TIMEOUT;
+    trainer.handle_command(&mut mem, bulk_command("999", true));
+    assert_eq!(VType::I32.read_at(&mem, base), Some(135));
+    assert!(trainer.state.pending_bulk.is_some());
 }

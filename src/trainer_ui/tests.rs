@@ -168,3 +168,48 @@ fn gles1_overlay_does_not_sample_the_presented_game_frame() {
         }
     }
 }
+
+#[test]
+fn panel_has_unique_actions_and_results_header_below_keypad() {
+    let mut ui = TrainerUi::new();
+    ui.open = true;
+    for viewport in [(0, 100, 320, 480), (100, 0, 480, 320)] {
+        let panel = compute_layout(&ui, viewport).panel.unwrap();
+        let ids: std::collections::HashSet<_> = panel.widgets.iter().map(|&(id, _)| id).collect();
+        assert_eq!(ids.len(), panel.widgets.len(), "duplicate widget IDs");
+        assert_eq!(panel.widgets.iter().filter(|&&(id, _)| id == W_SET_ALL).count(), 1);
+        assert_eq!(panel.widgets.iter().filter(|&&(id, _)| id == W_DUMP).count(), 1);
+        let scroll = panel.widgets.iter().find(|&&(id, _)| id == W_SCROLL_UP).unwrap().1;
+        assert_eq!(panel.results_header_y, scroll.y);
+        for &(id, rect) in &panel.widgets {
+            if (W_KEY_BASE..W_KEY_BASE + 16).contains(&id) {
+                assert!(rect.y + rect.h <= panel.results_header_y);
+            }
+        }
+    }
+}
+
+#[test]
+fn dump_and_safe_all_dispatch_distinct_commands() {
+    let mut ui = TrainerUi::new();
+    ui.set_text = "999".to_string();
+    take_commands();
+    activate_widget(&mut ui, W_DUMP);
+    let commands = take_commands();
+    assert!(matches!(commands.as_slice(), [TrainerCmd::CancelBulk, TrainerCmd::Dump]));
+    activate_widget(&mut ui, W_SET_ALL);
+    let commands = take_commands();
+    assert!(matches!(commands.as_slice(), [TrainerCmd::SetAll { confirm: false, .. }]));
+    ui.bulk_preview = true;
+    activate_widget(&mut ui, W_SET_ALL);
+    let commands = take_commands();
+    assert!(matches!(commands.as_slice(), [TrainerCmd::SetAll { confirm: true, .. }]));
+    // A second click before a new preview is drawn cannot confirm again.
+    activate_widget(&mut ui, W_SET_ALL);
+    let commands = take_commands();
+    assert!(matches!(commands.as_slice(), [TrainerCmd::SetAll { confirm: false, .. }]));
+    ui.bulk_preview = true;
+    activate_widget(&mut ui, W_TYPE);
+    assert!(!ui.bulk_preview);
+    assert!(matches!(take_commands().as_slice(), [TrainerCmd::CancelBulk]));
+}

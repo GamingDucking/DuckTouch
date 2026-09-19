@@ -32,7 +32,8 @@ pub enum TrainerCmd {
     Refine { vtype: VType, text: String },
     Reset,
     Set { vtype: VType, text: String },
-    SetAll { vtype: VType, text: String },
+    SetAll { vtype: VType, text: String, confirm: bool },
+    CancelBulk,
     Freeze { vtype: VType, text: String },
     UnfreezeAll,
     Dump,
@@ -67,6 +68,7 @@ struct TrainerUi {
     scroll: usize,
     status: String,
     frozen_count: usize,
+    bulk_preview: bool,
     /// Widget id pressed but not yet released (pending activation).
     pending: Option<u16>,
 }
@@ -87,6 +89,7 @@ impl TrainerUi {
             scroll: 0,
             status: String::new(),
             frozen_count: 0,
+            bulk_preview: false,
             pending: None,
         }
     }
@@ -118,6 +121,7 @@ pub fn reset_for_app(app_id: Option<&str>) {
     ui.scroll = 0;
     ui.status.clear();
     ui.frozen_count = 0;
+    ui.bulk_preview = false;
     ui.pending = None;
 }
 
@@ -147,6 +151,10 @@ pub fn publish_status(status: String) {
     UI.lock().unwrap().status = status;
 }
 
+pub fn publish_bulk_preview(ready: bool) {
+    UI.lock().unwrap().bulk_preview = ready;
+}
+
 pub fn publish_frozen(count: usize) {
     UI.lock().unwrap().frozen_count = count;
 }
@@ -171,7 +179,7 @@ const W_SET: u16 = 9;
 const W_FREEZE: u16 = 10;
 const W_UNFREEZE: u16 = 11;
 const W_SET_ALL: u16 = 12;
-const W_DUMP: u16 = 12;
+const W_DUMP: u16 = 16;
 const W_SAVE: u16 = 13;
 const W_SCROLL_UP: u16 = 14;
 const W_SCROLL_DOWN: u16 = 15;
@@ -209,6 +217,7 @@ struct Layout {
 struct PanelLayout {
     rect: Rect,
     widgets: Vec<(u16, Rect)>,
+    results_header_y: f32,
 }
 
 const RESULT_ROWS: usize = 5;
@@ -278,6 +287,7 @@ fn compute_layout(ui: &TrainerUi, viewport: (u32, u32, u32, u32)) -> Layout {
         }
         y += row_h + 4.0 * s;
         // Results header + scroll buttons.
+        let results_header_y = y;
         let res_h = 18.0 * s;
         push_widget(W_SCROLL_UP, px + pw - 2.0 * (res_h + 3.0 * s), y, res_h, res_h, &mut widgets);
         push_widget(W_SCROLL_DOWN, px + pw - res_h - 3.0 * s, y, res_h, res_h, &mut widgets);
@@ -308,6 +318,7 @@ fn compute_layout(ui: &TrainerUi, viewport: (u32, u32, u32, u32)) -> Layout {
         Some(PanelLayout {
             rect: Rect { x: px, y: py, w: pw, h: ph },
             widgets,
+            results_header_y,
         })
     } else {
         None
@@ -393,6 +404,12 @@ pub fn touch_up(abs: (f32, f32), viewport: (u32, u32, u32, u32)) -> bool {
 }
 
 fn activate_widget(ui: &mut TrainerUi, id: u16) {
+    // Editing inputs, closing the panel or taking any other action cancels
+    // confirmation. A later click must preview again, never apply silently.
+    if id != W_SET_ALL {
+        ui.bulk_preview = false;
+        COMMANDS.lock().unwrap().push(TrainerCmd::CancelBulk);
+    }
     match id {
         W_BUTTON => ui.open = !ui.open,
         W_CLOSE => ui.open = false,
@@ -422,7 +439,11 @@ fn activate_widget(ui: &mut TrainerUi, id: u16) {
         }
         W_SET_ALL => {
             let text = ui.set_text.trim().to_string();
-            COMMANDS.lock().unwrap().push(TrainerCmd::SetAll { vtype: ui.vtype, text });
+            let confirm = ui.bulk_preview;
+            ui.bulk_preview = false;
+            COMMANDS.lock().unwrap().push(TrainerCmd::SetAll {
+                vtype: ui.vtype, text, confirm,
+            });
         }
         W_FREEZE => {
             let text = ui.set_text.trim().to_string();
@@ -971,7 +992,7 @@ unsafe fn build_scene(
                         W_REFINE => "REFINE",
                         W_RESET => "RESET",
                         W_SET => "SET",
-                        W_SET_ALL => "SET ALL",
+                        W_SET_ALL => if ui_state.bulk_preview { "CONFIRM" } else { "SAFE ALL" },
                         W_FREEZE => "FREEZE",
                         W_UNFREEZE => "UNFRZ",
                         W_DUMP => "DUMP",
@@ -1041,8 +1062,8 @@ unsafe fn build_scene(
             atlas,
             &res_label,
             panel.rect.x + 8.0 * bs,
-            panel.rect.y + 4.0 * bs + 130.0 * bs,
-            11.0 * bs,
+            panel.results_header_y + 3.0 * bs,
+            9.0 * bs,
             COL_TEXT_DIM,
         );
 

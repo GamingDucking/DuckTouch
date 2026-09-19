@@ -27,6 +27,14 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+mod bulk;
+use bulk::{apply_bulk, plan_bulk, BulkPlan};
+
+struct PendingBulk {
+    plan: BulkPlan,
+    created_at: Instant,
+}
+
 /// Data type of a searched/set memory value. All values are little-endian,
 /// matching ARM memory layout.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -194,6 +202,7 @@ struct TrainerState {
     results: Vec<SearchResult>,
     /// Whether a search has been performed (so "REFINE" is meaningful).
     searched: bool,
+    pending_bulk: Option<PendingBulk>,
     /// One-shot patches already applied (from hack files).
     applied_hacks: HashSet<(u32, VType, u64)>,
     /// Frozen patches, re-asserted every tick.
@@ -218,9 +227,8 @@ const GLOBAL_HACKS_FILE: &str = "hacks.txt";
 const MAX_SCAN_ALLOCATION: GuestUSize = 64 * 1024 * 1024;
 /// Hard cap on stored search results (memory + UI sanity).
 const MAX_RESULTS: usize = 500_000;
-/// A guardrail, not a guarantee that the matches actually represent currency.
-/// Never silently edit just the first N hits of an ambiguous search.
-const MAX_BULK_WRITES: usize = 32;
+/// Confirmation expires rather than leaving a hidden armed bulk operation.
+const BULK_CONFIRM_TIMEOUT: Duration = Duration::from_secs(15);
 /// Cap on dump file lines.
 const MAX_DUMP_LINES: usize = 200_000;
 
@@ -256,6 +264,14 @@ impl Trainer {
             self.last_file_check = Instant::now();
         }
 
+        if self.state.pending_bulk.as_ref().is_some_and(|pending| {
+            pending.created_at.elapsed() >= BULK_CONFIRM_TIMEOUT
+        }) {
+            self.state.pending_bulk = None;
+            trainer_ui::publish_bulk_preview(false);
+            trainer_ui::publish_status("PREVIEW EXPIRED: TAP SAFE ALL".to_string());
+        }
+
         // Pick up commands from the overlay UI.
         for cmd in trainer_ui::take_commands() {
             self.handle_command(mem, cmd);
@@ -284,7 +300,14 @@ impl Trainer {
     }
 
     fn handle_command(&mut self, mem: &mut Mem, cmd: TrainerCmd) {
+        if !matches!(&cmd, TrainerCmd::SetAll { .. }) {
+            if self.state.pending_bulk.take().is_some() {
+                trainer_ui::publish_status("BULK PREVIEW CANCELLED".to_string());
+            }
+            trainer_ui::publish_bulk_preview(false);
+        }
         match cmd {
+            TrainerCmd::CancelBulk => {}
             TrainerCmd::Search { vtype, text } => {
                 let Some(_) = vtype.parse(&text) else {
                     trainer_ui::publish_status(format!("BAD VALUE: {}", text));
@@ -343,17 +366,40 @@ impl Trainer {
                 });
                 log!("trainer: set 0x{:X} = {} ({})", addr, text, t.name());
             }
-            TrainerCmd::SetAll { vtype, text } => {
-                match set_all(mem, &mut self.state.results, vtype, &text) {
-                    Ok(written) => {
-                        trainer_ui::publish_live_values(&self.state.results);
-                        trainer_ui::publish_status(format!("SET ALL: {} ADDRS", written));
-                        log!("trainer: set all {} -> {} addrs", text, written);
-                    }
+            TrainerCmd::SetAll { vtype, text, confirm } => {
+                let previous = self.state.pending_bulk.take();
+                trainer_ui::publish_bulk_preview(false);
+                let plan = match plan_bulk(mem, &self.state.results, vtype, &text) {
+                    Ok(plan) => plan,
                     Err(reason) => {
                         trainer_ui::publish_status(reason.to_string());
-                        log!("trainer: set all blocked: {}", reason);
+                        return;
                     }
+                };
+                // Re-plan even on confirmation: if anything changed, show
+                // the new counts and require a fresh explicit confirmation.
+                if confirm && previous.as_ref().is_some_and(|pending| {
+                    pending.created_at.elapsed() < BULK_CONFIRM_TIMEOUT
+                        && pending.plan == plan
+                }) {
+                    match apply_bulk(mem, &mut self.state.results, &plan) {
+                        Ok(written) => {
+                            trainer_ui::publish_live_values(&self.state.results);
+                            trainer_ui::publish_status(format!(
+                                "WROTE {} SKIPPED {}", written, plan.skipped,
+                            ));
+                            log!("trainer: safe bulk wrote {}, skipped {}", written, plan.skipped);
+                        }
+                        Err(reason) => trainer_ui::publish_status(reason.to_string()),
+                    }
+                } else {
+                    trainer_ui::publish_status(format!(
+                        "CHECKED {} SKIP {}: STILL RISKY", plan.writes.len(), plan.skipped,
+                    ));
+                    self.state.pending_bulk = Some(PendingBulk {
+                        plan, created_at: Instant::now(),
+                    });
+                    trainer_ui::publish_bulk_preview(true);
                 }
             }
             TrainerCmd::Freeze { vtype, text } => {
@@ -772,66 +818,6 @@ fn search_all(
         }
     }
     results
-}
-
-/// Validate the entire batch before touching memory. This avoids partial
-/// edits when a later result has an incompatible type, range or address.
-/// It cannot determine whether a match is currency or an unrelated field.
-fn set_all(
-    mem: &mut Mem,
-    results: &mut [SearchResult],
-    requested_type: VType,
-    text: &str,
-) -> Result<usize, &'static str> {
-    if results.is_empty() {
-        return Err("NO RESULTS TO SET");
-    }
-    if results.len() > MAX_BULK_WRITES {
-        return Err("TOO MANY HITS (MAX 32): REFINE");
-    }
-    let allocations = mem.live_allocations();
-    let mut writes = Vec::with_capacity(results.len());
-    let mut ranges = Vec::with_capacity(results.len());
-    for result in results.iter() {
-        // Changing the UI type after searching must not widen a one-byte
-        // hit into a four-byte write over neighbouring game fields.
-        let t = result.vtype;
-        if t == VType::Auto || (requested_type != VType::Auto && requested_type != t) {
-            return Err("TYPE CHANGED: SEARCH AGAIN");
-        }
-        let bits = t.parse(text).ok_or("VALUE OUT OF RANGE: CHECK TYPE")?;
-        let start = result.addr as u64;
-        let end = start + t.size() as u64;
-        if result.addr % t.size() != 0 {
-            return Err("UNALIGNED HITS: USE SINGLE SET");
-        }
-        if !allocations.iter().any(|&(base, size)| {
-            start >= base as u64 && end <= base as u64 + size as u64
-        }) {
-            return Err("EXPIRED ADDRESS: SEARCH AGAIN");
-        }
-        if t.read_at(mem, result.addr) != Some(result.bits) {
-            return Err("VALUES CHANGED: REFINE FIRST");
-        }
-        writes.push(bits);
-        ranges.push((start, end));
-    }
-    ranges.sort_unstable();
-    if ranges.windows(2).any(|pair| pair[1].0 < pair[0].1) {
-        return Err("OVERLAPPING HITS: REFINE TYPE");
-    }
-
-    // The trainer runs on the main loop thread; the guest cannot execute
-    // between validation and these writes. All byte ranges were checked by
-    // read_at above and lie in live allocations, outside the null segment.
-    for (result, bits) in results.iter_mut().zip(writes) {
-        if !result.vtype.write_at(mem, result.addr, bits) {
-            return Err("WRITE FAILED (BAD ADDR?)");
-        }
-        result.bits = bits;
-        result.changed = false;
-    }
-    Ok(results.len())
 }
 
 /// Directory for hack/dump files: `<user data>/touchHLE_hacks/`.

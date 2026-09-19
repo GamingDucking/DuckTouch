@@ -1,6 +1,6 @@
 # Trainer: search and bulk editing
 
-`SET ALL` edits memory matches, **not necessarily currency**. An unrelated
+`SAFE ALL` edits memory matches, **not necessarily currency**. An unrelated
 counter, length or game-state flag can contain the same number. Even a single
 wrong match can crash a game. The trainer cannot universally identify currency,
 validate a game's invariants, or bypass its value checks. Back up saves first.
@@ -17,37 +17,63 @@ validate a game's invariants, or bypass its value checks. Back up saves first.
 - `REFINE` with no remaining results stays empty; only `SEARCH` starts a new
   scan of memory.
 
-## SET ALL checks
+## SAFE ALL: preview, then confirm
 
-The entire batch is checked before the first write. It is rejected if:
+There is one bulk-edit button, `SAFE ALL`. The other bottom-row button is
+`DUMP`, which only exports the search results. They have distinct widget IDs.
 
-- there are more than **32** results (no arbitrary subset is edited);
-- the UI type differs from a result's type — search/refine with the intended
-  type instead of widening existing hits;
-- the new value does not fit any one of the result types;
-- a result is unaligned, two results overlap, or an address is no longer fully
-  inside a live allocation;
-- an address is unreadable or its value changed since the last result update.
+The old **32-address bulk limit is removed**. All stored search results are
+considered (the existing search-storage cap of 500,000 still applies), not just
+those visible in the panel. For large batches, allocation lookup uses a sorted
+index rather than a full allocation scan per hit.
 
-A rejection is shown in the panel's status line. No writes are made on a failed
-preflight. A successful write updates the values shown in the list immediately.
-These checks reduce accidental corruption, but a live allocation and a matching
-value do **not** prove that an address represents currency. Allocation reuse
-with the same value cannot be detected by these checks either.
+1. Enter a replacement value and tap `SAFE ALL`. **Nothing is written yet.**
+2. The status shows `CHECKED N SKIP M: STILL RISKY`. Here `CHECKED` means
+   structurally eligible, **not proven to be currency**. The button becomes
+   `CONFIRM`.
+3. Review the counts. Tap `CONFIRM` within 15 seconds to apply that exact plan.
+   If the input or eligible writes changed, a new preview is shown and another
+   confirmation is required. An expired or missing preview cannot authorize a
+   write. Rapid clicks before the confirmation UI appears only create previews.
+4. Editing inputs, closing the panel or using another action cancels the
+   preview. The button returns to `SAFE ALL`.
 
-If the batch is rejected as too broad, choose the known storage type (often
-`I32`, but this depends on the game) and refine the search. Observing a legitimate
-value change is still the most useful way to narrow ambiguous matches. For a
-known address, use single `SET` or a per-game saved hack; these are not subject
-to the bulk count/alignment guard and still require care.
+The preview skips and counts results that:
+
+- have a different type from the selected explicit type, or cannot represent
+  the replacement value without overflow (types are never widened);
+- are unaligned, no longer fit inside a live allocation, are unreadable, or
+  changed since the last result update;
+- already hold the requested replacement value;
+- overlap another otherwise eligible result (all members of such a group are
+  skipped, including duplicate addresses).
+
+Immediately before applying, the **entire confirmed plan** is checked again
+against live allocation boundaries, values and the result list. A failed
+preflight writes nothing. Successful writes update the displayed values; the
+status reports how many were written and skipped. No eligible results means
+no write.
+
+These checks reduce accidental corruption, but do **not** prove that an address
+represents currency or that a replacement satisfies the game's rules. Reused
+allocations with the same boundaries and value cannot be detected. This is not
+a crash-recovery mechanism: even a single eligible but unrelated field can
+crash a game or damage a save. Back up saves and refine ambiguous matches.
+
+Choose the known storage type (often `I32`, but it depends on the game).
+Observing a legitimate value change is still the most useful way to narrow
+matches. For a known address, use single `SET` or a per-game saved hack; these
+are not subject to the bulk preview/filter and still require care.
 
 ## Regression tests
 
 ```sh
 RUSTFLAGS="-C link-arg=-latomic" cargo test --lib trainer::tests
+RUSTFLAGS="-C link-arg=-latomic" cargo test --lib trainer_ui::tests
 ```
 
 The tests cover numeric bounds, float encoding, truncated AUTO matches, empty
-refinement, bulk preflight failures without partial writes, and successful
-mixed-type writes that preserve neighbouring bytes. They do not replace testing
+refinement, preview without writing, filtering/counts, more than 32 matches,
+confirmation/cancellation/expiry, stale plans without partial writes, unique
+widget IDs and independent DUMP/bulk actions. They do not replace testing
 against real games on the target device.
