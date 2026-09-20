@@ -844,7 +844,11 @@ impl MachO {
                     let extrels = {
                         let start = extreloff as usize;
                         let len = nextrel as usize * 8;
-                        if len == 0 || start >= bytes.len() || start + len > bytes.len() {
+                        if len == 0 {
+                            // A zero-length external relocation table is normal
+                            // (no externally-relocated symbols) — don't warn.
+                            &[][..]
+                        } else if start >= bytes.len() || start + len > bytes.len() {
                             log!(
                                 "Warning: external relocation table out of bounds (offset {:#x}, {} entries, file size {:#x}); skipping.",
                                 extreloff,
