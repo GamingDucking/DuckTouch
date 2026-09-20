@@ -31,6 +31,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// requiring the user to enable debug logging.
 static TOUCH_DIAGS_LEFT: AtomicUsize = AtomicUsize::new(12);
 
+/// Number of times a lost Up/Cancel was healed by cancelling a stale touch on
+/// a repeated Down. Visible in the log so "swipes randomly dead" reports can
+/// be traced without debug logging.
+static STALE_TOUCH_HEALS: AtomicUsize = AtomicUsize::new(0);
+
 pub type UITouchPhase = NSInteger;
 pub const UITouchPhaseBegan: UITouchPhase = 0;
 pub const UITouchPhaseMoved: UITouchPhase = 1;
@@ -613,18 +618,49 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
         allocWithZone:(MutVoidPtr::null())];
 
     for (finger_id, coords) in map {
-        if env
+        // A Down for a finger that is still tracked means an earlier Up or
+        // Cancel was lost somewhere before it reached us (overlay ate the Up,
+        // app went to the background mid-touch, host quirk, ...). The old
+        // behaviour converted this Down into a Move, so the game never saw
+        // touchesBegan: for this finger and silently ignored the whole
+        // swipe/tap — until the host recycled the finger id. That is the
+        // classic "swipes randomly dead" report (e.g. Subway Surfers). Heal
+        // like real iOS: cancel the stale touch, then deliver a fresh Began.
+        if let Some(stale_touch) = env
             .framework_state
             .uikit
             .ui_touch
             .current_touches
-            .contains_key(&finger_id)
+            .remove(&finger_id)
         {
+            STALE_TOUCH_HEALS.fetch_add(1, Ordering::Relaxed);
             log!(
-                "Warning: New touch {:?} initiated but old one exists.",
-                finger_id
+                "Warning: touch {:?} never ended (lost Up/Cancel); cancelling stale touch and starting a fresh one (occurrence {}).",
+                finger_id,
+                STALE_TOUCH_HEALS.load(Ordering::Relaxed)
             );
-            return handle_touches_move(env, HashMap::from([(finger_id, coords)]));
+            let stale_view: id = touch_ivars(env, stale_touch, |v| v.view);
+            if stale_view != nil {
+                // Phase 4 mirrors `cancel_for_gesture`: not a public phase, so
+                // guests that poll `phase` see the touch as neither began,
+                // moved nor ended. Gesture recognizers are not notified here
+                // (there is no touchesCancelled hook for them yet); a tracking
+                // recognizer simply re-arms on the next touchesBegan.
+                touch_ivars(env, stale_touch, |v| v.phase = 4);
+                let stale_set: id =
+                    msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
+                () = msg![env; stale_set addObject:stale_touch];
+                let cancel_event = ui_event::new_event(env, stale_set);
+                () = msg![env; stale_view touchesCancelled:stale_set withEvent:cancel_event];
+                release(env, cancel_event);
+                release(env, stale_set);
+            }
+            env.framework_state
+                .uikit
+                .ui_touch
+                .cancelled_by_gesture
+                .remove(&stale_touch);
+            release(env, stale_touch);
         }
 
         let location = CGPoint {

@@ -602,10 +602,11 @@ pub fn touch_up(abs: (f32, f32), viewport: (u32, u32, u32, u32)) -> bool {
     let (vx, vy, _, _) = viewport;
     let (x, y) = (abs.0 - vx as f32, abs.1 - vy as f32);
     let Some(pending) = ui.pending.take() else {
-        // Finger wasn't consumed on the way down.
-        if layout.button.contains(x, y) || layout.panels().any(|p| p.rect.contains(x, y)) {
-            return true;
-        }
+        // The Down went to the game, so the Up belongs to the game too.
+        // Eating it here used to leave a stuck touch in the game: its next
+        // swipe/tap then had no touchesBegan and was ignored until the host
+        // recycled the finger id (the Subway Surfers "swipes randomly dead"
+        // bug). A stray release over the panel activates nothing.
         return false;
     };
     // Activate if the finger is released over the same widget.

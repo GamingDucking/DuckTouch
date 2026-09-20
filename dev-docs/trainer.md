@@ -255,3 +255,21 @@ offset rejection, repeated refill cycles, irregular timer rejection, explicit
 snapshot baselines, signed/float comparisons, bounded/coalesced activity feeds,
 trainer-write suppression, side-by-side window layout, stable inline edit
 targets, read-only observation controls, and validated single-address writes.
+
+## Overlay touches no longer break game input
+
+Two fixes target games where swipes or taps randomly stopped registering
+(e.g. Subway Surfers "swipe right does nothing sometimes"):
+
+1. **Stray releases are no longer swallowed.** If a finger was pressed in the
+   game and only the release landed over the overlay, the release used to be
+   eaten by the overlay. The game then believed the finger was still down, and
+   its next gestures had no `touchesBegan:` and were ignored. The overlay now
+   consumes an Up only when it consumed the matching Down.
+2. **Stale touches are healed.** If an Up/Cancel is lost for any other reason
+   (backgrounding mid-swipe, host quirk), a repeated Down for the same finger
+   used to be converted into a Move — the game again never saw `touchesBegan:`.
+   It now receives `touchesCancelled:` for the stale touch and a fresh
+   `touchesBegan:` for the new one, like real iOS. Each heal is logged at
+   default level as `touch ... never ended (lost Up/Cancel)`, so a misbehaving
+   game can be diagnosed from an ordinary log without debug flags.
