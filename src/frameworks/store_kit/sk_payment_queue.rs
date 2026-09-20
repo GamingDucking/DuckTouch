@@ -67,7 +67,7 @@ fn identifier_string(env: &mut Environment, string: id) -> String {
     if string == nil {
         return String::new();
     }
-    ns_string::to_rust_string(env, string).to_owned()
+    ns_string::to_rust_string(env, string).into_owned()
 }
 
 /// Fields of an `SKPaymentTransaction`. Retained on assignment.
