@@ -153,3 +153,68 @@ Local validation: 13 Python tests pass, including PT_LOAD translation with a
 real compiled ELF whose virtual addresses differ from file offsets, rejection
 of malformed/wrong-run inputs, stripped-symbol reporting, annotation escaping,
 and the recorded RR3 offset arithmetic. This is not an Android runtime test.
+
+## Symbolicated stack: the crash is inside mimalloc v3.3.2
+
+The diagnostics mode was run for real on 2026-09-20: run
+https://github.com/KlugKlugTG/HyperHLE-Fork/actions/runs/35499114018
+(job `diagnose-rr3`, check-run annotations) downloaded the saved
+run 35497728843 APK on a GitHub runner and resolved every recorded
+libtouchHLE frame — the APK kept its `.symtab`, so no symbol was guessed.
+
+Innermost-first native stack (annotations, abbreviated):
+
+```
+#5  _mi_malloc_generic                        (mimalloc, static.c)
+#6  _mi_theap_realloc_zero                    (mimalloc)
+#7  <alloc::raw_vec::RawVecInner>::finish_grow
+#8  std::io::default_read_to_end::<zip::read::ZipFile>
+#9  <touchHLE::fs::bundle::IpaFileRef>::open
+#10 touchHLE::libc::posix_io::stat::stat
+#11 <CallFromGuest>::call_from_guest
+#12 touchHLE::environment::Environment::run_inner
+#2  Dynarmic::...::SigHandler::SigAction      (forwards non-guest faults)
+#1  touchHLE::crash_handler::imp::handler
+```
+
+Fault address `0xf93dd9bcde00d2` is a garbage pointer (not a guard page, not a
+near-null jump). The `stat`/`IpaFileRef::open` frames are plain safe Rust on
+this path — they are where the corrupt allocator state was *hit*, not
+necessarily where it was *caused*.
+
+### Root-cause identification
+
+- The `_mi_theap_*` symbol names prove the build used mimalloc **v3**
+  (v2 uses `mi_heap_*` names). libmimalloc-sys 0.1.49 vendors v3 by default,
+  pinned at microsoft/mimalloc `30b2d9d8` = **v3.3.2** (2026-04-29).
+- Upstream microsoft/mimalloc issue **#1287**: "mimalloc >= 3.3.0 causes
+  segmentation faults when used from multiple threads" — 3.3.0/3.3.1/3.3.2
+  crash, 3.2.x fine; stack is `_mi_malloc_generic` → `mi_thread_init` →
+  dereferencing NULL `theap->tld`; the maintainer identified the cause as the
+  main thread being misidentified and reclaimed, after which allocator state
+  is corrupt; the issue includes a pure-Rust reproducer (no touchHLE
+  involved). Status: fixed later in the dev line.
+- Issue **#1288**: the same crash on **Android** (v3.3.1), same
+  `_mi_malloc_generic` entry path, maintainer-confirmed.
+- The 3.4/3.5 line (through v3.5.3, 2026-09-17) carries a chain of
+  theap/thread-reclamation/NULL-theap fixes — this class was still being
+  repaired after our pinned revision.
+
+RR3 spawns many short-lived native threads (unlike the tested NOVA3), which
+matches the #1287 trigger. `finish_grow` in frame #7 is simply the Vec growth
+that performed the realloc at the moment the thread-local heap was broken.
+
+### Fix: pin the global allocator to the mimalloc v2 branch
+
+`Cargo.toml` now builds mimalloc with `features = ["v2"]`, so
+libmimalloc-sys 0.1.49 compiles the maintained **v2.3.2** branch — the
+default of every mimalloc release before the 3.x flip and the variant
+long used by Android builds. No Rust/C source changes; `Cargo.lock` is
+unchanged (Cargo does not lock features). Local validation: manifest TOML
+parses; cargo is unavailable in this environment, so the next ordinary
+**Build HyperHLE** run is also the compile check.
+
+Retest plan: run Build HyperHLE normally (no diagnostics input needed),
+install the produced APK, start RR3. If it still SIGSEGVs inside mimalloc,
+the next candidates are bumping to the v3.5.x line or removing mimalloc;
+decide on fresh evidence, not assumption.
