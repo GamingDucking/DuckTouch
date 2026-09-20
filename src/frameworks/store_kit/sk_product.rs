@@ -47,6 +47,95 @@ fn make_product(env: &mut Environment, product_identifier: id) -> id {
     product
 }
 
+// MARK: - SKProductsResponse
+
+#[derive(Default)]
+struct SKProductsResponseHostObject {
+    /// Retained NSArray of SKProduct.
+    products: id,
+    /// Retained NSArray of NSString.
+    invalid_product_identifiers: id,
+}
+impl HostObject for SKProductsResponseHostObject {}
+
+// MARK: - SKProductsRequest
+
+#[derive(Default)]
+struct SKProductsRequestHostObject {
+    /// Retained NSSet of NSString product identifiers.
+    product_identifiers: id,
+    /// SKProductsRequestDelegate — weak reference.
+    delegate: id,
+    /// Pending response NSTimer, if `start` was called. Retained.
+    timer: id,
+}
+impl HostObject for SKProductsRequestHostObject {}
+
+fn stop_response_timer(env: &mut Environment, this: id) {
+    let timer = std::mem::replace(
+        &mut env
+            .objc
+            .borrow_mut::<SKProductsRequestHostObject>(this)
+            .timer,
+        nil,
+    );
+    if timer != nil {
+        () = msg![env; timer invalidate];
+        release(env, timer);
+    }
+}
+
+fn deliver_products_response(env: &mut Environment, this: id) {
+    let product_identifiers = {
+        let host = env.objc.borrow::<SKProductsRequestHostObject>(this);
+        host.product_identifiers
+    };
+    let products: id = msg_class![env; NSMutableArray array];
+    let mut requested = 0usize;
+    if product_identifiers != nil {
+        let array: id = msg![env; product_identifiers allObjects];
+        let count: crate::frameworks::foundation::NSUInteger = msg![env; array count];
+        for i in 0..count {
+            let identifier: id = msg![env; array objectAtIndex:i];
+            let product = make_product(env, identifier);
+            () = msg![env; products addObject:product];
+            requested += 1;
+        }
+    }
+    let invalid: id = msg_class![env; NSMutableArray array];
+    let response: id = msg_class![env; SKProductsResponse alloc];
+    {
+        let host = env.objc.borrow_mut::<SKProductsResponseHostObject>(response);
+        host.products = products;
+        host.invalid_product_identifiers = invalid;
+    }
+    retain(env, products);
+    retain(env, invalid);
+    autorelease(env, response);
+
+    let delegate = env.objc.borrow::<SKProductsRequestHostObject>(this).delegate;
+    log!(
+        "SKProductsRequest: IAP emulation answered locally with {} product(s) (all free).",
+        requested
+    );
+    if delegate == nil {
+        return;
+    }
+    let sel = env.objc.register_host_selector(
+        "productsRequest:didReceiveResponse:".to_string(),
+        &mut env.mem,
+    );
+    let responds: bool = msg![env; delegate respondsToSelector:sel];
+    if responds {
+        let _: () = msg![env; delegate productsRequest:this didReceiveResponse:response];
+    } else {
+        log!(
+            "Warning: SKProductsRequestDelegate does not respond to productsRequest:didReceiveResponse:; response dropped."
+        );
+    }
+}
+
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -132,17 +221,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 @end
 
-// MARK: - SKProductsResponse
-
-#[derive(Default)]
-struct SKProductsResponseHostObject {
-    /// Retained NSArray of SKProduct.
-    products: id,
-    /// Retained NSArray of NSString.
-    invalid_product_identifiers: id,
-}
-impl HostObject for SKProductsResponseHostObject {}
-
 @implementation SKProductsResponse: NSObject
 
 + (id)allocWithZone:(NSZonePtr)_zone {
@@ -190,83 +268,6 @@ impl HostObject for SKProductsResponseHostObject {}
 }
 
 @end
-
-// MARK: - SKProductsRequest
-
-#[derive(Default)]
-struct SKProductsRequestHostObject {
-    /// Retained NSSet of NSString product identifiers.
-    product_identifiers: id,
-    /// SKProductsRequestDelegate — weak reference.
-    delegate: id,
-    /// Pending response NSTimer, if `start` was called. Retained.
-    timer: id,
-}
-impl HostObject for SKProductsRequestHostObject {}
-
-fn stop_response_timer(env: &mut Environment, this: id) {
-    let timer = std::mem::replace(
-        &mut env
-            .objc
-            .borrow_mut::<SKProductsRequestHostObject>(this)
-            .timer,
-        nil,
-    );
-    if timer != nil {
-        () = msg![env; timer invalidate];
-        release(env, timer);
-    }
-}
-
-fn deliver_products_response(env: &mut Environment, this: id) {
-    let product_identifiers = {
-        let host = env.objc.borrow::<SKProductsRequestHostObject>(this);
-        host.product_identifiers
-    };
-    let products: id = msg_class![env; NSMutableArray array];
-    let mut requested = 0usize;
-    if product_identifiers != nil {
-        let array: id = msg![env; product_identifiers allObjects];
-        let count: crate::frameworks::foundation::NSUInteger = msg![env; array count];
-        for i in 0..count {
-            let identifier: id = msg![env; array objectAtIndex:i];
-            let product = make_product(env, identifier);
-            () = msg![env; products addObject:product];
-            requested += 1;
-        }
-    }
-    let invalid: id = msg_class![env; NSMutableArray array];
-    let response: id = msg_class![env; SKProductsResponse alloc];
-    {
-        let host = env.objc.borrow_mut::<SKProductsResponseHostObject>(response);
-        host.products = products;
-        host.invalid_product_identifiers = invalid;
-    }
-    retain(env, products);
-    retain(env, invalid);
-    autorelease(env, response);
-
-    let delegate = env.objc.borrow::<SKProductsRequestHostObject>(this).delegate;
-    log!(
-        "SKProductsRequest: IAP emulation answered locally with {} product(s) (all free).",
-        requested
-    );
-    if delegate == nil {
-        return;
-    }
-    let sel = env.objc.register_host_selector(
-        "productsRequest:didReceiveResponse:".to_string(),
-        &mut env.mem,
-    );
-    let responds: bool = msg![env; delegate respondsToSelector:sel];
-    if responds {
-        let _: () = msg![env; delegate productsRequest:this didReceiveResponse:response];
-    } else {
-        log!(
-            "Warning: SKProductsRequestDelegate does not respond to productsRequest:didReceiveResponse:; response dropped."
-        );
-    }
-}
 
 @implementation SKProductsRequest: NSObject
 

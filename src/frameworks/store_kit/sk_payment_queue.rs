@@ -153,6 +153,15 @@ fn payment_for_identifier(env: &mut Environment, identifier: &str) -> id {
     autorelease(env, payment)
 }
 
+// MARK: - SKPayment
+
+#[derive(Default)]
+struct SKPaymentHostObject {
+    /// Retained identifier string, or nil.
+    product_identifier: id,
+}
+impl HostObject for SKPaymentHostObject {}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -383,15 +392,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 @end
-
-// MARK: - SKPayment
-
-#[derive(Default)]
-struct SKPaymentHostObject {
-    /// Retained identifier string, or nil.
-    product_identifier: id,
-}
-impl HostObject for SKPaymentHostObject {}
 
 @implementation SKPayment: NSObject
 
