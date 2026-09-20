@@ -322,6 +322,9 @@ const W_SPEED_UP: u16 = 20;
 const W_CATEGORY: u16 = 21;
 const W_WATCH: u16 = 22;
 const W_MARK: u16 = 23;
+/// Sentinel for presses that hit the overlay but no widget: the whole gesture
+/// is swallowed, so no ghost Moved/Ended without Began leaks into the game.
+const W_SWALLOW: u16 = u16::MAX;
 const W_CHANGED: u16 = 24;
 const W_SAME: u16 = 25;
 const W_INCREASED: u16 = 26;
@@ -577,7 +580,9 @@ pub fn touch_down(abs: (f32, f32), viewport: (u32, u32, u32, u32)) -> bool {
                 return true;
             }
         }
-        // Inside the panel but not on a widget: swallow the touch.
+        // Inside the panel but not on a widget: swallow the WHOLE gesture so
+        // the game never sees a Moved/Ended without the matching Began.
+        ui.pending = Some(W_SWALLOW);
         return true;
     }
     false

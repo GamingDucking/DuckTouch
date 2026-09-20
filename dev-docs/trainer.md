@@ -265,11 +265,23 @@ Two fixes target games where swipes or taps randomly stopped registering
    game and only the release landed over the overlay, the release used to be
    eaten by the overlay. The game then believed the finger was still down, and
    its next gestures had no `touchesBegan:` and were ignored. The overlay now
-   consumes an Up only when it consumed the matching Down.
+   consumes an Up only when it consumed the matching Down, and a press that
+   lands on the panel but no widget swallows the whole gesture (no ghost
+   `Moved`/`Ended` without `Began` reaches the game).
 2. **Stale touches are healed.** If an Up/Cancel is lost for any other reason
    (backgrounding mid-swipe, host quirk), a repeated Down for the same finger
    used to be converted into a Move — the game again never saw `touchesBegan:`.
    It now receives `touchesCancelled:` for the stale touch and a fresh
    `touchesBegan:` for the new one, like real iOS. Each heal is logged at
-   default level as `touch ... never ended (lost Up/Cancel)`, so a misbehaving
-   game can be diagnosed from an ordinary log without debug flags.
+   default level as `touch ... [heal N]`, so a misbehaving game can be
+   diagnosed from an ordinary log without debug flags.
+3. **The first finger survives a second finger.** On views that refuse
+   multi-touch, a second simultaneous finger used to silently DELETE the
+   tracked first touch (no Ended, no further events), stalling Unity-style
+   input state machines. Now the tracked touch is kept and only the newcomer
+   is dropped, like real iOS; genuinely stale (10s+ idle) touches are
+   cancelled visibly and reclaimed.
+4. **Gesture summaries in ordinary logs.** The first touch ends are logged as
+   `TOUCH-END #n: view=... moves=... delta=(...)`, and Move/Up events for
+   fingers whose Down never arrived are warned as `untracked finger`. These
+   lines separate "host lost events" from "game ignored a complete gesture".
