@@ -822,6 +822,22 @@ pub(crate) fn recover_guest_termination(env: &mut Environment, termination: &str
     );
     env.stack_trace_current();
 
+    if env.libc_state.signal.fatal_delivered {
+        // A fault-class signal was already delivered to a guest handler this
+        // session: the process crashed in the real-Darwin sense. Resuming a
+        // validated app frame from a crash reporter's stack leaves the app
+        // half-alive with no way to recover (observed: Turbo Dismount froze
+        // on a dead frame after SIGSEGV, then its crash reporter aborted).
+        // Release the session instead; benign abort()/exit() calls never
+        // see this.
+        echo!(
+            "Guest {} follows an earlier fatal hardware signal; refusing \
+             frame recovery and ending the guest session.",
+            termination
+        );
+        return false;
+    }
+
     let Some(continuation) = crate::libc::cxxabi::unwind_to_app_frame(env) else {
         return false;
     };

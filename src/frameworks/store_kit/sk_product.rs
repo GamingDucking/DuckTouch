@@ -225,6 +225,17 @@ pub const CLASSES: ClassExports = objc_classes! {
     false
 }
 
+// iOS 6+ hosted-content fields. Real StoreKit reports them per product; we
+// have no downloadable content, so an empty list and an empty version match
+// the "Not Available" defaults games fall back to.
+- (id)downloadContentLengths {
+    msg_class![env; NSArray array]
+}
+
+- (id)downloadContentVersion {
+    ns_string::get_static_str(env, "")
+}
+
 - (())dealloc {
     let (product_identifier, title, description) = {
         let host = env.objc.borrow::<SKProductHostObject>(this);

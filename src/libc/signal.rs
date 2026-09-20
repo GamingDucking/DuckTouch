@@ -108,6 +108,20 @@ pub struct State {
     /// the same signal must not re-enter the handler (it would recurse
     /// forever); re-raising it performs the default action instead.
     handling: Vec<i32>,
+    /// Whether a fault-class signal (SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGTRAP)
+    /// has been delivered to a guest handler this session. On real Darwin
+    /// such a signal means the process already crashed; if the guest then
+    /// falls through to `abort()`/`exit()`, validated frame recovery would
+    /// resume it in a broken state (observed as a permanently frozen
+    /// screen in Turbo Dismount), so recovery must refuse and the session
+    /// must end instead.
+    fatal_delivered: bool,
+}
+
+/// Whether `signum` is a hardware-fault signal whose Darwin default action
+/// terminates the process.
+fn is_fault_signal(signum: i32) -> bool {
+    matches!(signum, SIGILL | SIGTRAP | SIGFPE | SIGBUS | SIGSEGV)
 }
 
 /// Whether `signum` names a real signal on this platform.
@@ -318,6 +332,9 @@ pub(crate) fn raise_signal(env: &mut Environment, signum: i32) -> RaiseOutcome {
                 handler,
                 signum
             );
+            if is_fault_signal(signum) {
+                env.libc_state.signal.fatal_delivered = true;
+            }
             env.libc_state.signal.handling.push(signum);
             let func = GuestFunction::from_addr_with_thumb_bit(handler);
             let _: () = func.call_from_host(env, (signum,));
