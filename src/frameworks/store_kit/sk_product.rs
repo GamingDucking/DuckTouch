@@ -226,7 +226,8 @@ fn deliver_products_response(env: &mut Environment, this: id) {
         let count: crate::frameworks::foundation::NSUInteger = msg![env; array count];
         for i in 0..count {
             let identifier: id = msg![env; array objectAtIndex:i];
-            () = msg![env; products addObject:make_product(env, identifier)];
+            let product = make_product(env, identifier);
+            () = msg![env; products addObject:product];
             requested += 1;
         }
     }

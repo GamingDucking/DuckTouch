@@ -227,6 +227,9 @@ pub const CLASSES: ClassExports = objc_classes! {
         nil
     };
     let identifier = identifier_string(env, identifier_object);
+    if identifier_object != nil {
+        release(env, identifier_object);
+    }
 
     if !emulation_enabled() {
         log!(
