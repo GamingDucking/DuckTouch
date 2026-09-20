@@ -115,7 +115,7 @@ pub struct State {
     /// resume it in a broken state (observed as a permanently frozen
     /// screen in Turbo Dismount), so recovery must refuse and the session
     /// must end instead.
-    fatal_delivered: bool,
+    pub(crate) fatal_delivered: bool,
 }
 
 /// Whether `signum` is a hardware-fault signal whose Darwin default action
