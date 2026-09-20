@@ -17,6 +17,8 @@ Changes are categorised as follows:
 
 Compatibility:
 
+- `realpath()` no longer aborts the guest when the app passes `NULL` as the resolved-path buffer (a valid POSIX usage that mallocs the result); it now allocates the buffer instead. It also sets `errno`/returns `NULL` on unreadable paths instead of failing the whole call. `dirname(3)` is now implemented, along with `getpwuid_r(3)` (a single stub `root`/`mobile` user with the app-container home directory) and `sysconf(_SC_GETPW_R_SIZE_MAX)`. Together these fix Unity's startup path (`rvmStartup` → `getenv("HOME")` fallback chain) for Unity games such as Deep Town. (@KlugKlugTG)
+
 - New working apps:
   - Devil May Cry 4 Refrain (@hikari-no-yume)
   - Amerzone Pt1 (@ciciplusplus)
