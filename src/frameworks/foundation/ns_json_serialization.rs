@@ -44,6 +44,19 @@ pub const CLASSES: ClassExports = objc_classes! {
 @implementation NSJSONSerialization: NSObject
 
 + (bool)isValidJSONObject:(id)obj {
+    // Diagnostic: if a game rejects a graph as "not a valid JSON object",
+    // this line tells us whether our validator was even consulted (the line
+    // appears and a rejection reason is logged below) or the game has a
+    // bundled JSON library of its own (the line never appears).
+    if obj != nil {
+        let class: Class = msg![env; obj class];
+        log_once!(
+            "NSJSONSerialization: +isValidJSONObject: called (root class {:?})",
+            env.objc.get_class_name(class)
+        );
+    } else {
+        log_once!("NSJSONSerialization: +isValidJSONObject: called (nil root)");
+    }
     is_valid_json_object_root(env, obj)
 }
 
@@ -120,6 +133,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 fn is_valid_json_object_root(env: &mut Environment, obj: id) -> bool {
     if obj == nil {
+        log!("NSJSONSerialization: root object is nil (not JSON-serializable)");
         return false;
     }
     let ns_array_class = env.objc.get_known_class("NSArray", &mut env.mem);
@@ -134,6 +148,7 @@ fn is_valid_json_object_root(env: &mut Environment, obj: id) -> bool {
 
 fn is_valid_json_subtree(env: &mut Environment, obj: id) -> bool {
     if obj == nil {
+        log!("NSJSONSerialization: graph contains nil (not JSON-serializable)");
         return false;
     }
     let ns_array_class = env.objc.get_known_class("NSArray", &mut env.mem);
