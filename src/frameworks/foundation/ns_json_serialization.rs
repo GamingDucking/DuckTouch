@@ -27,7 +27,7 @@ use super::ns_string::{from_rust_string, to_rust_string};
 use super::ns_value::NSNumberHostObject;
 use super::NSUInteger;
 use crate::mem::MutPtr;
-use crate::objc::{autorelease, id, msg, msg_class, nil, objc_classes, ClassExports};
+use crate::objc::{autorelease, id, msg, msg_class, nil, objc_classes, Class, ClassExports};
 use crate::Environment;
 
 pub type NSJSONReadingOptions = NSUInteger;
@@ -161,6 +161,11 @@ fn is_valid_json_subtree(env: &mut Environment, obj: id) -> bool {
         let pairs = collect_dictionary_pairs(env, obj);
         for (k, v) in pairs {
             if !msg![env; k isKindOfClass:ns_string_class] {
+                let key_class: Class = msg![env; k class];
+                log!(
+                    "NSJSONSerialization: dictionary key of class {:?} is not JSON-serializable",
+                    env.objc.get_class_name(key_class)
+                );
                 return false;
             }
             if !is_valid_json_subtree(env, v) {
@@ -169,6 +174,15 @@ fn is_valid_json_subtree(env: &mut Environment, obj: id) -> bool {
         }
         return true;
     }
+    // Not a JSON-serializable object. Report the class so a game's own
+    // "not a valid JSON object" complaint can be attributed to our
+    // validator (if this line appears in the log) or to their own check
+    // (if it does not).
+    let class: Class = msg![env; obj class];
+    log!(
+        "NSJSONSerialization: object of class {:?} is not JSON-serializable",
+        env.objc.get_class_name(class)
+    );
     false
 }
 
