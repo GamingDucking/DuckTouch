@@ -7,6 +7,10 @@ on:
         description: Publish a HyperHLE release (after all builds succeed)
         type: boolean
         default: false
+      diagnose_rr3_crash:
+        description: Analyze saved RR3 crash (run 35497728843), without rebuilding or publishing
+        type: boolean
+        default: false
   push:
     branches: [ "trunk" ]
   pull_request:
@@ -17,11 +21,54 @@ env:
   CARGO_TERM_COLOR: always
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.diagnose_rr3_crash && 'rr3-diagnostics' || 'build' }}
   cancel-in-progress: true
 
 jobs:
+  # Uses the original saved APK: rebuilding even the same sources can move PCs.
+  # Kept inside the existing workflow, not a second diagnostics workflow.
+  diagnose-rr3:
+    # Also run alongside normal manual builds on the investigation branch:
+    # the UI may still show the input form from the default branch.
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      (inputs.diagnose_rr3_crash || github.ref == 'refs/heads/arena/01a0bad7-hyperhle-fork')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the exact reported build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          mkdir -p target/rr3-source
+          gh api "repos/$GH_REPO/actions/runs/35497728843" > target/rr3-source/run.json
+          gh run download 35497728843 -n HyperHLE_Android_AArch64 -D target/rr3-source
+      - name: Install AArch64 symbol tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq binutils-aarch64-linux-gnu
+      - name: Symbolicate and publish text annotations
+        run: |
+          python3 dev-scripts/symbolicate-android-crash.py \
+            --apk target/rr3-source/HyperHLE-Fork.apk \
+            --trace dev-docs/crashes/real-racing-3-30bdf19.json \
+            --source-run target/rr3-source/run.json \
+            --output target/rr3-source/report.md \
+            --github-annotations
+      - name: Save text report
+        uses: actions/upload-artifact@v4
+        with:
+          name: RR3-native-crash-report
+          path: target/rr3-source/report.md
+          if-no-files-found: error
+
   build-osx:
+    if: ${{ !inputs.diagnose_rr3_crash }}
     runs-on: macos-latest  
 
     steps:  
@@ -112,6 +159,7 @@ jobs:
           path: touchHLE.dmg
 
   build-linux:
+    if: ${{ !inputs.diagnose_rr3_crash }}
     runs-on: ubuntu-latest
 
     steps:
@@ -184,6 +232,7 @@ jobs:
           path: touchHLE_linux_bundle/
 
   build-android:
+    if: ${{ !inputs.diagnose_rr3_crash }}
     runs-on: ubuntu-latest  
 
     steps:  
@@ -292,6 +341,7 @@ jobs:
         path: HyperHLE-Fork.apk
 
   build-win:
+    if: ${{ !inputs.diagnose_rr3_crash }}
     runs-on: windows-2022  
 
     steps:  
@@ -338,8 +388,9 @@ jobs:
   check-hyperhle-release:
     runs-on: ubuntu-latest
     if: >-
-      (github.event_name == 'push' && github.ref == 'refs/heads/trunk') ||
-      github.event_name == 'workflow_dispatch'
+      !inputs.diagnose_rr3_crash &&
+      ((github.event_name == 'push' && github.ref == 'refs/heads/trunk') ||
+      github.event_name == 'workflow_dispatch')
     outputs:
       should_release: ${{ steps.check.outputs.should_release }}
       version: ${{ steps.check.outputs.version }}

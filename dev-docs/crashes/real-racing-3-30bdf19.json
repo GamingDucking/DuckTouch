@@ -1,0 +1,136 @@
+{
+  "run_id": "35497728843",
+  "head_sha": "30bdf19655513ac186e8d6edf45428a9551c4b57",
+  "artifact_name": "HyperHLE_Android_AArch64",
+  "mapping": {
+    "start": "0x799d113000",
+    "end": "0x799dde0000",
+    "offset": "0x689000"
+  },
+  "frames": [
+    {
+      "index": 1,
+      "pc": "0x799d3ba2ec"
+    },
+    {
+      "index": 2,
+      "pc": "0x799db11fe0"
+    },
+    {
+      "index": 5,
+      "pc": "0x799d7ef168"
+    },
+    {
+      "index": 6,
+      "pc": "0x799d7e1354"
+    },
+    {
+      "index": 7,
+      "pc": "0x799d327af8"
+    },
+    {
+      "index": 8,
+      "pc": "0x799d1eb4fc"
+    },
+    {
+      "index": 9,
+      "pc": "0x799d2fa6f4"
+    },
+    {
+      "index": 10,
+      "pc": "0x799d595750"
+    },
+    {
+      "index": 11,
+      "pc": "0x799d5fe4c8"
+    },
+    {
+      "index": 12,
+      "pc": "0x799d2efc70"
+    },
+    {
+      "index": 13,
+      "pc": "0x799d32c9cc"
+    },
+    {
+      "index": 14,
+      "pc": "0x799d41c3b4"
+    },
+    {
+      "index": 15,
+      "pc": "0x799d5fe480"
+    },
+    {
+      "index": 16,
+      "pc": "0x799d2efc70"
+    },
+    {
+      "index": 17,
+      "pc": "0x799d32c9cc"
+    },
+    {
+      "index": 18,
+      "pc": "0x799d41c3b4"
+    },
+    {
+      "index": 19,
+      "pc": "0x799d7388bc"
+    },
+    {
+      "index": 20,
+      "pc": "0x799d6031cc"
+    },
+    {
+      "index": 21,
+      "pc": "0x799d41c368"
+    },
+    {
+      "index": 22,
+      "pc": "0x799d430054"
+    },
+    {
+      "index": 23,
+      "pc": "0x799d5fe480"
+    },
+    {
+      "index": 24,
+      "pc": "0x799d41c368"
+    },
+    {
+      "index": 25,
+      "pc": "0x799d4e17a4"
+    },
+    {
+      "index": 26,
+      "pc": "0x799d607d2c"
+    },
+    {
+      "index": 27,
+      "pc": "0x799d2efc70"
+    },
+    {
+      "index": 28,
+      "pc": "0x799d290950"
+    },
+    {
+      "index": 29,
+      "pc": "0x799d2698f0"
+    },
+    {
+      "index": 30,
+      "pc": "0x799dafc6d8"
+    },
+    {
+      "index": 31,
+      "pc": "0x799d2ebc40"
+    },
+    {
+      "index": 32,
+      "pc": "0x799d117f30"
+    },
+    {
+      "index": 33,
+      "pc": "0x799d113ffc"
+    }
+  ]
+}
