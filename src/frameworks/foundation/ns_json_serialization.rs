@@ -48,15 +48,21 @@ pub const CLASSES: ClassExports = objc_classes! {
     // this line tells us whether our validator was even consulted (the line
     // appears and a rejection reason is logged below) or the game has a
     // bundled JSON library of its own (the line never appears).
-    if obj != nil {
-        let class: Class = msg![env; obj class];
-        log_once!(
-            "NSJSONSerialization: +isValidJSONObject: called (root class {:?})",
-            env.objc.get_class_name(class)
-        );
-    } else {
-        log_once!("NSJSONSerialization: +isValidJSONObject: called (nil root)");
-    }
+    // log_once! takes only a literal, so use a static Once for formatting.
+    static VALIDATOR_CALLED: std::sync::Once = std::sync::Once::new();
+    VALIDATOR_CALLED.call_once(|| {
+        if obj != nil {
+            let class: Class = msg![env; obj class];
+            log!(
+                "NSJSONSerialization: +isValidJSONObject: called (root class {:?}) [this log will only be shown once]",
+                env.objc.get_class_name(class)
+            );
+        } else {
+            log!(
+                "NSJSONSerialization: +isValidJSONObject: called (nil root) [this log will only be shown once]"
+            );
+        }
+    });
     is_valid_json_object_root(env, obj)
 }
 
