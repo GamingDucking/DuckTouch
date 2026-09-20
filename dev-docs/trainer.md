@@ -311,9 +311,12 @@ While enabled:
   the products delegate also receives `requestDidFinish:` after the response.
 - `restoreCompletedTransactions` re-delivers every identifier bought this
   session as restored transactions.
-- With the switch off, `addPayment:` delivers a well-formed **failed**
-  transaction instead of silence, so games show their "purchases unavailable"
-  path instead of hanging.
+- With the switch off (the default), StoreKit falls back to the original
+  pre-emulation stubs: `canMakePayments` is false, `addPayment:` notifies the
+  observer with an empty transaction array, and `SKProductsRequest` fails in
+  `initWithProductIdentifiers:`/`start`, so no product list, transaction or
+  receipt is ever fabricated. Games see exactly the stock no-store behavior
+  they had before the IAP emulation existed.
 
 Scope and honesty: this only affects the guest app inside touchHLE. No App
 Store, receipts or Apple servers are contacted, nothing outside the emulator

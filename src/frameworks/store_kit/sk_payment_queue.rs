@@ -13,14 +13,15 @@
 //! This only affects the emulated app inside touchHLE: no App Store, receipts
 //! or Apple servers are involved, and nothing outside this process changes.
 //!
-//! With emulation disabled, `addPayment:` delivers a well-formed
-//! `SKPaymentTransactionStateFailed` transaction so well-behaved games can
-//! show their "purchases are disabled" path instead of hanging.
+//! With emulation disabled (Cheat Engine inactive — the default), every
+//! entry point behaves exactly like the original pre-emulation stubs:
+//! `canMakePayments` is false, `addPayment:` notifies the observer with an
+//! empty transaction array, and nothing is fabricated — no transactions,
+//! no receipts, no product responses.
 
 use crate::frameworks::foundation::{ns_string, NSInteger, NSUInteger};
 use crate::frameworks::store_kit::{
-    emulation_enabled, SK_PAYMENT_TRANSACTION_STATE_FAILED, SK_PAYMENT_TRANSACTION_STATE_PURCHASED,
-    SK_PAYMENT_TRANSACTION_STATE_RESTORED,
+    emulation_enabled, SK_PAYMENT_TRANSACTION_STATE_PURCHASED, SK_PAYMENT_TRANSACTION_STATE_RESTORED,
 };
 use crate::objc::{autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr};
 use crate::Environment;
@@ -241,21 +242,22 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 
     if !emulation_enabled() {
-        log!(
-            "SKPaymentQueue addPayment: IAP emulation off; failing transaction for {:?}.",
-            identifier
-        );
-        let error_identifier = ns_string::from_rust_string(env, identifier);
-        autorelease(env, error_identifier);
-        let transaction = make_transaction(
-            env,
-            SK_PAYMENT_TRANSACTION_STATE_FAILED,
-            payment,
-            error_identifier,
-            nil,
-        );
-        autorelease(env, transaction);
-        deliver_transactions(env, this, &[transaction]);
+        // Cheat Engine inactive: exact pre-emulation stub behavior — notify
+        // the observer with an EMPTY transaction array. No transaction
+        // object is created, so nothing in the game can see a success.
+        log!("SKPaymentQueue addPayment: stubbed — failing transaction immediately");
+        let observer = env.objc.borrow::<SKPaymentQueueHostObject>(this).observer;
+        if observer == nil {
+            return;
+        }
+        let transactions: id = msg_class![env; NSArray new];
+        let sel = env
+            .objc
+            .register_host_selector("paymentQueue:updatedTransactions:".to_string(), &mut env.mem);
+        let responds: bool = msg![env; observer respondsToSelector:sel];
+        if responds {
+            () = msg![env; observer paymentQueue:this updatedTransactions:transactions];
+        }
         return;
     }
 

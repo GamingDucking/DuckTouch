@@ -725,7 +725,7 @@ fn activate_widget(ui: &mut TrainerUi, id: u16) {
             ui.status = if ui.iap {
                 "IN-APP ON: PURCHASES FREE"
             } else {
-                "IN-APP OFF: PURCHASES FAIL"
+                "IN-APP OFF: STOCK STORE STUBS"
             }
             .to_string();
         }

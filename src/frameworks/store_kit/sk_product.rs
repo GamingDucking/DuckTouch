@@ -11,8 +11,14 @@
 //! copied from the identifier, price 0.00), so games that hide their buy
 //! buttons until the product list arrives show them and the queue completes
 //! the purchase (see `sk_payment_queue.rs`).
+//!
+//! With emulation disabled (Cheat Engine inactive — the default), the
+//! original pre-emulation stubs apply: `initWithProductIdentifiers:` and
+//! `start` fail, so a products request never begins and no response is
+//! ever delivered.
 
 use crate::frameworks::foundation::ns_string;
+use crate::frameworks::store_kit::emulation_enabled;
 use crate::objc::{autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr};
 use crate::Environment;
 
@@ -312,6 +318,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)initWithProductIdentifiers:(id)product_identifiers { // NSSet*
+    if !emulation_enabled() {
+        // Cheat Engine inactive: pre-emulation stub — requests can never
+        // start, so games keep their stock no-store behavior.
+        log!("SKProductsRequest initWithProductIdentifiers: stubbed (IAP emulation off)");
+        return nil;
+    }
     {
         let host = env.objc.borrow_mut::<SKProductsRequestHostObject>(this);
         host.product_identifiers = product_identifiers;
@@ -334,6 +346,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (bool)start {
+    if !emulation_enabled() {
+        // Defensive twin of the init stub above (e.g. a request created
+        // before the toggle changed).
+        log!("SKProductsRequest start: stubbed (IAP emulation off)");
+        return false;
+    }
     stop_response_timer(env, this);
     let Some(selector) = env.objc.lookup_selector("_touchHLE_iapProductsTimer:") else {
         log!("Warning: SKProductsRequest timer selector missing; cannot answer.");
