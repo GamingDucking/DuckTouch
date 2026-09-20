@@ -1127,18 +1127,62 @@ fn strtol(env: &mut Environment, str: ConstPtr<u8>, endptr: MutPtr<MutPtr<u8>>, 
     }
 }
 
+fn dirname(env: &mut Environment, path: MutPtr<u8>) -> MutPtr<u8> {
+    if path.is_null() {
+        set_errno(env, EINVAL);
+        return Ptr::null();
+    }
+
+    let len = strlen(env, path.cast_const());
+    let mut bytes: Vec<u8> = (0..len).map(|i| env.mem.read(path + i)).collect();
+    while bytes.len() > 1 && bytes.last() == Some(&b'/') {
+        bytes.pop();
+    }
+
+    let output = if bytes.is_empty() {
+        b".".to_vec()
+    } else if let Some(slash) = bytes.iter().rposition(|&b| b == b'/') {
+        if slash == 0 {
+            b"/".to_vec()
+        } else {
+            bytes[..slash].to_vec()
+        }
+    } else {
+        b".".to_vec()
+    };
+
+    for (i, byte) in output.iter().enumerate() {
+        env.mem.write(path + i as GuestUSize, *byte);
+    }
+    env.mem.write(path + output.len() as GuestUSize, b'\0');
+    path
+}
+
 fn realpath(
     env: &mut Environment,
     file_name: ConstPtr<u8>,
     resolve_name: MutPtr<u8>,
 ) -> MutPtr<u8> {
-    assert!(!resolve_name.is_null());
-    let file_name_str = env.mem.cstr_at_utf8(file_name).unwrap();
+    let file_name_str = match env.mem.cstr_at_utf8(file_name) {
+        Ok(s) => s,
+        Err(_) => {
+            set_errno(env, EINVAL);
+            return Ptr::null();
+        }
+    };
     let resolved = resolve_path(
         GuestPath::new(file_name_str),
         Some(env.fs.working_directory()),
     );
     let result = format!("/{}", resolved.join("/"));
+    let resolve_name = if resolve_name.is_null() {
+        // POSIX: when @resolve_name is NULL, realpath() must allocate a
+        // buffer for the resolved path (up to PATH_MAX bytes).
+        let buf: MutPtr<u8> = env.mem.alloc((result.len() + 1) as GuestUSize).cast();
+        buf
+    } else {
+        resolve_name
+    };
     env.mem
         .bytes_at_mut(resolve_name, result.len() as GuestUSize)
         .copy_from_slice(result.as_bytes());
@@ -1839,6 +1883,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func_aliased!("strtoq", strtoll(_, _, _)),
     export_c_func_aliased!("strtouq", strtoull(_, _, _)),
     export_c_func!(strtol(_, _, _)),
+    export_c_func!(dirname(_)),
     export_c_func!(realpath(_, _)),
     export_c_func_aliased!("realpath$DARWIN_EXTSN", realpath(_, _)),
     // mbstowcs and wcstombs are exported from libc::wchar; not duplicated here.
