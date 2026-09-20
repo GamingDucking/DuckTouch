@@ -13,7 +13,7 @@
 //! the purchase (see `sk_payment_queue.rs`).
 
 use crate::frameworks::foundation::ns_string;
-use crate::objc::{id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr};
+use crate::objc::{autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr};
 use crate::Environment;
 
 // MARK: - SKProduct

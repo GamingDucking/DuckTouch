@@ -164,7 +164,9 @@ impl TrainerUi {
             frozen_count: 0,
             bulk_preview: false,
             safe_mode: true,
-            iap: crate::frameworks::store_kit::emulation_enabled(),
+            // Cannot read the environment in this const context; the env
+            // default is picked up lazily by the activation toggle.
+            iap: false,
             speed: Speed::Normal,
             speed_dirty: false,
             pending: None,
