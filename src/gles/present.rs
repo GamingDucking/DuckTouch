@@ -204,7 +204,7 @@ pub unsafe fn present_frame(
         }
     }
 
-    // GameGuardian-style trainer overlay (floating button + panel). Drawn
+    // Cheat Engine-style trainer overlay (floating button + panel). Drawn
     // last so it sits on top of everything, including the FPS overlay.
     crate::trainer_ui::draw(gles, viewport);
 

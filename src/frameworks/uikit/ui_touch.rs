@@ -31,6 +31,19 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// requiring the user to enable debug logging.
 static TOUCH_DIAGS_LEFT: AtomicUsize = AtomicUsize::new(12);
 
+/// Number of touch-end summaries to print at `log!` level. Shows how many
+/// Moved events reached the view and the total displacement, which
+/// distinguishes "host lost the moves" from "game ignored a complete gesture".
+static TOUCH_END_DIAGS_LEFT: AtomicUsize = AtomicUsize::new(12);
+
+/// Number of warnings for Move/Up events naming an untracked finger (its Down
+/// never arrived). Proof of lost Downs in "swipes randomly dead" reports.
+static UNTRACKED_TOUCH_WARNS: AtomicUsize = AtomicUsize::new(8);
+
+/// A touch with no event for this long is no longer part of a live gesture;
+/// its Up/Cancel was lost. Used to reclaim stale touches safely.
+const STALE_TOUCH_SECONDS: f64 = 10.0;
+
 pub type UITouchPhase = NSInteger;
 pub const UITouchPhaseBegan: UITouchPhase = 0;
 pub const UITouchPhaseMoved: UITouchPhase = 1;
@@ -123,8 +136,46 @@ pub(super) struct UITouchHostObject {
     /// Host-side only: guests never need it, and swipe recognition always
     /// operates on registered (non-copied) touch objects.
     start_location: CGPoint,
+    /// How many Moved updates this touch has received. Diagnostics only.
+    move_count: u32,
 }
 impl HostObject for UITouchHostObject {}
+
+/// Cancel a touch whose Up/Cancel was lost, exactly like a real cancel, and
+/// drop it from the tracking table. `reason` is shown in the log.
+fn stale_cancel_and_release(env: &mut Environment, finger_id: FingerId, touch: id, reason: &str) {
+    static HEALS: AtomicUsize = AtomicUsize::new(0);
+    let n = HEALS.fetch_add(1, Ordering::Relaxed) + 1;
+    log!(
+        "Warning: touch {:?} {} [heal {}]; delivering touchesCancelled and dropping it.",
+        finger_id,
+        reason,
+        n
+    );
+    let stale_view: id = touch_ivars(env, touch, |v| v.view);
+    if stale_view != nil {
+        // Phase 4 mirrors `cancel_for_gesture`: not a public phase, so guests
+        // that poll `phase` see the touch as neither began, moved nor ended.
+        touch_ivars(env, touch, |v| v.phase = 4);
+        let stale_set: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
+        () = msg![env; stale_set addObject:touch];
+        let cancel_event = ui_event::new_event(env, stale_set);
+        () = msg![env; stale_view touchesCancelled:stale_set withEvent:cancel_event];
+        release(env, cancel_event);
+        release(env, stale_set);
+    }
+    env.framework_state
+        .uikit
+        .ui_touch
+        .cancelled_by_gesture
+        .remove(&touch);
+    env.framework_state
+        .uikit
+        .ui_touch
+        .current_touches
+        .remove(&finger_id);
+    release(env, touch);
+}
 
 fn touchhle_cocos_view_class_name(env: &mut Environment, view: id) -> String {
     if view == nil {
@@ -332,6 +383,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)allocWithZone:(NSZonePtr)_zone {
     let host_object = Box::new(UITouchHostObject {
         start_location: CGPoint { x: 0.0, y: 0.0 },
+        move_count: 0,
     });
     // The guest allocation must cover the ivars (see `UITouchIvars`): guest
     // engines bit-copy the whole 0x40-byte object and message the copy.
@@ -613,18 +665,22 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
         allocWithZone:(MutVoidPtr::null())];
 
     for (finger_id, coords) in map {
-        if env
+        // A Down for a finger that is still tracked means an earlier Up or
+        // Cancel was lost somewhere before it reached us (overlay ate the Up,
+        // app went to the background mid-touch, host quirk, ...). The old
+        // behaviour converted this Down into a Move, so the game never saw
+        // touchesBegan: for this finger and silently ignored the whole
+        // swipe/tap — until the host recycled the finger id. That is the
+        // classic "swipes randomly dead" report (e.g. Subway Surfers). Heal
+        // like real iOS: cancel the stale touch, then deliver a fresh Began.
+        if let Some(stale_touch) = env
             .framework_state
             .uikit
             .ui_touch
             .current_touches
-            .contains_key(&finger_id)
+            .remove(&finger_id)
         {
-            log!(
-                "Warning: New touch {:?} initiated but old one exists.",
-                finger_id
-            );
-            return handle_touches_move(env, HashMap::from([(finger_id, coords)]));
+            stale_cancel_and_release(env, finger_id, stale_touch, "restarted without ending");
         }
 
         let location = CGPoint {
@@ -804,6 +860,12 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
             && !touchhle_cocos_should_allow_multitouch(env, view)
             && (view_touches.contains_key(&view) || views_with_existing_touches.contains(&view))
         {
+            // The view already has a finger and refuses multi-touch. Real iOS
+            // delivers only the first touch of a sequence and KEEPS it alive;
+            // the old code silently deleted the tracked touch instead, so the
+            // first finger turned into a ghost (no more Moved/Ended, and the
+            // view was never told it ended). Unity-style input state machines
+            // then stalled and later swipes were randomly ignored.
             let active: Vec<(FingerId, id)> = env
                 .framework_state
                 .uikit
@@ -812,26 +874,43 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
                 .iter()
                 .map(|(&fid, &t)| (fid, t))
                 .collect();
-            let stuck: Vec<FingerId> = active
+            let stale: Vec<(FingerId, id)> = active
                 .into_iter()
                 .filter(|&(_, t)| {
-                    touch_ivars(env, t, |v| v.view) == view && t != touch
+                    touch_ivars(env, t, |v| {
+                        v.view == view
+                            && t != touch
+                            && (timestamp - v.timestamp) > STALE_TOUCH_SECONDS
+                    })
                 })
-                .map(|(fid, _)| fid)
                 .collect();
-            if !stuck.is_empty() {
-                for fid in stuck {
-                    if let Some(t) = env
-                        .framework_state
+            if !stale.is_empty() {
+                // Very old touches cannot be part of a live gesture; their
+                // Up/Cancel was lost long ago. Cancel them visibly, then let
+                // the newcomer through.
+                for (fid, t) in stale {
+                    stale_cancel_and_release(env, fid, t, "stale on single-touch view");
+                }
+            } else {
+                // A live second finger on a single-touch view: like real iOS,
+                // keep the tracked touch intact and drop the newcomer.
+                log_dbg!("Second finger on single-touch view; dropping the new touch.");
+                let new_finger = env
+                    .framework_state
+                    .uikit
+                    .ui_touch
+                    .current_touches
+                    .iter()
+                    .find(|(_, &v)| v == touch)
+                    .map(|(&k, _)| k);
+                if let Some(new_finger) = new_finger {
+                    env.framework_state
                         .uikit
                         .ui_touch
                         .current_touches
-                        .remove(&fid)
-                    {
-                        release(env, t);
-                    }
+                        .remove(&new_finger);
                 }
-            } else {
+                release(env, touch);
                 continue;
             }
         }
@@ -879,6 +958,15 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
             .current_touches
             .get(&finger_id)
         else {
+            let n = UNTRACKED_TOUCH_WARNS.load(Ordering::Relaxed);
+            if n > 0 {
+                UNTRACKED_TOUCH_WARNS.fetch_sub(1, Ordering::Relaxed);
+                log!(
+                    "Warning: TouchesMove for untracked finger {:?}; its Down never arrived. [{} reports left]",
+                    finger_id,
+                    n - 1
+                );
+            }
             continue;
         };
         let location = CGPoint {
@@ -900,6 +988,7 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
         if !moved {
             continue;
         }
+        env.objc.borrow_mut::<UITouchHostObject>(touch).move_count += 1;
 
         if let Entry::Vacant(e) = view_touches.entry(view) {
             let s: id = msg_class![env;
@@ -1053,6 +1142,15 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
             .current_touches
             .get(&finger_id)
         else {
+            let n = UNTRACKED_TOUCH_WARNS.load(Ordering::Relaxed);
+            if n > 0 {
+                UNTRACKED_TOUCH_WARNS.fetch_sub(1, Ordering::Relaxed);
+                log!(
+                    "Warning: TouchesUp for untracked finger {:?}; its Down never arrived. [{} reports left]",
+                    finger_id,
+                    n - 1
+                );
+            }
             continue;
         };
         let location = CGPoint {
@@ -1066,6 +1164,41 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
             v.timestamp = timestamp;
             v.phase = UITouchPhaseEnded;
         });
+
+        // Compact always-visible end-of-gesture summary for the first few
+        // touches: how many Moved updates reached the view and the total
+        // displacement. A swipe with moves=0 means the host lost the moves;
+        // a large delta that the game still ignores points at game-side
+        // interpretation instead.
+        if TOUCH_END_DIAGS_LEFT.load(Ordering::Relaxed) > 0 {
+            TOUCH_END_DIAGS_LEFT.fetch_sub(1, Ordering::Relaxed);
+            let gesture_cancelled = env
+                .framework_state
+                .uikit
+                .ui_touch
+                .cancelled_by_gesture
+                .contains(&touch);
+            let (start, moves) = {
+                let host = env.objc.borrow::<UITouchHostObject>(touch);
+                (host.start_location, host.move_count)
+            };
+            let (dx, dy) = (location.x - start.x, location.y - start.y);
+            let view_name = if view != nil {
+                let view_class: crate::objc::Class = msg![env; view class];
+                env.objc.get_class_name(view_class).to_owned()
+            } else {
+                "(nil view)".to_owned()
+            };
+            log!(
+                "TOUCH-END #{}: view={} moves={} delta=({:+.0},{:+.0}) gesture_cancelled={}",
+                12 - TOUCH_END_DIAGS_LEFT.load(Ordering::Relaxed),
+                view_name,
+                moves,
+                dx,
+                dy,
+                gesture_cancelled
+            );
+        }
 
         let _: () = msg![env;
             touches addObject:touch];

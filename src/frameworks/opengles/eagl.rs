@@ -775,7 +775,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     // The presented frame should be displayed ASAP, but the next one must be
     // delayed, so this needs to be checked before returning.
-    let frame_due = limit_framerate(&mut env.objc.borrow_mut::<EAGLContextHostObject>(this).next_frame_due, &env.options);
+    let frame_due = limit_framerate(&mut env.objc.borrow_mut::<EAGLContextHostObject>(this).next_frame_due, &env.options, env.guest_clock.speed().multiplier());
 
     if env.options.print_fps {
         env
@@ -1089,9 +1089,10 @@ unsafe fn present_renderbuffer_readback(env: &mut Environment, renderbuffer: GLu
 /// Returns the [Instant] the current frame is due at (or `None` if no pacing
 /// is needed), so the caller can pace the *next* guest work precisely with
 /// [pace_frame].
-fn limit_framerate(next_frame_due: &mut Option<Instant>, options: &Options) -> Option<Instant> {
+fn limit_framerate(next_frame_due: &mut Option<Instant>, options: &Options, speed: f64) -> Option<Instant> {
     let interval = if let Some(fps) = options.fps_limit {
-        1.0 / fps
+        // Host frame spacing follows speed; the FPS counter itself stays real.
+        1.0 / (fps * speed)
     } else {
         return None;
     };
@@ -1628,7 +1629,7 @@ unsafe fn present_renderbuffer_es2(
     );
     gles.DrawArrays(gles2::TRIANGLES, 0, 6);
 
-    // GameGuardian-style trainer overlay (floating button + panel), drawn
+    // Cheat Engine-style trainer overlay (floating button + panel), drawn
     // with a dedicated ES 2.0 shader so it also works on native ES 2.0
     // drivers (Android), where the fixed-function GLES 1.x path is unusable.
     crate::trainer_ui::draw_es2(gles, viewport, context_token);

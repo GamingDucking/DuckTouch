@@ -54,6 +54,7 @@ mod options;
 mod paths;
 mod perf_hints;
 mod stack;
+mod guest_clock;
 mod trainer;
 mod trainer_ui;
 mod window;

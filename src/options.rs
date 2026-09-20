@@ -149,7 +149,7 @@ pub struct Options {
     /// `--device-family=auto` (from the host display) or via the explicit
     /// `--screen-size=WxH` override below.
     pub host_screen_size: Option<(u32, u32)>,
-    /// Disable the GameGuardian-style memory trainer overlay.
+    /// Disable the Cheat Engine-style memory trainer overlay.
     pub trainer_disabled: bool,
     pub initial_orientation: DeviceOrientation,
     /// iOS version reported to guest applications. `None` uses the latest compatibility version.

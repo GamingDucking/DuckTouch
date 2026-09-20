@@ -4,7 +4,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-//! GameGuardian-style on-screen trainer overlay: a small floating button in
+//! Cheat Engine-style on-screen trainer overlay: a small floating button in
 //! the top-right corner of the viewport opens a touch panel for searching and
 //! editing guest memory while a game is running.
 //!
@@ -16,9 +16,13 @@
 //! main loop thread, where `&mut Mem` is available.
 
 use crate::font::{Font, TextAlignment};
+use crate::guest_clock::Speed;
 use crate::gles::gles11_raw as gles11;
 use crate::gles::{GLES, GLint, GLuint};
 use crate::trainer::{SearchResult, VType};
+use crate::trainer::watch::{Change, WatchFilter};
+use std::collections::VecDeque;
+use crate::trainer::classify::{Category, ResultFilter};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -32,7 +36,14 @@ pub enum TrainerCmd {
     Refine { vtype: VType, text: String },
     Reset,
     Set { vtype: VType, text: String },
-    SetAll { vtype: VType, text: String },
+    WatchSet { addr: u32, vtype: VType, text: String },
+    SetAll { vtype: VType, text: String, confirm: bool, safe_mode: bool, filter: ResultFilter },
+    CancelBulk,
+    RefreshView,
+    InspectSelection,
+    Mark,
+    Compare(WatchFilter),
+    ClearActivity,
     Freeze { vtype: VType, text: String },
     UnfreezeAll,
     Dump,
@@ -63,15 +74,75 @@ struct TrainerUi {
     vtype: VType,
     results: Vec<SearchResult>,
     total_results: usize,
+    filtered_results: usize,
+    category_counts: [usize; 6],
+    filter: ResultFilter,
+    selected_type: Option<VType>,
     selected: Option<u32>,
     scroll: usize,
     status: String,
     frozen_count: usize,
+    bulk_preview: bool,
+    /// Latched preference for this session, not the current touch state.
+    safe_mode: bool,
+    /// Latched StoreKit IAP emulation (Lucky Patcher-style free in-app buys).
+    iap: bool,
+    speed: Speed,
+    speed_dirty: bool,
     /// Widget id pressed but not yet released (pending activation).
     pending: Option<u16>,
+    watch_open: bool,
+    watch_paused: bool,
+    activity: Vec<Change>,
+    activity_changed: usize,
+    activity_tracked: usize,
+    activity_scroll: usize,
+    watch_target: Option<(u32, VType)>,
+    watch_current: Option<u64>,
+    watch_text: String,
+    watch_status: String,
 }
 
 impl TrainerUi {
+    /// Cache only the current page, but count/filter the complete result set.
+    /// This avoids both a huge UI copy and the old first-200 paging cutoff.
+    fn update_results(&mut self, results: &[SearchResult], reset: bool) {
+        if reset {
+            self.watch_target = None;
+            self.watch_current = None;
+            self.watch_text.clear();
+            self.watch_status.clear();
+            self.activity_tracked = results.len();
+            self.scroll = 0;
+            self.selected = None;
+            self.selected_type = None;
+        }
+        self.category_counts = [0; 6];
+        for result in results {
+            self.category_counts[result.analysis.category.index()] += 1;
+        }
+        self.total_results = results.len();
+        self.filtered_results = match self.filter {
+            ResultFilter::All => results.len(),
+            ResultFilter::Category(c) => self.category_counts[c.index()],
+        };
+        self.scroll = self.scroll.min(self.filtered_results.saturating_sub(RESULT_ROWS));
+        self.results = results.iter()
+            .filter(|r| self.filter.matches(r.analysis.category))
+            .skip(self.scroll).take(RESULT_ROWS).copied().collect();
+        if self.selected.is_some() && !self.results.iter().any(|r| {
+            Some(r.addr) == self.selected && Some(r.vtype) == self.selected_type
+        }) {
+            self.status = "SELECTION LEFT CURRENT PAGE".to_string();
+            self.selected = None;
+            self.selected_type = None;
+        }
+    }
+
+    fn take_speed_request(&mut self) -> Option<Speed> {
+        std::mem::take(&mut self.speed_dirty).then_some(self.speed)
+    }
+
     const fn new() -> TrainerUi {
         TrainerUi {
             enabled: true,
@@ -83,11 +154,32 @@ impl TrainerUi {
             vtype: VType::Auto,
             results: Vec::new(),
             total_results: 0,
+            filtered_results: 0,
+            category_counts: [0; 6],
+            filter: ResultFilter::All,
+            selected_type: None,
             selected: None,
             scroll: 0,
             status: String::new(),
             frozen_count: 0,
+            bulk_preview: false,
+            safe_mode: true,
+            // Cannot read the environment in this const context; the env
+            // default is picked up lazily by the activation toggle.
+            iap: false,
+            speed: Speed::Normal,
+            speed_dirty: false,
             pending: None,
+            watch_open: false,
+            watch_paused: false,
+            activity: Vec::new(),
+            activity_changed: 0,
+            activity_tracked: 0,
+            activity_scroll: 0,
+            watch_target: None,
+            watch_current: None,
+            watch_text: String::new(),
+            watch_status: String::new(),
         }
     }
 }
@@ -114,37 +206,93 @@ pub fn reset_for_app(app_id: Option<&str>) {
     ui.set_text.clear();
     ui.results.clear();
     ui.total_results = 0;
+    ui.filtered_results = 0;
+    ui.category_counts = [0; 6];
+    ui.filter = ResultFilter::All;
     ui.selected = None;
+    ui.selected_type = None;
     ui.scroll = 0;
     ui.status.clear();
     ui.frozen_count = 0;
+    ui.bulk_preview = false;
+    ui.speed = Speed::Normal;
+    ui.speed_dirty = false;
     ui.pending = None;
+    ui.watch_open = false;
+    ui.watch_target = None;
+    ui.watch_current = None;
+    ui.watch_text.clear();
+    ui.watch_status.clear();
+    ui.watch_paused = false;
+    ui.activity.clear();
+    ui.activity_changed = 0;
+    ui.activity_tracked = 0;
+    ui.activity_scroll = 0;
 }
 
-/// Live value refresh: replace the displayed values (and `changed` flags)
-/// without touching scroll position or selection.
-pub fn publish_live_values(results: &[crate::trainer::SearchResult]) {
+/// Refresh the currently selected category/page without resetting its scroll.
+pub fn publish_live_values(results: &[SearchResult]) {
+    UI.lock().unwrap().update_results(results, false);
+}
+
+pub fn publish_activity(changes: &VecDeque<Change>, changed: usize, tracked: usize) {
     let mut ui = UI.lock().unwrap();
-    if ui.results.is_empty() && results.is_empty() {
-        return;
+    // Do not let a live reorder replace the row under the user's finger.
+    let pressing_row = ui.pending.is_some_and(|id| (W_CHANGE_BASE..W_CHANGE_BASE + RESULT_ROWS as u16).contains(&id));
+    if !ui.watch_paused && !pressing_row {
+        ui.activity_scroll = 0;
+        ui.activity = changes.iter().copied().collect();
+        ui.activity_changed = changed;
+        ui.activity_tracked = tracked;
     }
-    ui.results = results.iter().copied().take(200).collect();
-    ui.total_results = results.len();
+}
+
+pub fn clear_activity() {
+    let mut ui = UI.lock().unwrap();
+    ui.activity.clear();
+    ui.activity_scroll = 0;
+    ui.activity_changed = 0;
+    ui.activity_tracked = ui.total_results;
+}
+
+pub fn watch_target() -> Option<(u32, VType)> {
+    UI.lock().unwrap().watch_target
+}
+
+pub fn publish_watch_value(target: (u32, VType), value: Option<u64>) {
+    let mut ui = UI.lock().unwrap();
+    if ui.watch_target == Some(target) { ui.watch_current = value; }
+}
+
+pub fn publish_watch_status(target: (u32, VType), status: String) {
+    let mut ui = UI.lock().unwrap();
+    if ui.watch_target == Some(target) { ui.watch_status = status; }
+}
+
+/// Consumed by Environment, which owns the per-app guest clock.
+pub fn take_speed_request() -> Option<Speed> {
+    UI.lock().unwrap().take_speed_request()
 }
 
 pub fn take_commands() -> Vec<TrainerCmd> {
     std::mem::take(&mut COMMANDS.lock().unwrap())
 }
 
-pub fn publish_results(results: &[SearchResult], total: usize) {
-    let mut ui = UI.lock().unwrap();
-    ui.results = results.iter().copied().take(200).collect();
-    ui.total_results = total;
-    ui.scroll = 0;
+pub fn publish_results(results: &[SearchResult], _total: usize) {
+    UI.lock().unwrap().update_results(results, true);
+}
+
+pub fn selected_result_type(addr: u32) -> Option<VType> {
+    let ui = UI.lock().unwrap();
+    if ui.selected == Some(addr) { ui.selected_type } else { None }
 }
 
 pub fn publish_status(status: String) {
     UI.lock().unwrap().status = status;
+}
+
+pub fn publish_bulk_preview(ready: bool) {
+    UI.lock().unwrap().bulk_preview = ready;
 }
 
 pub fn publish_frozen(count: usize) {
@@ -171,7 +319,32 @@ const W_SET: u16 = 9;
 const W_FREEZE: u16 = 10;
 const W_UNFREEZE: u16 = 11;
 const W_SET_ALL: u16 = 12;
-const W_DUMP: u16 = 12;
+const W_DUMP: u16 = 16;
+const W_SAFE_MODE: u16 = 17;
+const W_SPEED_DOWN: u16 = 18;
+const W_SPEED_RESET: u16 = 19;
+const W_SPEED_UP: u16 = 20;
+const W_CATEGORY: u16 = 21;
+const W_WATCH: u16 = 22;
+const W_MARK: u16 = 23;
+/// Sentinel for presses that hit the overlay but no widget: the whole gesture
+/// is swallowed, so no ghost Moved/Ended without Began leaks into the game.
+const W_SWALLOW: u16 = u16::MAX;
+const W_CHANGED: u16 = 24;
+const W_SAME: u16 = 25;
+const W_INCREASED: u16 = 26;
+const W_DECREASED: u16 = 27;
+const W_WATCH_PAUSE: u16 = 28;
+const W_WATCH_CLEAR: u16 = 29;
+const W_WATCH_CLOSE: u16 = 30;
+const W_IAP: u16 = 31;
+const W_WATCH_NEWER: u16 = 45;
+const W_WATCH_OLDER: u16 = 46;
+const W_WATCH_FIELD: u16 = 47;
+const W_WATCH_SET: u16 = 48;
+const W_WATCH_DONE: u16 = 49;
+const W_WATCH_KEY_BASE: u16 = 80; // + keypad index
+const W_CHANGE_BASE: u16 = 40; // + row index; below keypad IDs
 const W_SAVE: u16 = 13;
 const W_SCROLL_UP: u16 = 14;
 const W_SCROLL_DOWN: u16 = 15;
@@ -204,11 +377,19 @@ struct Layout {
     scale: f32,
     button: Rect,
     panel: Option<PanelLayout>,
+    monitor: Option<PanelLayout>,
+}
+
+impl Layout {
+    fn panels(&self) -> impl Iterator<Item = &PanelLayout> {
+        self.panel.iter().chain(self.monitor.iter())
+    }
 }
 
 struct PanelLayout {
     rect: Rect,
     widgets: Vec<(u16, Rect)>,
+    results_header_y: f32,
 }
 
 const RESULT_ROWS: usize = 5;
@@ -220,8 +401,8 @@ fn compute_layout(ui: &TrainerUi, viewport: (u32, u32, u32, u32)) -> Layout {
     // by the letterbox offset, tap targets misaligned with drawn keys).
     let (_vx, _vy, vw, vh) = viewport;
     let (vx, vy, vw, vh) = (0.0_f32, 0.0_f32, vw as f32, vh as f32);
-    // UI scale: reference height is 480 px (iPhone portrait).
-    let s = (vh / 480.0).clamp(0.75, 4.0);
+    // Fit the complete panel, including speed controls, in both orientations.
+    let s = (vh / 545.0).min(vw / if ui.watch_open && ui.open { 600.0 } else { 320.0 }).clamp(0.1, 4.0);
     let btn = 30.0 * s;
     let button = Rect {
         x: vx + vw - btn - 6.0 * s,
@@ -233,24 +414,34 @@ fn compute_layout(ui: &TrainerUi, viewport: (u32, u32, u32, u32)) -> Layout {
         let pw = (vw - 12.0 * s).min(300.0 * s);
         let px = vx + vw - pw - 6.0 * s;
         // Leave room for the button row above the panel.
-        let py = button.y + button.h + 4.0 * s;
-        let row_h = 24.0 * s;
-        let small_h = 20.0 * s;
-        let key_h = 26.0 * s;
+        let py = button.y + button.h + 3.0 * s;
+        let row_h = 22.0 * s;
+        let small_h = 18.0 * s;
+        let key_h = 24.0 * s;
         let mut widgets = Vec::new();
-        let mut y = py + 4.0 * s;
+        let mut y = py + 3.0 * s;
         let mut push_widget = |id: u16, wx: f32, wy: f32, ww: f32, wh: f32, widgets: &mut Vec<(u16, Rect)>| {
             widgets.push((id, Rect { x: wx, y: wy, w: ww, h: wh }));
         };
         // Header row (title + close button).
         push_widget(W_CLOSE, px + pw - small_h - 4.0 * s, y, small_h, small_h, &mut widgets);
-        y += small_h + 4.0 * s;
-        // Type row.
+        y += small_h + 3.0 * s;
+        // Type and latched safe-mode toggle share a row.
         push_widget(W_TYPE, px + 6.0 * s, y, 110.0 * s, row_h, &mut widgets);
-        y += row_h + 4.0 * s;
+        push_widget(W_SAFE_MODE, px + 120.0 * s, y, pw - 126.0 * s, row_h, &mut widgets);
+        y += row_h + 3.0 * s;
+        // Game speed: minus, current value (tap to reset), plus.
+        let speed_side = 38.0 * s;
+        push_widget(W_SPEED_DOWN, px + 6.0 * s, y, speed_side, row_h, &mut widgets);
+        push_widget(W_SPEED_RESET, px + 48.0 * s, y, pw - 96.0 * s, row_h, &mut widgets);
+        push_widget(W_SPEED_UP, px + pw - 44.0 * s, y, speed_side, row_h, &mut widgets);
+        y += row_h + 3.0 * s;
+        // Latched IAP emulation toggle (StoreKit free in-app purchases).
+        push_widget(W_IAP, px + 6.0 * s, y, pw - 12.0 * s, row_h, &mut widgets);
+        y += row_h + 3.0 * s;
         // Search value field.
         push_widget(W_FIELD_SEARCH, px + 6.0 * s, y, pw - 12.0 * s, row_h, &mut widgets);
-        y += row_h + 4.0 * s;
+        y += row_h + 3.0 * s;
         // Keypad: 4 columns x 4 rows.
         let key_w = (pw - 12.0 * s) / 4.0;
         for (row_idx, row) in KEYPAD.iter().enumerate() {
@@ -270,15 +461,25 @@ fn compute_layout(ui: &TrainerUi, viewport: (u32, u32, u32, u32)) -> Layout {
                 );
             }
         }
-        y += key_h * 4.0 + 4.0 * s;
+        y += key_h * 4.0 + 3.0 * s;
         // Actions row.
         let third = (pw - 12.0 * s - 8.0 * s) / 3.0;
         for (i, id) in [W_SEARCH, W_REFINE, W_RESET].iter().enumerate() {
             push_widget(*id, px + 6.0 * s + (third + 4.0 * s) * i as f32, y, third, row_h, &mut widgets);
         }
-        y += row_h + 4.0 * s;
+        y += row_h + 3.0 * s;
+        // Explicit before/after comparison: independent of live refresh.
+        let fifth = (pw - 12.0 * s - 8.0 * s) / 5.0;
+        for (i, id) in [W_MARK, W_CHANGED, W_SAME, W_INCREASED, W_DECREASED].iter().enumerate() {
+            push_widget(*id, px + 6.0 * s + (fifth + 2.0 * s) * i as f32, y, fifth, row_h, &mut widgets);
+        }
+        y += row_h + 3.0 * s;
+        // Category selector: guesses always keep a question mark.
+        push_widget(W_CATEGORY, px + 6.0 * s, y, pw - 12.0 * s, row_h, &mut widgets);
+        y += row_h + 3.0 * s;
         // Results header + scroll buttons.
-        let res_h = 18.0 * s;
+        let results_header_y = y;
+        let res_h = 16.0 * s;
         push_widget(W_SCROLL_UP, px + pw - 2.0 * (res_h + 3.0 * s), y, res_h, res_h, &mut widgets);
         push_widget(W_SCROLL_DOWN, px + pw - res_h - 3.0 * s, y, res_h, res_h, &mut widgets);
         y += res_h + 2.0 * s;
@@ -290,29 +491,70 @@ fn compute_layout(ui: &TrainerUi, viewport: (u32, u32, u32, u32)) -> Layout {
         y += 3.0 * s;
         // Set value field.
         push_widget(W_FIELD_SET, px + 6.0 * s, y, pw - 12.0 * s, row_h, &mut widgets);
-        y += row_h + 4.0 * s;
+        y += row_h + 3.0 * s;
         // Set / set-all / freeze row.
         let quarter = (pw - 12.0 * s - 12.0 * s) / 4.0;
         for (i, id) in [W_SET, W_SET_ALL, W_FREEZE, W_UNFREEZE].iter().enumerate() {
             push_widget(*id, px + 6.0 * s + (quarter + 4.0 * s) * i as f32, y, quarter, row_h, &mut widgets);
         }
-        y += row_h + 4.0 * s;
-        // Dump / save row.
-        let half = (pw - 12.0 * s - 4.0 * s) / 2.0;
-        for (i, id) in [W_DUMP, W_SAVE].iter().enumerate() {
-            push_widget(*id, px + 6.0 * s + (half + 4.0 * s) * i as f32, y, half, row_h, &mut widgets);
+        y += row_h + 3.0 * s;
+        // Activity window with inline editing, plus dump/save.
+        let third = (pw - 12.0 * s - 8.0 * s) / 3.0;
+        for (i, id) in [W_DUMP, W_SAVE, W_WATCH].iter().enumerate() {
+            push_widget(*id, px + 6.0 * s + (third + 4.0 * s) * i as f32, y, third, row_h, &mut widgets);
         }
-        y += row_h + 4.0 * s;
+        y += row_h + 3.0 * s;
         // Status line (not interactive).
-        let ph = y + small_h + 4.0 * s - py;
+        let ph = y + small_h + 3.0 * s - py;
         Some(PanelLayout {
             rect: Rect { x: px, y: py, w: pw, h: ph },
             widgets,
+            results_header_y,
         })
     } else {
         None
     };
-    Layout { scale: s, button, panel }
+    let monitor = if ui.watch_open {
+        // A compact independent window leaves the rest of the game touchable.
+        // Beside the editor when it is open; larger when watching the game.
+        let ms = if ui.open { s } else { (vw / 300.0).min(vh / 480.0).clamp(0.1, 2.0) };
+        let height = if ui.watch_target.is_some() { 428.0 } else { 218.0 };
+        let rect = Rect { x: 6.0 * ms, y: 42.0 * ms, w: 280.0 * ms, h: height * ms };
+        let mut widgets = Vec::new();
+        for (i, id) in [W_WATCH_PAUSE, W_WATCH_CLEAR, W_WATCH_CLOSE].iter().enumerate() {
+            widgets.push((*id, Rect { x: rect.x + (128.0 + i as f32 * 48.0) * ms,
+                y: rect.y + 3.0 * ms, w: 46.0 * ms, h: 23.0 * ms }));
+        }
+        for row in 0..RESULT_ROWS {
+            widgets.push((W_CHANGE_BASE + row as u16, Rect { x: rect.x + 4.0 * ms,
+                y: rect.y + (42.0 + row as f32 * 29.0) * ms,
+                w: rect.w - 8.0 * ms, h: 28.0 * ms }));
+        }
+        for (i, id) in [W_WATCH_NEWER, W_WATCH_OLDER].iter().enumerate() {
+            widgets.push((*id, Rect { x: rect.x + (4.0 + i as f32 * 138.0) * ms,
+                y: rect.y + 190.0 * ms, w: 134.0 * ms, h: 23.0 * ms }));
+        }
+        if ui.watch_target.is_some() {
+            for (id, x, width) in [(W_WATCH_FIELD, 4.0, 198.0), (W_WATCH_SET, 206.0, 70.0)] {
+                widgets.push((id, Rect { x: rect.x + x * ms, y: rect.y + 242.0 * ms,
+                    w: width * ms, h: 24.0 * ms }));
+            }
+            for (row, keys) in KEYPAD.iter().enumerate() {
+                for (col, key) in keys.iter().enumerate() {
+                    if key.is_some() {
+                        widgets.push((W_WATCH_KEY_BASE + (row * 4 + col) as u16,
+                            Rect { x: rect.x + (4.0 + col as f32 * 68.0) * ms,
+                                y: rect.y + (270.0 + row as f32 * 26.0) * ms,
+                                w: 66.0 * ms, h: 24.0 * ms }));
+                    }
+                }
+            }
+            widgets.push((W_WATCH_DONE, Rect { x: rect.x + 4.0 * ms,
+                y: rect.y + 378.0 * ms, w: 272.0 * ms, h: 23.0 * ms }));
+        }
+        Some(PanelLayout { rect, widgets, results_header_y: rect.y + 28.0 * ms })
+    } else { None };
+    Layout { scale: s, button, panel, monitor }
 }
 
 // ---------------------------------------------------------------------------
@@ -339,17 +581,17 @@ pub fn touch_down(abs: (f32, f32), viewport: (u32, u32, u32, u32)) -> bool {
         ui.pending = Some(W_BUTTON);
         return true;
     }
-    if let Some(panel) = &layout.panel {
-        if !panel.rect.contains(x, y) {
-            return false; // outside the panel: let the game have the touch
-        }
+    for panel in layout.panels() {
+        if !panel.rect.contains(x, y) { continue; }
         for (id, rect) in &panel.widgets {
             if rect.contains(x, y) {
                 ui.pending = Some(*id);
                 return true;
             }
         }
-        // Inside the panel but not on a widget: swallow the touch.
+        // Inside the panel but not on a widget: swallow the WHOLE gesture so
+        // the game never sees a Moved/Ended without the matching Began.
+        ui.pending = Some(W_SWALLOW);
         return true;
     }
     false
@@ -374,18 +616,16 @@ pub fn touch_up(abs: (f32, f32), viewport: (u32, u32, u32, u32)) -> bool {
     let (vx, vy, _, _) = viewport;
     let (x, y) = (abs.0 - vx as f32, abs.1 - vy as f32);
     let Some(pending) = ui.pending.take() else {
-        // Finger wasn't consumed on the way down.
-        if layout.button.contains(x, y) || layout.panel.as_ref().map_or(false, |p| p.rect.contains(x, y)) {
-            return true;
-        }
+        // The Down went to the game, so the Up belongs to the game too.
+        // Eating it here used to leave a stuck touch in the game: its next
+        // swipe/tap then had no touchesBegan and was ignored until the host
+        // recycled the finger id (the Subway Surfers "swipes randomly dead"
+        // bug). A stray release over the panel activates nothing.
         return false;
     };
     // Activate if the finger is released over the same widget.
     let hit = pending == W_BUTTON && layout.button.contains(x, y)
-        || layout
-            .panel
-            .as_ref()
-            .map_or(false, |p| p.widgets.iter().any(|(id, r)| *id == pending && r.contains(x, y)));
+        || layout.panels().any(|p| p.widgets.iter().any(|(id, r)| *id == pending && r.contains(x, y)));
     if hit {
         activate_widget(&mut ui, pending);
     }
@@ -393,10 +633,123 @@ pub fn touch_up(abs: (f32, f32), viewport: (u32, u32, u32, u32)) -> bool {
 }
 
 fn activate_widget(ui: &mut TrainerUi, id: u16) {
+    // Editing inputs, closing the panel or taking any other action cancels
+    // confirmation. A later click must preview again, never apply silently.
+    if id != W_SET_ALL {
+        ui.bulk_preview = false;
+        COMMANDS.lock().unwrap().push(TrainerCmd::CancelBulk);
+    }
     match id {
         W_BUTTON => ui.open = !ui.open,
+        W_WATCH => ui.watch_open = !ui.watch_open,
+        W_WATCH_CLOSE => ui.watch_open = false,
+        W_WATCH_PAUSE => {
+            ui.watch_paused = !ui.watch_paused;
+            ui.activity_scroll = 0;
+        }
+        W_WATCH_NEWER | W_WATCH_OLDER => {
+            ui.watch_paused = true;
+            ui.activity_scroll = if id == W_WATCH_NEWER {
+                ui.activity_scroll.saturating_sub(RESULT_ROWS)
+            } else {
+                (ui.activity_scroll + RESULT_ROWS).min(ui.activity.len().saturating_sub(RESULT_ROWS))
+            };
+        }
+        W_WATCH_CLEAR => {
+            ui.activity.clear();
+            ui.activity_scroll = 0;
+            ui.activity_changed = 0;
+            COMMANDS.lock().unwrap().push(TrainerCmd::ClearActivity);
+        }
+        W_MARK => COMMANDS.lock().unwrap().push(TrainerCmd::Mark),
+        W_CHANGED | W_SAME | W_INCREASED | W_DECREASED => {
+            let filter = match id {
+                W_CHANGED => WatchFilter::Changed, W_SAME => WatchFilter::Same,
+                W_INCREASED => WatchFilter::Increased, _ => WatchFilter::Decreased,
+            };
+            COMMANDS.lock().unwrap().push(TrainerCmd::Compare(filter));
+        }
+        id if (W_CHANGE_BASE..W_CHANGE_BASE + RESULT_ROWS as u16).contains(&id) => {
+            if let Some(change) = ui.activity.get(ui.activity_scroll + (id - W_CHANGE_BASE) as usize) {
+                // Pin identity, not row index: subsequent live events cannot
+                // redirect the edit to a different address or AUTO alias.
+                ui.watch_target = Some((change.addr, change.vtype));
+                ui.watch_current = None;
+                ui.watch_text = change.vtype.format(change.after);
+                ui.watch_status = "SET edits this address only; still risky".to_string();
+                COMMANDS.lock().unwrap().push(TrainerCmd::RefreshView);
+            }
+        }
+        W_WATCH_FIELD => {}
+        W_WATCH_DONE => {
+            ui.watch_target = None;
+            ui.watch_current = None;
+            ui.watch_text.clear();
+            ui.watch_status.clear();
+        }
+        W_WATCH_SET => {
+            if let Some((addr, vtype)) = ui.watch_target {
+                if ui.watch_current.is_some() {
+                    COMMANDS.lock().unwrap().push(TrainerCmd::WatchSet {
+                        addr, vtype, text: ui.watch_text.trim().to_string(),
+                    });
+                } else {
+                    ui.watch_status = "ADDRESS UNAVAILABLE: WAIT OR SEARCH AGAIN".to_string();
+                }
+            }
+        }
+        id if (W_WATCH_KEY_BASE..W_WATCH_KEY_BASE + 16).contains(&id) => {
+            let index = (id - W_WATCH_KEY_BASE) as usize;
+            if let Some(ch) = KEYPAD[index / 4][index % 4] {
+                match ch {
+                    '\u{8}' => { ui.watch_text.pop(); }
+                    '\u{4}' => ui.watch_text.clear(),
+                    _ if ui.watch_text.len() < 24 => ui.watch_text.push(ch),
+                    _ => {}
+                }
+            }
+        }
         W_CLOSE => ui.open = false,
         W_TYPE => ui.vtype = ui.vtype.next(),
+        W_SAFE_MODE => {
+            ui.safe_mode = !ui.safe_mode;
+            ui.status = if ui.safe_mode {
+                "SAFE MODE ON: FILTER BULK WRITES"
+            } else {
+                "SAFE MODE OFF: EXTRA CRASH RISK"
+            }.to_string();
+        }
+        W_IAP => {
+            ui.iap = !ui.iap;
+            crate::frameworks::store_kit::set_emulation_enabled(ui.iap);
+            ui.status = if ui.iap {
+                "IN-APP ON: PURCHASES FREE"
+            } else {
+                "IN-APP OFF: STOCK STORE STUBS"
+            }
+            .to_string();
+        }
+        W_SPEED_DOWN | W_SPEED_RESET | W_SPEED_UP => {
+            ui.speed = match id {
+                W_SPEED_DOWN => ui.speed.step(false),
+                W_SPEED_UP => ui.speed.step(true),
+                _ => Speed::Normal,
+            };
+            ui.speed_dirty = true;
+        }
+        W_CATEGORY => {
+            ui.filter = ui.filter.next();
+            ui.scroll = 0;
+            ui.selected = None;
+            ui.selected_type = None;
+            ui.results.clear();
+            ui.filtered_results = match ui.filter {
+                ResultFilter::All => ui.total_results,
+                ResultFilter::Category(c) => ui.category_counts[c.index()],
+            };
+            ui.status = "Guesses only; not verified".to_string();
+            COMMANDS.lock().unwrap().push(TrainerCmd::RefreshView);
+        }
         W_FIELD_SEARCH => ui.focus = Focus::Search,
         W_FIELD_SET => ui.focus = Focus::Set,
         W_SEARCH => {
@@ -422,7 +775,11 @@ fn activate_widget(ui: &mut TrainerUi, id: u16) {
         }
         W_SET_ALL => {
             let text = ui.set_text.trim().to_string();
-            COMMANDS.lock().unwrap().push(TrainerCmd::SetAll { vtype: ui.vtype, text });
+            let confirm = ui.bulk_preview;
+            ui.bulk_preview = false;
+            COMMANDS.lock().unwrap().push(TrainerCmd::SetAll {
+                vtype: ui.vtype, text, confirm, safe_mode: ui.safe_mode, filter: ui.filter,
+            });
         }
         W_FREEZE => {
             let text = ui.set_text.trim().to_string();
@@ -440,18 +797,25 @@ fn activate_widget(ui: &mut TrainerUi, id: u16) {
         W_SAVE => {
             COMMANDS.lock().unwrap().push(TrainerCmd::SaveHack { vtype: ui.vtype });
         }
-        W_SCROLL_UP => ui.scroll = ui.scroll.saturating_sub(RESULT_ROWS),
-        W_SCROLL_DOWN => {
-            let last = ui.total_results.saturating_sub(RESULT_ROWS);
-            if ui.scroll + RESULT_ROWS < last + RESULT_ROWS && ui.scroll < last {
-                ui.scroll = (ui.scroll + RESULT_ROWS).min(last);
-            }
+        W_SCROLL_UP | W_SCROLL_DOWN => {
+            let last = ui.filtered_results.saturating_sub(RESULT_ROWS);
+            ui.scroll = if id == W_SCROLL_UP {
+                ui.scroll.saturating_sub(RESULT_ROWS)
+            } else {
+                (ui.scroll + RESULT_ROWS).min(last)
+            };
+            ui.results.clear();
+            ui.selected = None;
+            ui.selected_type = None;
+            COMMANDS.lock().unwrap().push(TrainerCmd::RefreshView);
         }
         id if (W_RESULT_BASE..W_RESULT_BASE + RESULT_ROWS as u16).contains(&id) => {
-            let idx = ui.scroll + (id - W_RESULT_BASE) as usize;
-            if idx < ui.results.len() {
-                ui.selected = Some(ui.results[idx].addr);
-                ui.status = format!("SELECTED 0x{:X}", ui.results[idx].addr);
+            let idx = (id - W_RESULT_BASE) as usize;
+            if let Some(result) = ui.results.get(idx) {
+                ui.selected = Some(result.addr);
+                ui.selected_type = Some(result.vtype);
+                ui.status = format!("{}: {}", result.analysis.category.label(), result.analysis.description());
+                COMMANDS.lock().unwrap().push(TrainerCmd::InspectSelection);
             }
         }
         id if (W_KEY_BASE..W_KEY_BASE + 16).contains(&id) => {
@@ -815,6 +1179,16 @@ const COL_TEXT_DIM: (f32, f32, f32, f32) = (0.6, 0.6, 0.62, 1.0);
 const COL_ACCENT: (f32, f32, f32, f32) = (0.0, 0.75, 0.35, 0.92);
 const COL_SELECTED: (f32, f32, f32, f32) = (0.15, 0.3, 0.6, 1.0);
 const COL_CHANGED: (f32, f32, f32, f32) = (0.75, 0.55, 0.0, 0.95);
+const COL_SAFE_MODE_ON: (f32, f32, f32, f32) = (1.0, 0.8, 0.1, 1.0);
+const COL_SAFE_MODE_TEXT: (f32, f32, f32, f32) = (0.08, 0.07, 0.02, 1.0);
+
+fn safe_mode_colors(enabled: bool) -> ((f32, f32, f32, f32), (f32, f32, f32, f32)) {
+    if enabled {
+        (COL_SAFE_MODE_ON, COL_SAFE_MODE_TEXT)
+    } else {
+        (COL_WIDGET, COL_TEXT)
+    }
+}
 
 /// Entry point called from present_frame (CA composition and native ES 1.1
 /// present paths), in viewport pixel space. Renders with GLES 1.x
@@ -843,6 +1217,9 @@ pub unsafe fn draw_es2(
             drop(stored);
             *OVERLAY_PROGRAM.lock().unwrap() = None;
             *OVERLAY_VBO.lock().unwrap() = None;
+            // The solid-quad texture is context-owned too. Reusing its old
+            // name can sample an unrelated texture in the new context.
+            *OVERLAY_WHITE_TEX.lock().unwrap() = None;
             invalidate_atlas();
         }
     }
@@ -879,7 +1256,7 @@ unsafe fn build_scene(
     let lit = ui_state.pending == Some(W_BUTTON) || ui_state.open;
     push_rect(&mut quads, layout.button, if lit { COL_WIDGET_LIT } else { COL_ACCENT });
     let bs = layout.scale;
-    let label = if ui_state.open { "X" } else { "GG" };
+    let label = if ui_state.open { "X" } else { "CE" };
     let tw = text_width(atlas, label, 12.0 * bs);
     push_text(&mut quads,
         atlas,
@@ -890,11 +1267,82 @@ unsafe fn build_scene(
         COL_TEXT,
     );
 
+    if let Some(monitor) = &layout.monitor {
+        let ms = monitor.rect.w / 280.0;
+        push_rect(&mut quads, monitor.rect, COL_PANEL);
+        push_text(&mut quads, atlas, if ui_state.watch_paused { "CHANGES PAUSED" } else { "LIVE CHANGES" },
+            monitor.rect.x + 5.0 * ms, monitor.rect.y + 9.0 * ms, 10.0 * ms, COL_ACCENT);
+        let counts = if ui_state.activity_tracked == 0 {
+            "Search a value first; then play".to_string()
+        } else {
+            format!("{} changed / {} tracked{}", ui_state.activity_changed, ui_state.activity_tracked,
+                if ui_state.activity_changed > 256 { " (sampled)" } else { "" })
+        };
+        let size = 9.0 * ms;
+        let size = size * ((monitor.rect.w - 10.0 * ms) / text_width(atlas, &counts, size).max(1.0)).min(1.0);
+        push_text(&mut quads, atlas, &counts, monitor.rect.x + 5.0 * ms,
+            monitor.results_header_y + 2.0 * ms, size, COL_TEXT_DIM);
+        for &(id, rect) in &monitor.widgets {
+            push_rect(&mut quads, rect, COL_WIDGET);
+            let label = match id {
+                W_WATCH_PAUSE => Some(if ui_state.watch_paused { "RESUME" } else { "PAUSE" }),
+                W_WATCH_CLEAR => Some("CLEAR"), W_WATCH_CLOSE => Some("X"),
+                W_WATCH_NEWER => Some("< NEWER"), W_WATCH_OLDER => Some("OLDER >"), _ => None,
+            };
+            if let Some(label) = label {
+                push_text(&mut quads, atlas, label, rect.x + 3.0 * ms, rect.y + 7.0 * ms, 9.0 * ms, COL_TEXT);
+            } else if (W_CHANGE_BASE..W_CHANGE_BASE + RESULT_ROWS as u16).contains(&id) {
+                let Some(change) = ui_state.activity.get(ui_state.activity_scroll + (id - W_CHANGE_BASE) as usize) else { continue; };
+                if ui_state.watch_target == Some((change.addr, change.vtype)) {
+                    push_rect(&mut quads, rect, COL_SELECTED);
+                }
+                let fresh = !ui_state.watch_paused && change.at.elapsed().as_secs_f32() < 0.75;
+                let title = format!("0x{:08X} {}  {:.1}s ago", change.addr, change.vtype.name(), change.at.elapsed().as_secs_f32());
+                let values = format!("{} -> {}", change.vtype.format(change.before), change.vtype.format(change.after));
+                for (line, text) in [title, values].iter().enumerate() {
+                    let size = 10.0 * ms;
+                    let size = size * ((rect.w - 10.0 * ms) / text_width(atlas, text, size).max(1.0)).min(1.0);
+                    push_text(&mut quads, atlas, text, rect.x + 4.0 * ms,
+                        rect.y + (2.0 + line as f32 * 13.0) * ms, size,
+                        if fresh { COL_ACCENT } else { COL_TEXT });
+                }
+            } else {
+                let label = match id {
+                    W_WATCH_FIELD => format!("NEW: {}_", ui_state.watch_text),
+                    W_WATCH_SET => "SET".to_string(),
+                    W_WATCH_DONE => "DONE (keep watching)".to_string(),
+                    id if (W_WATCH_KEY_BASE..W_WATCH_KEY_BASE + 16).contains(&id) => {
+                        let index = (id - W_WATCH_KEY_BASE) as usize;
+                        match KEYPAD[index / 4][index % 4] {
+                            Some('\u{8}') => "DEL".to_string(),
+                            Some('\u{4}') => "CLR".to_string(),
+                            Some(ch) => ch.to_string(), None => String::new(),
+                        }
+                    }
+                    _ => String::new(),
+                };
+                let size = 11.0 * ms;
+                let size = size * ((rect.w - 8.0 * ms) / text_width(atlas, &label, size).max(1.0)).min(1.0);
+                push_text(&mut quads, atlas, &label, rect.x + 4.0 * ms, rect.y + 6.0 * ms, size, COL_TEXT);
+            }
+        }
+        if let Some((addr, vtype)) = ui_state.watch_target {
+            let current = ui_state.watch_current.map(|v| vtype.format(v)).unwrap_or_else(|| "unavailable".to_string());
+            let target = format!("0x{:08X} {} NOW: {}", addr, vtype.name(), current);
+            for (y, text) in [(222.0, target.as_str()), (407.0, ui_state.watch_status.as_str())] {
+                let size = 10.0 * ms;
+                let size = size * ((monitor.rect.w - 10.0 * ms) / text_width(atlas, text, size).max(1.0)).min(1.0);
+                push_text(&mut quads, atlas, text, monitor.rect.x + 5.0 * ms,
+                    monitor.rect.y + y * ms, size, COL_ACCENT);
+            }
+        }
+    }
+
     if let Some(panel) = &layout.panel {
         push_rect(&mut quads, panel.rect, COL_PANEL);
 
         // Header.
-        let title = "GameGuardian";
+        let title = "Cheat Engine";
         push_text(&mut quads,
             atlas,
             title,
@@ -923,6 +1371,52 @@ unsafe fn build_scene(
                     push_rect(&mut quads, *rect, COL_WIDGET);
                     let label = format!("TYPE: {}", ui_state.vtype.name());
                     push_text(&mut quads, atlas, &label, rect.x + 6.0 * bs, rect.y + 5.0 * bs, 12.0 * bs, COL_TEXT);
+                }
+                W_SAFE_MODE => {
+                    let (background, foreground) = safe_mode_colors(ui_state.safe_mode);
+                    push_rect(&mut quads, *rect, background);
+                    let label = "SAFE MODE";
+                    let size = 11.0 * bs;
+                    let tw = text_width(atlas, label, size);
+                    push_text(&mut quads, atlas, label,
+                        rect.x + (rect.w - tw) / 2.0,
+                        rect.y + (rect.h - atlas.height * (size / FONT_PX)) / 2.0,
+                        size, foreground,
+                    );
+                }
+                W_IAP => {
+                    let (background, foreground) = safe_mode_colors(ui_state.iap);
+                    push_rect(&mut quads, *rect, background);
+                    let label = "IN-APP: FREE BUYS";
+                    let size = 11.0 * bs;
+                    let tw = text_width(atlas, label, size);
+                    push_text(&mut quads, atlas, label,
+                        rect.x + (rect.w - tw) / 2.0,
+                        rect.y + (rect.h - atlas.height * (size / FONT_PX)) / 2.0,
+                        size, foreground,
+                    );
+                }
+                W_SPEED_DOWN | W_SPEED_RESET | W_SPEED_UP => {
+                    push_rect(&mut quads, *rect, if *id == W_SPEED_RESET && ui_state.speed != Speed::Normal {
+                        COL_WIDGET_LIT
+                    } else { COL_WIDGET });
+                    let label = match *id {
+                        W_SPEED_DOWN => "-".to_string(),
+                        W_SPEED_UP => "+".to_string(),
+                        _ => format!("SPEED {}", ui_state.speed.label()),
+                    };
+                    let size = 12.0 * bs;
+                    let tw = text_width(atlas, &label, size);
+                    push_text(&mut quads, atlas, &label,
+                        rect.x + (rect.w - tw) / 2.0,
+                        rect.y + 5.0 * bs, size, COL_TEXT,
+                    );
+                }
+                W_CATEGORY => {
+                    push_rect(&mut quads, *rect, COL_WIDGET);
+                    let label = format!("GROUP: {} ({})", ui_state.filter.label(), ui_state.filtered_results);
+                    push_text(&mut quads, atlas, &label,
+                        rect.x + 6.0 * bs, rect.y + 5.0 * bs, 11.0 * bs, COL_ACCENT);
                 }
                 W_FIELD_SEARCH | W_FIELD_SET => {
                     let focus_here = (*id == W_FIELD_SEARCH && ui_state.focus == Focus::Search)
@@ -961,21 +1455,28 @@ unsafe fn build_scene(
                         );
                     }
                 }
-                W_SEARCH | W_REFINE | W_RESET | W_SET | W_SET_ALL | W_FREEZE | W_UNFREEZE | W_DUMP | W_SAVE => {
+                W_SEARCH | W_REFINE | W_RESET | W_SET | W_SET_ALL | W_FREEZE | W_UNFREEZE | W_DUMP | W_SAVE | W_WATCH | W_MARK | W_CHANGED | W_SAME | W_INCREASED | W_DECREASED => {
                     push_rect(&mut quads, *rect, COL_WIDGET);
                     let label: &str = match *id {
                         W_SEARCH => "SEARCH",
                         W_REFINE => "REFINE",
                         W_RESET => "RESET",
                         W_SET => "SET",
-                        W_SET_ALL => "SET ALL",
+                        W_SET_ALL => if ui_state.bulk_preview { "CONFIRM" } else { "SET ALL" },
                         W_FREEZE => "FREEZE",
                         W_UNFREEZE => "UNFRZ",
                         W_DUMP => "DUMP",
-                        W_SAVE => "SAVE HACK",
+                        W_SAVE => "SAVE",
+                        W_WATCH => "WATCH",
+                        W_MARK => "MARK",
+                        W_CHANGED => "CHANGED",
+                        W_SAME => "SAME",
+                        W_INCREASED => "UP",
+                        W_DECREASED => "DOWN",
                         _ => "",
                     };
                     let size = 12.0 * bs;
+                    let size = size * ((rect.w - 6.0 * bs) / text_width(atlas, label, size).max(1.0)).min(1.0);
                     let tw = text_width(atlas, label, size);
                     push_text(&mut quads,
                         atlas,
@@ -990,6 +1491,7 @@ unsafe fn build_scene(
                     push_rect(&mut quads, *rect, COL_WIDGET);
                     let label: &str = if *id == W_SCROLL_UP { "^" } else { "v" };
                     let size = 12.0 * bs;
+                    let size = size * ((rect.w - 6.0 * bs) / text_width(atlas, label, size).max(1.0)).min(1.0);
                     let tw = text_width(atlas, label, size);
                     push_text(&mut quads,
                         atlas,
@@ -1002,9 +1504,9 @@ unsafe fn build_scene(
                 }
                 id if (W_RESULT_BASE..W_RESULT_BASE + RESULT_ROWS as u16).contains(&id) => {
                     let row_idx = (id - W_RESULT_BASE) as usize;
-                    let abs_idx = ui_state.scroll + row_idx;
-                    if let Some(result) = ui_state.results.get(abs_idx) {
-                        let selected = ui_state.selected == Some(result.addr);
+                    if let Some(result) = ui_state.results.get(row_idx) {
+                        let selected = ui_state.selected == Some(result.addr)
+                            && ui_state.selected_type == Some(result.vtype);
                         push_rect(
                             &mut quads,
                             *rect,
@@ -1017,11 +1519,16 @@ unsafe fn build_scene(
                             },
                         );
                         let text = format!(
-                            "0x{:08X} {}",
+                            "0x{:08X} {} {} {}",
                             result.addr,
-                            ui_state.vtype.format(result.bits)
+                            result.vtype.name(),
+                            result.vtype.format(result.bits),
+                            result.analysis.category.label(),
                         );
-                        push_text(&mut quads, atlas, &text, rect.x + 6.0 * bs, rect.y + 3.0 * bs, 11.0 * bs, COL_TEXT);
+                        let size = 10.0 * bs;
+                        let width = text_width(atlas, &text, size).max(1.0);
+                        let size = size * ((rect.w - 12.0 * bs) / width).min(1.0);
+                        push_text(&mut quads, atlas, &text, rect.x + 6.0 * bs, rect.y + 3.0 * bs, size, COL_TEXT);
                     }
                 }
                 _ => {}
@@ -1030,27 +1537,30 @@ unsafe fn build_scene(
 
         // Results header + counts, drawn between the header and the result rows.
         let res_label = format!(
-            "RESULTS {} FROZEN {}",
-            ui_state.total_results, ui_state.frozen_count
+            "HITS {}/{} FROZEN {}",
+            ui_state.filtered_results, ui_state.total_results, ui_state.frozen_count
         );
         push_text(&mut quads,
             atlas,
             &res_label,
             panel.rect.x + 8.0 * bs,
-            panel.rect.y + 4.0 * bs + 130.0 * bs,
-            11.0 * bs,
+            panel.results_header_y + 3.0 * bs,
+            9.0 * bs,
             COL_TEXT_DIM,
         );
 
         // Status line at the bottom of the panel.
         if !ui_state.status.is_empty() {
             let status_y = panel.rect.y + panel.rect.h - 18.0 * bs;
+            let size = 11.0 * bs;
+            let width = text_width(atlas, &ui_state.status, size).max(1.0);
+            let size = size * ((panel.rect.w - 16.0 * bs) / width).min(1.0);
             push_text(&mut quads,
                 atlas,
                 &ui_state.status,
                 panel.rect.x + 8.0 * bs,
                 status_y,
-                11.0 * bs,
+                size,
                 COL_ACCENT,
             );
         }
@@ -1073,6 +1583,12 @@ unsafe fn render_gles1(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quad
     gles.GetIntegerv(gles11::ACTIVE_TEXTURE, &mut old_active_texture);
     let mut old_texture: GLint = 0;
     gles.GetIntegerv(gles11::TEXTURE_BINDING_2D, &mut old_texture);
+    let mut old_tex_env_mode: GLint = 0;
+    gles.GetTexEnviv(gles11::TEXTURE_ENV, gles11::TEXTURE_ENV_MODE, &mut old_tex_env_mode);
+    // The presenter uses REPLACE for the game frame; glyphs instead need
+    // their atlas coverage multiplied by the overlay's text colour.
+    let tex_env_mode = gles11::MODULATE as GLint;
+    gles.TexEnviv(gles11::TEXTURE_ENV, gles11::TEXTURE_ENV_MODE, &tex_env_mode);
 
     gles.MatrixMode(gles11::PROJECTION);
     gles.PushMatrix();
@@ -1087,6 +1603,11 @@ unsafe fn render_gles1(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quad
     gles.Enable(gles11::BLEND);
     gles.BlendFunc(gles11::SRC_ALPHA, gles11::ONE_MINUS_SRC_ALPHA);
 
+    // present_frame leaves TEXTURE_2D enabled with the game frame bound
+    // (unless the cursor/FPS overlay happened to disable it). Establish the
+    // untextured state before using 0 as our solid-quad cache sentinel, or
+    // the first rectangle — the CE button — samples a miniature game frame.
+    gles.Disable(gles11::TEXTURE_2D);
     let mut bound_tex: GLuint = 0;
     for q in quads {
         let (r, g, b, a) = q.col;
@@ -1117,6 +1638,7 @@ unsafe fn render_gles1(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quad
     }
 
     // Restore state.
+    gles.TexEnviv(gles11::TEXTURE_ENV, gles11::TEXTURE_ENV_MODE, &old_tex_env_mode);
     gles.BindTexture(gles11::TEXTURE_2D, old_texture as _);
     gles.ActiveTexture(old_active_texture as _);
     gles.Disable(gles11::BLEND);
@@ -1421,3 +1943,6 @@ fn text_width(atlas: &Atlas, text: &str, px_size: f32) -> f32 {
         })
         .sum()
 }
+
+#[cfg(test)]
+mod tests;

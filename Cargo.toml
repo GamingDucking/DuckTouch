@@ -59,7 +59,15 @@ symphonia = { version = "0.6.0", default-features = false, features = [
     "aac", "adpcm", "alac", "mp3", "pcm"
 ] }
 quick-xml = "0.38.4"
-mimalloc = { version = "0.1", default-features = false }
+# PERF: use mimalloc as the global allocator (see src/lib.rs).
+# PIN: the `v2` feature is required. Without it, libmimalloc-sys 0.1.49 builds
+# mimalloc v3 (locked resolution: v3.3.2), which has an upstream-confirmed
+# multithreading crash class in 3.3.0-3.3.2 (microsoft/mimalloc #1287, #1288:
+# `_mi_malloc_generic` SIGSEGVs after the main thread is misidentified and
+# reclaimed; fixed only in the still-churning 3.4/3.5 line). The symbolicated
+# Real Racing 3 Android crash lands in exactly that path. Stay on the
+# maintained v2 branch (v2.3.2) until v3 is proven stable.
+mimalloc = { version = "0.1", default-features = false, features = ["v2"] }
 digest = "0.10.7"
 md-5 = "0.10.6"
 sha1 = "0.10.6"

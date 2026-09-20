@@ -12,9 +12,18 @@
 use crate::{msg, Environment};
 use std::time::Instant;
 
-use crate::dyld::HostConstant;
+use crate::dyld::{export_c_func, FunctionExports, HostConstant};
 use crate::frameworks::core_graphics::cg_geometry::CGSize;
 use crate::mem::{ConstVoidPtr, MutPtr};
+
+/// HyperHLE does not emulate an active iOS Guided Access session.
+fn UIAccessibilityIsGuidedAccessEnabled(_env: &mut Environment) -> bool {
+    false
+}
+
+const FUNCTIONS: FunctionExports = &[
+    export_c_func!(UIAccessibilityIsGuidedAccessEnabled()),
+];
 
 pub mod ui_accelerometer;
 pub mod ui_action_sheet;
@@ -984,6 +993,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         CONSTANTS,
     ],
     function_exports: &[
+        FUNCTIONS,
         ui_application::FUNCTIONS,
         ui_geometry::FUNCTIONS,
         ui_graphics::FUNCTIONS,
@@ -1105,4 +1115,16 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
     }
 
     ui_accelerometer::handle_accelerometer(env)
+}
+
+#[cfg(test)]
+mod accessibility_export_tests {
+    #[test]
+    fn guided_access_query_is_exported_as_a_function() {
+        let exports: Vec<_> = super::DYLIB.function_exports.iter()
+            .flat_map(|table| table.iter())
+            .filter(|(name, _)| *name == "_UIAccessibilityIsGuidedAccessEnabled")
+            .collect();
+        assert_eq!(exports.len(), 1);
+    }
 }

@@ -106,6 +106,7 @@ pub static GUEST_PC_RING_IDX: std::sync::atomic::AtomicUsize =
 pub struct Environment {
     /// Reference point for various timing functions.
     pub startup_time: Instant,
+    pub(crate) guest_clock: crate::guest_clock::GuestClock,
     pub bundle: NullableBox<bundle::Bundle>,
     pub fs: NullableBox<fs::Fs>,
     /// The window is only absent when running in headless mode.
@@ -184,6 +185,8 @@ pub enum ThreadBlock {
     NotBlocked,
     // Thread is sleeping. (until Instant)
     Sleeping(Instant),
+    // Guest deadline, rescaled dynamically by the game clock.
+    GuestSleeping(Instant),
     // Thread is waiting for a mutex to unlock.
     Mutex(MutexId),
     // Thread is waiting on a semaphore.
@@ -836,6 +839,7 @@ impl Environment {
 
         let mut env = Environment {
             startup_time,
+            guest_clock: crate::guest_clock::GuestClock::new(),
             bundle: NullableBox::new(bundle),
             fs: NullableBox::new(fs),
             window,
@@ -1003,6 +1007,7 @@ impl Environment {
 
         let mut env = Environment {
             startup_time,
+            guest_clock: crate::guest_clock::GuestClock::new(),
             bundle: NullableBox::new(bundle),
             fs: NullableBox::new(fs),
             window,
@@ -1072,6 +1077,7 @@ impl Environment {
     unsafe fn new_fake() -> Self {
         Self {
             startup_time: Instant::now(),
+            guest_clock: crate::guest_clock::GuestClock::new(),
             bundle: NullableBox::null(),
             fs: NullableBox::null(),
             window: None,
@@ -1403,6 +1409,13 @@ impl Environment {
         self.yield_thread(ThreadBlock::Sleeping(until));
     }
 
+    /// Guest-requested sleep. Keep its deadline in game time so changing
+    /// speed also affects waits already in progress. Host pacing uses sleep().
+    pub fn sleep_guest(&mut self, duration: Duration) {
+        let until = self.guest_clock.now().checked_add(duration).unwrap();
+        self.yield_thread(ThreadBlock::GuestSleeping(until));
+    }
+
     #[allow(dead_code)]
     pub fn suspend_thread(&mut self, thread: ThreadId) {
         match &mut self.threads[thread].blocked_by {
@@ -1626,6 +1639,10 @@ impl Environment {
                     let duration = until.duration_since(Instant::now());
                     std::thread::sleep(duration);
                 }
+                ThreadBlock::GuestSleeping(until) => {
+                    let due = self.guest_clock.host_deadline(until);
+                    std::thread::sleep(due.saturating_duration_since(Instant::now()));
+                }
                 ref other => {
                     log!(
                         "Warning: Unexpected ThreadBlock in app picker: {:?}; clearing block.",
@@ -1677,8 +1694,12 @@ impl Environment {
                 // overhead win in long busy stretches, fall back to the
                 // smaller batch whenever any thread has an imminent wake-up.
                 let imminent_wakeup = self.threads.iter().any(|thread| {
-                    matches!(thread.blocked_by, ThreadBlock::Sleeping(deadline)
-                        if deadline < Instant::now() + Duration::from_millis(10))
+                    let deadline = match thread.blocked_by {
+                        ThreadBlock::Sleeping(due) => Some(due),
+                        ThreadBlock::GuestSleeping(due) => Some(self.guest_clock.host_deadline(due)),
+                        _ => None,
+                    };
+                    deadline.is_some_and(|due| due < Instant::now() + Duration::from_millis(10))
                 });
                 self.remaining_ticks = Some(if imminent_wakeup {
                     100_000
@@ -1694,7 +1715,7 @@ impl Environment {
                 corruptor.tick(&mut self.mem);
                 self.corruptor = corruptor;
             }
-            // Game trainer (GameGuardian-style memory search/patch + on-screen
+            // Game trainer (Cheat Engine-style memory search/patch + on-screen
             // UI). No-op unless enabled (default on for games).
             {
                 let app_id = self.bundle.bundle_identifier().to_string();
@@ -1702,8 +1723,12 @@ impl Environment {
                     &mut self.trainer,
                     crate::trainer::Trainer::new(false),
                 );
-                trainer.tick(&mut self.mem, Some(app_id.as_str()));
+                trainer.tick(&mut self.mem, Some(app_id.as_str()), &self.objc);
                 self.trainer = trainer;
+                if let Some(speed) = crate::trainer_ui::take_speed_request() {
+                    self.guest_clock.set_speed(speed);
+                    crate::trainer_ui::publish_status(format!("GAME SPEED {}", speed.label()));
+                }
             }
             let mut kill_current_thread = false;
             if let Some(w) = self.window.as_mut() {
@@ -2807,6 +2832,14 @@ impl Environment {
                                 Some(other) => Some(other.min(sleeping_until)),
                             };
                         }
+                    }
+                    ThreadBlock::GuestSleeping(due) => {
+                        if due <= self.guest_clock.now() {
+                            candidate.blocked_by = ThreadBlock::NotBlocked;
+                            return thread_id;
+                        }
+                        let host_due = self.guest_clock.host_deadline(due);
+                        next_awakening = Some(next_awakening.map_or(host_due, |d| d.min(host_due)));
                     }
                     ThreadBlock::Mutex(mutex_id) => {
                         if !self.mutex_state.mutex_is_locked(mutex_id) {

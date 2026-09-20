@@ -100,7 +100,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 // get a plausible positive value rather than 0 or NaN.
 // <https://developer.apple.com/documentation/quartzcore/cadisplaylink/1648478-timestamp>
 - (f64)timestamp {
-    msg_class![env; NSDate timeIntervalSinceReferenceDate]
+    crate::frameworks::core_animation::CACurrentMediaTime(env)
 }
 
 // The time interval between screen refresh updates.

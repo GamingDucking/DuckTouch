@@ -3,7 +3,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
-//! In-emulator game trainer ("GameGuardian"-style), driven either by the
+//! In-emulator game trainer ("Cheat Engine"-style), driven either by the
 //! on-screen overlay UI (see [crate::trainer_ui]) or by text hack files.
 //!
 //! Hack files live under `touchHLE_hacks/` in the user data directory:
@@ -21,11 +21,23 @@
 //! `# freeze` comment, which makes the trainer re-assert the value
 //! continuously.
 
-use crate::mem::{ConstVoidPtr, GuestUSize, Mem, MutPtr};
+use crate::mem::{ConstVoidPtr, GuestUSize, Mem};
 use crate::trainer_ui::{self, TrainerCmd};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+mod bulk;
+pub mod classify;
+pub mod watch;
+use watch::{Activity, Change, Snapshot};
+use classify::{analyze_batch, Analysis, ResultFilter};
+use bulk::{apply_bulk, plan_bulk, BulkPlan};
+
+struct PendingBulk {
+    plan: BulkPlan,
+    created_at: Instant,
+}
 
 /// Data type of a searched/set memory value. All values are little-endian,
 /// matching ARM memory layout.
@@ -69,21 +81,34 @@ impl VType {
         Self::ALL[(idx + 1) % Self::ALL.len()]
     }
 
-    /// Parse user input text into the raw little-endian bit pattern.
+    /// Parse a value without silently truncating it to the target width.
+    /// Hex input denotes raw bits; decimal F32 input denotes a float value.
     pub fn parse(self, text: &str) -> Option<u64> {
         let text = text.trim();
-        let parsed = if text.starts_with('-') {
-            let v: i64 = text.parse().ok()?;
-            v as u64
-        } else if let Some(hex) = text
-            .strip_prefix("0x")
-            .or_else(|| text.strip_prefix("0X"))
-        {
-            u64::from_str_radix(hex, 16).ok()?
-        } else {
-            text.parse::<u64>().ok()?
+        if self == VType::Auto {
+            return auto_types().iter().find_map(|t| t.parse(text));
+        }
+        if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+            let bits = u64::from_str_radix(hex, 16).ok()?;
+            return (bits == self.mask_bits(bits)).then_some(bits);
+        }
+        let bits = match self {
+            VType::Auto => unreachable!(),
+            VType::U8 => text.parse::<u8>().ok()? as u64,
+            VType::I8 => text.parse::<i8>().ok()? as u64,
+            VType::U16 => text.parse::<u16>().ok()? as u64,
+            VType::I16 => text.parse::<i16>().ok()? as u64,
+            VType::U32 => text.parse::<u32>().ok()? as u64,
+            VType::I32 => text.parse::<i32>().ok()? as u64,
+            VType::F32 => {
+                let value = text.parse::<f32>().ok()?;
+                if !value.is_finite() {
+                    return None;
+                }
+                value.to_bits() as u64
+            }
         };
-        Some(self.mask_bits(parsed))
+        Some(self.mask_bits(bits))
     }
 
     fn mask_bits(self, value: u64) -> u64 {
@@ -132,25 +157,22 @@ impl VType {
 
     /// Read the raw bits at `addr` for this type.
     pub fn read_at(self, mem: &Mem, addr: u32) -> Option<u64> {
-        let bytes = mem.get_bytes_fallible(
-            ConstVoidPtr::from_bits(addr as _),
-            self.size(),
-        )?;
-        Some(Self::read_le(bytes, 0, self.size() as usize))
+        if addr < mem.null_segment_size() {
+            return None;
+        }
+        let bytes = mem.get_bytes_fallible(ConstVoidPtr::from_bits(addr), self.size())?;
+        let bytes = bytes.get(..self.size() as usize)?;
+        Some(Self::read_le(bytes, 0, bytes.len()))
     }
 
-    /// Write raw bits at `addr` for this type.
+    /// Write raw bits without falling back to Mem's invalid-address sink.
     pub fn write_at(self, mem: &mut Mem, addr: u32, bits: u64) -> bool {
-        match self {
-            VType::Auto => mem.write(MutPtr::<i32>::from_bits(addr as _), bits as i32), // fallback; callers resolve first
-            VType::U8 => mem.write(MutPtr::<u8>::from_bits(addr as _), bits as u8),
-            VType::I8 => mem.write(MutPtr::<i8>::from_bits(addr as _), bits as i8),
-            VType::U16 => mem.write(MutPtr::<u16>::from_bits(addr as _), bits as u16),
-            VType::I16 => mem.write(MutPtr::<i16>::from_bits(addr as _), bits as i16),
-            VType::U32 => mem.write(MutPtr::<u32>::from_bits(addr as _), bits as u32),
-            VType::I32 => mem.write(MutPtr::<i32>::from_bits(addr as _), bits as i32),
-            VType::F32 => mem.write(MutPtr::<f32>::from_bits(addr as _), f32::from_bits(bits as u32)),
-        }
+        let Some(bytes) = mem.get_bytes_fallible_mut(
+            ConstVoidPtr::from_bits(addr), self.size(),
+        ) else {
+            return false;
+        };
+        bytes.copy_from_slice(&bits.to_le_bytes()[..self.size() as usize]);
         true
     }
 }
@@ -164,6 +186,7 @@ pub struct SearchResult {
     /// Set during a live-value refresh when the value at this address
     /// changed since the previous refresh (shown highlighted in the UI).
     pub changed: bool,
+    pub analysis: Analysis,
 }
 
 /// A hack patch: either applied once from a hack file, or continuously
@@ -184,6 +207,11 @@ struct TrainerState {
     results: Vec<SearchResult>,
     /// Whether a search has been performed (so "REFINE" is meaningful).
     searched: bool,
+    analysis_cursor: usize,
+    snapshot: Option<Snapshot>,
+    activity: Activity,
+    activity_cursor: usize,
+    pending_bulk: Option<PendingBulk>,
     /// One-shot patches already applied (from hack files).
     applied_hacks: HashSet<(u32, VType, u64)>,
     /// Frozen patches, re-asserted every tick.
@@ -208,6 +236,8 @@ const GLOBAL_HACKS_FILE: &str = "hacks.txt";
 const MAX_SCAN_ALLOCATION: GuestUSize = 64 * 1024 * 1024;
 /// Hard cap on stored search results (memory + UI sanity).
 const MAX_RESULTS: usize = 500_000;
+/// Confirmation expires rather than leaving a hidden armed bulk operation.
+const BULK_CONFIRM_TIMEOUT: Duration = Duration::from_secs(15);
 /// Cap on dump file lines.
 const MAX_DUMP_LINES: usize = 200_000;
 
@@ -225,7 +255,7 @@ impl Trainer {
 
     /// Called from the main loop. `app_id` is the identifier of the
     /// currently running app, if any.
-    pub fn tick(&mut self, mem: &mut Mem, app_id: Option<&str>) {
+    pub fn tick(&mut self, mem: &mut Mem, app_id: Option<&str>, objc: &crate::objc::ObjC) {
         if !self.enabled {
             return;
         }
@@ -243,9 +273,19 @@ impl Trainer {
             self.last_file_check = Instant::now();
         }
 
+        if self.state.pending_bulk.as_ref().is_some_and(|pending| {
+            pending.created_at.elapsed() >= BULK_CONFIRM_TIMEOUT
+        }) {
+            self.state.pending_bulk = None;
+            trainer_ui::publish_bulk_preview(false);
+            trainer_ui::publish_status("PREVIEW EXPIRED: TAP SET ALL".to_string());
+        }
+
         // Pick up commands from the overlay UI.
         for cmd in trainer_ui::take_commands() {
+            let inspect = matches!(&cmd, TrainerCmd::InspectSelection);
             self.handle_command(mem, cmd);
+            if inspect { self.describe_selection(mem, objc); }
         }
 
         // Re-assert frozen values ~20 times per second.
@@ -258,8 +298,9 @@ impl Trainer {
         // second, flagging addresses whose value changed since last time —
         // spend coins in-game and the matching row lights up.
         if self.last_value_refresh.elapsed() >= Duration::from_millis(250) {
+            let seconds = self.last_value_refresh.elapsed().as_secs_f32();
             self.last_value_refresh = Instant::now();
-            self.refresh_live_values(mem);
+            self.refresh_live_values(mem, Some(objc), seconds);
         }
 
         // Watch hack files for external edits (e.g. edited over ADB or a
@@ -270,14 +311,119 @@ impl Trainer {
         }
     }
 
+    /// Show the actual matched field name when runtime metadata is available.
+    fn describe_selection(&self, mem: &Mem, objc: &crate::objc::ObjC) {
+        let Some(addr) = trainer_ui::selected_address() else { return; };
+        let Some(t) = trainer_ui::selected_result_type(addr) else { return; };
+        if let Some((base, size)) = mem.live_allocations().into_iter().find(|&(base, size)| {
+            base <= addr && addr as u64 + t.size() as u64 <= base as u64 + size as u64
+        }) {
+            if let Some(name) = objc.diagnostic_scalar_field(mem, base, size, addr, t.size(), classify::encoding(t)) {
+                trainer_ui::publish_status(format!("FIELD {} [{}]; verify in game", name, t.name()));
+            }
+        }
+    }
+
+    fn refresh_watch_value(&self, mem: &Mem) {
+        let Some(target @ (addr, vtype)) = trainer_ui::watch_target() else { return; };
+        let found = self.state.results.iter().any(|r| r.addr == addr && r.vtype == vtype);
+        let live = mem.live_allocations().iter().any(|&(base, size)| {
+            base <= addr && addr as u64 + vtype.size() as u64 <= base as u64 + size as u64
+        });
+        trainer_ui::publish_watch_value(target, if found && live { vtype.read_at(mem, addr) } else { None });
+    }
+
+    /// Explicit address/type from WATCH, never the main editor's selection.
+    fn set_watch_value(&mut self, mem: &mut Mem, addr: u32, vtype: VType, text: &str) -> Result<u64, &'static str> {
+        if vtype == VType::Auto || !self.state.results.iter().any(|r| r.addr == addr && r.vtype == vtype) {
+            return Err("RESULT EXPIRED: SEARCH AGAIN");
+        }
+        let bits = vtype.parse(text).ok_or("BAD VALUE: CHECK TYPE / RANGE")?;
+        let mut allocations = mem.live_allocations();
+        allocations.sort_unstable_by_key(|a| a.0);
+        if bulk::containing_allocation(&allocations, addr, vtype.size()).is_none()
+            || vtype.read_at(mem, addr).is_none()
+        {
+            return Err("ADDRESS NO LONGER LIVE");
+        }
+        let end = addr as u64 + vtype.size() as u64;
+        if self.state.frozen.iter().any(|p| {
+            (p.addr as u64) < end && (addr as u64) < p.addr as u64 + p.vtype.size() as u64
+        }) {
+            return Err("FROZEN RANGE: UNFREEZE FIRST");
+        }
+        // A changing value is expected here. Validate identity/range, not
+        // equality with a historical event's old value.
+        if !vtype.write_at(mem, addr, bits) { return Err("WRITE FAILED"); }
+        self.state.snapshot = None;
+        record_trainer_write(mem, &mut self.state.results, addr, vtype.size());
+        Ok(bits)
+    }
+
     fn handle_command(&mut self, mem: &mut Mem, cmd: TrainerCmd) {
+        if !matches!(&cmd, TrainerCmd::SetAll { .. }) {
+            if self.state.pending_bulk.take().is_some() {
+                trainer_ui::publish_status("BULK PREVIEW CANCELLED".to_string());
+            }
+            trainer_ui::publish_bulk_preview(false);
+        }
+        // A comparison experiment must not include the trainer's own edits.
+        if matches!(&cmd, TrainerCmd::Set { .. } | TrainerCmd::SetAll { .. }
+            | TrainerCmd::Freeze { .. } | TrainerCmd::ApplyHack { .. }) {
+            self.state.snapshot = None;
+        }
         match cmd {
+            TrainerCmd::WatchSet { addr, vtype, text } => {
+                let status = match self.set_watch_value(mem, addr, vtype, &text) {
+                    Ok(bits) => {
+                        trainer_ui::publish_live_values(&self.state.results);
+                        format!("SET 0x{:08X} = {}", addr, vtype.format(bits))
+                    }
+                    Err(reason) => reason.to_string(),
+                };
+                self.refresh_watch_value(mem);
+                trainer_ui::publish_watch_status((addr, vtype), status);
+            }
+            TrainerCmd::Mark => {
+                if self.state.results.is_empty() {
+                    trainer_ui::publish_status("SEARCH FIRST, THEN MARK".to_string());
+                } else {
+                    self.state.snapshot = Some(Snapshot::capture(mem, &self.state.results));
+                    trainer_ui::publish_status("MARKED: PLAY, THEN CHANGED / SAME / UP / DOWN".to_string());
+                }
+            }
+            TrainerCmd::Compare(filter) => {
+                let Some(snapshot) = self.state.snapshot.take() else {
+                    trainer_ui::publish_status("TAP MARK BEFORE THE GAME ACTION".to_string());
+                    return;
+                };
+                snapshot.retain(mem, &mut self.state.results, filter);
+                self.state.snapshot = Some(Snapshot::capture(mem, &self.state.results));
+                self.state.activity = Activity::default();
+                trainer_ui::clear_activity();
+                trainer_ui::publish_results(&self.state.results, self.state.results.len());
+                trainer_ui::publish_status(format!("KEPT {}: BASELINE UPDATED", self.state.results.len()));
+            }
+            TrainerCmd::ClearActivity => {
+                self.state.activity = Activity::default();
+                trainer_ui::clear_activity();
+            }
+            TrainerCmd::CancelBulk | TrainerCmd::InspectSelection => {}
+            TrainerCmd::RefreshView => {
+                trainer_ui::publish_live_values(&self.state.results);
+                self.refresh_watch_value(mem);
+            }
             TrainerCmd::Search { vtype, text } => {
-                let Some(bits) = vtype.parse(&text) else {
+                let Some(_) = vtype.parse(&text) else {
                     trainer_ui::publish_status(format!("BAD VALUE: {}", text));
                     return;
                 };
-                let results = search_all(mem, vtype, bits, &[]);
+                let mut results = search_all(mem, vtype, &text, None);
+                self.state.analysis_cursor = 0;
+                analyze_batch(mem, &mut results, &mut self.state.analysis_cursor);
+                self.state.snapshot = None;
+                self.state.activity = Activity::default();
+                trainer_ui::clear_activity();
                 self.state.results = results.clone();
                 self.state.searched = true;
                 trainer_ui::publish_results(&results, results.len());
@@ -293,11 +439,14 @@ impl Trainer {
                     trainer_ui::publish_status("NO PRIOR SEARCH".to_string());
                     return;
                 }
-                let Some(bits) = vtype.parse(&text) else {
+                let Some(_) = vtype.parse(&text) else {
                     trainer_ui::publish_status(format!("BAD VALUE: {}", text));
                     return;
                 };
-                let results = search_all(mem, vtype, bits, &self.state.results);
+                let results = search_all(mem, vtype, &text, Some(&self.state.results));
+                self.state.snapshot = None;
+                self.state.activity = Activity::default();
+                trainer_ui::clear_activity();
                 self.state.results = results.clone();
                 trainer_ui::publish_results(&results, results.len());
                 trainer_ui::publish_status(format!(
@@ -307,7 +456,11 @@ impl Trainer {
                 ));
             }
             TrainerCmd::Reset => {
+                self.state.snapshot = None;
+                self.state.activity = Activity::default();
+                trainer_ui::clear_activity();
                 self.state.results.clear();
+                self.state.analysis_cursor = 0;
                 self.state.searched = false;
                 trainer_ui::publish_results(&[], 0);
                 trainer_ui::publish_status("SEARCH RESET".to_string());
@@ -323,6 +476,10 @@ impl Trainer {
                     return;
                 };
                 let ok = t.write_at(mem, addr, bits);
+                if ok {
+                    record_trainer_write(mem, &mut self.state.results, addr, t.size());
+                    trainer_ui::publish_live_values(&self.state.results);
+                }
                 trainer_ui::publish_status(if ok {
                     format!("SET 0x{:X} = {}", addr, t.format(bits))
                 } else {
@@ -330,25 +487,43 @@ impl Trainer {
                 });
                 log!("trainer: set 0x{:X} = {} ({})", addr, text, t.name());
             }
-            TrainerCmd::SetAll { vtype, text } => {
-                let results = self.state.results.clone();
-                if results.is_empty() {
-                    trainer_ui::publish_status("NO RESULTS TO SET".to_string());
-                    return;
-                }
-                let mut written = 0usize;
-                for result in &results {
-                    let t = if vtype == VType::Auto { result.vtype } else { vtype };
-                    let Some(bits) = t.parse(&text) else {
-                        trainer_ui::publish_status(format!("BAD VALUE: {}", text));
+            TrainerCmd::SetAll { vtype, text, confirm, safe_mode, filter } => {
+                let previous = self.state.pending_bulk.take();
+                trainer_ui::publish_bulk_preview(false);
+                let plan = match plan_bulk(mem, &self.state.results, vtype, &text, safe_mode, filter) {
+                    Ok(plan) => plan,
+                    Err(reason) => {
+                        trainer_ui::publish_status(reason.to_string());
                         return;
-                    };
-                    if t.write_at(mem, result.addr, bits) {
-                        written += 1;
                     }
+                };
+                // Re-plan even on confirmation: if anything changed, show
+                // the new counts and require a fresh explicit confirmation.
+                if confirm && previous.as_ref().is_some_and(|pending| {
+                    pending.created_at.elapsed() < BULK_CONFIRM_TIMEOUT
+                        && pending.plan == plan
+                }) {
+                    match apply_bulk(mem, &mut self.state.results, &plan) {
+                        Ok(written) => {
+                            trainer_ui::publish_live_values(&self.state.results);
+                            trainer_ui::publish_status(format!(
+                                "WROTE {} SKIPPED {}", written, plan.skipped,
+                            ));
+                            log!("trainer: bulk wrote {}, skipped {}, safe mode {}", written, plan.skipped, safe_mode);
+                        }
+                        Err(reason) => trainer_ui::publish_status(reason.to_string()),
+                    }
+                } else {
+                    trainer_ui::publish_status(if safe_mode {
+                        format!("CHECKED {} SKIP {}: STILL RISKY", plan.writes.len(), plan.skipped)
+                    } else {
+                        format!("SAFE OFF: {} WRITES / CRASH RISK", plan.writes.len())
+                    });
+                    self.state.pending_bulk = Some(PendingBulk {
+                        plan, created_at: Instant::now(),
+                    });
+                    trainer_ui::publish_bulk_preview(true);
                 }
-                trainer_ui::publish_status(format!("SET ALL: {} ADDRS", written));
-                log!("trainer: set all {} -> {} addrs", text, written);
             }
             TrainerCmd::Freeze { vtype, text } => {
                 let Some(addr) = trainer_ui::selected_address() else {
@@ -374,7 +549,10 @@ impl Trainer {
                     bits,
                     freeze: true,
                 });
-                vtype.write_at(mem, addr, bits);
+                if vtype.write_at(mem, addr, bits) {
+                    record_trainer_write(mem, &mut self.state.results, addr, vtype.size());
+                    trainer_ui::publish_live_values(&self.state.results);
+                }
                 trainer_ui::publish_frozen(self.state.frozen.len());
                 trainer_ui::publish_status(format!("FREEZE 0x{:X}", addr));
             }
@@ -402,6 +580,9 @@ impl Trainer {
             }
             TrainerCmd::ApplyHack { addr, vtype, bits } => {
                 let ok = vtype.write_at(mem, addr, bits);
+                if ok {
+                    record_trainer_write(mem, &mut self.state.results, addr, vtype.size());
+                }
                 log!(
                     "trainer: hack {} 0x{:X}={} -> {}",
                     vtype.name(),
@@ -432,6 +613,9 @@ impl Trainer {
     fn result_type(&self, addr: u32, vtype: VType) -> VType {
         if vtype != VType::Auto {
             return vtype;
+        }
+        if let Some(t) = trainer_ui::selected_result_type(addr) {
+            return t;
         }
         self.state
             .results
@@ -541,7 +725,10 @@ impl Trainer {
         if !state.applied_hacks.insert((addr, vtype, bits)) {
             return; // already applied (e.g. duplicate line)
         }
-        vtype.write_at(mem, addr, bits);
+        if vtype.write_at(mem, addr, bits) {
+            state.snapshot = None;
+            record_trainer_write(mem, &mut state.results, addr, vtype.size());
+        }
         log!(
             "trainer: hack {} 0x{:X}={}",
             vtype.name(),
@@ -588,16 +775,56 @@ impl Trainer {
     /// the updated list to the UI, marking rows whose value changed since the
     /// previous refresh. This makes the right address "light up" when the
     /// in-game value changes (e.g. coins are spent).
-    fn refresh_live_values(&mut self, mem: &mut Mem) {
+    fn refresh_live_values(&mut self, mem: &mut Mem, objc: Option<&crate::objc::ObjC>, seconds: f32) {
         if self.state.results.is_empty() {
             return;
         }
-        for r in self.state.results.iter_mut() {
+        // Include aliases of frozen values, not only exact start addresses.
+        let frozen: HashSet<_> = self.state.frozen.iter().flat_map(|p| {
+            (0..p.vtype.size()).filter_map(move |offset| p.addr.checked_add(offset))
+        }).collect();
+        self.state.activity.changed_last_sample = 0;
+        let now = Instant::now();
+        let mut allocations = mem.live_allocations();
+        allocations.sort_unstable_by_key(|a| a.0);
+        let len = self.state.results.len();
+        // Rotate traversal so a flood is not permanently biased to high addresses.
+        for step in 0..len {
+            let i = (self.state.activity_cursor + step) % len;
+            let r = &mut self.state.results[i];
+            if bulk::containing_allocation(&allocations, r.addr, r.vtype.size()).is_none() {
+                r.analysis = Analysis::default();
+                r.changed = false;
+                continue;
+            }
             if let Some(current) = r.vtype.read_at(mem, r.addr) {
+                if !frozen.is_empty() && (0..r.vtype.size()).filter_map(|offset| r.addr.checked_add(offset))
+                    .any(|addr| frozen.contains(&addr))
+                {
+                    r.analysis.reset_history();
+                } else {
+                    if current != r.bits {
+                        // Bound feed work even if every stored hit is changing.
+                        if self.state.activity.changed_last_sample < 256 {
+                            self.state.activity.record(Change {
+                                addr: r.addr, vtype: r.vtype, before: r.bits, after: current, at: now,
+                            });
+                        } else {
+                            self.state.activity.changed_last_sample += 1;
+                        }
+                    }
+                    r.analysis.observe_timed(r.vtype, r.bits, current, seconds);
+                }
                 r.changed = current != r.bits;
                 r.bits = current;
+            } else {
+                r.analysis = Analysis::default();
             }
         }
+        self.state.activity_cursor = (self.state.activity_cursor + 67) % len;
+        classify::analyze_batch_with_objects(mem, &mut self.state.results, &mut self.state.analysis_cursor, objc);
+        self.refresh_watch_value(mem);
+        trainer_ui::publish_activity(&self.state.activity.entries, self.state.activity.changed_last_sample, len);
         trainer_ui::publish_live_values(&self.state.results);
     }
 
@@ -626,10 +853,13 @@ impl Trainer {
         let count = results.len().min(MAX_DUMP_LINES);
         for result in &results[..count] {
             text.push_str(&format!(
-                "0x{:08X}\t{}\t{}\n",
+                "0x{:08X}\t{}\t{}\t{}\t{}\t{}\n",
                 result.addr,
-                VType::I32.format(result.bits),
-                format_bits_hex(result.bits)
+                result.vtype.name(),
+                result.vtype.format(result.bits),
+                format_bits_hex(result.bits),
+                result.analysis.category.label(),
+                result.analysis.description()
             ));
         }
         match std::fs::write(&path, text) {
@@ -725,67 +955,58 @@ fn parse_hack_value(text: &str) -> (VType, u64) {
     (VType::I32, 0)
 }
 
-/// Search memory for `want_bits` (little-endian) of `vtype`. If `previous`
-/// is non-empty, only addresses from that list are re-checked (refine).
+/// Keep observations honest: edits performed by the trainer (including
+/// aliases of the edited byte range) are not evidence of in-game behaviour.
+fn record_trainer_write(mem: &Mem, results: &mut [SearchResult], addr: u32, size: u32) {
+    let end = addr as u64 + size as u64;
+    for r in results {
+        if (r.addr as u64) < end && (addr as u64) < r.addr as u64 + r.vtype.size() as u64 {
+            if let Some(bits) = r.vtype.read_at(mem, r.addr) { r.bits = bits; }
+            r.changed = false;
+            r.analysis.reset_history();
+        }
+    }
+}
+
+/// A fresh search and an empty refinement are different operations: an
+/// exhausted refinement must never silently restart a whole-memory search.
 fn search_all(
     mem: &Mem,
     vtype: VType,
-    want_bits: u64,
-    previous: &[SearchResult],
+    text: &str,
+    previous: Option<&[SearchResult]>,
 ) -> Vec<SearchResult> {
-    if vtype == VType::Auto {
-        if previous.is_empty() {
-            return auto_search_fresh(mem, want_bits);
-        }
-        return auto_search_refine(mem, want_bits, previous);
+    if let Some(previous) = previous {
+        return previous.iter().filter_map(|result| {
+            let t = if vtype == VType::Auto { result.vtype } else { vtype };
+            let wanted = t.parse(text)?;
+            let bits = t.read_at(mem, result.addr)?;
+            (bits == wanted).then_some(SearchResult {
+                addr: result.addr,
+                vtype: t,
+                bits,
+                changed: false,
+                analysis: if t == result.vtype { result.analysis } else { Analysis::default() },
+            })
+        }).take(MAX_RESULTS).collect();
     }
-    let size = vtype.size() as usize;
+    if vtype != VType::Auto {
+        return vtype.parse(text).map_or_else(Vec::new, |bits| scan_bits(mem, vtype, bits));
+    }
+
     let mut results = Vec::new();
-    if !previous.is_empty() {
-        for result in previous {
-            if let Some(bits) = vtype.read_at(mem, result.addr) {
-                if bits == want_bits {
-                    results.push(SearchResult {
-                        addr: result.addr,
-                        vtype,
-                        bits,
-                        changed: false,
-                    });
-                    if results.len() >= MAX_RESULTS {
-                        break;
-                    }
-                }
-            }
-        }
-        return results;
-    }
-    for (addr, alloc_size) in mem.live_allocations() {
-        if alloc_size < size as GuestUSize || alloc_size > MAX_SCAN_ALLOCATION {
-            continue;
-        }
-        let bytes = match mem.get_bytes_fallible(
-            ConstVoidPtr::from_bits(addr as _),
-            alloc_size,
-        ) {
-            Some(bytes) => bytes,
-            None => continue,
-        };
-        let base = addr as u32;
-        let last = bytes.len() - size;
-        let mut offset = 0usize;
-        while offset <= last {
-            if VType::read_le(bytes, offset, size) == want_bits {
-                results.push(SearchResult {
-                    addr: base + offset as u32,
-                    vtype,
-                    bits: want_bits,
-                    changed: false,
-                });
+    let mut seen = HashSet::new();
+    for &t in auto_types() {
+        // E.g. searching for 600 must not also search for U8(88), and
+        // F32(600) must use 600.0's IEEE bits, not the integer bit pattern.
+        let Some(pattern) = t.parse(text) else { continue };
+        for hit in scan_bits(mem, t, pattern) {
+            if seen.insert((hit.addr, hit.bits)) {
+                results.push(hit);
                 if results.len() >= MAX_RESULTS {
                     return results;
                 }
             }
-            offset += 1;
         }
     }
     results
@@ -809,67 +1030,15 @@ fn auto_types() -> &'static [VType] {
     ]
 }
 
-/// Auto fresh search: scan memory once per concrete type. `want_bits` is the
-/// masked bit pattern of the *first* concrete type that parsed the input, so
-/// re-derive per-type patterns from the raw text instead.
-fn auto_search_fresh(mem: &Mem, want_bits: u64) -> Vec<SearchResult> {
-    let mut results: Vec<SearchResult> = Vec::new();
-    let mut seen: std::collections::HashSet<(u32, u64)> = std::collections::HashSet::new();
-    for t in auto_types() {
-        // Search with each type's own bit width; `want_bits` is only a hint —
-        // derive the per-type pattern by re-masking (widths differ).
-        let pattern = match t {
-            VType::U8 | VType::I8 => want_bits & 0xFF,
-            VType::U16 | VType::I16 => want_bits & 0xFFFF,
-            VType::U32 | VType::I32 | VType::F32 => want_bits & 0xFFFFFFFF,
-            VType::Auto => want_bits,
-        };
-        for hit in scan_bits(mem, *t, pattern) {
-            if seen.insert((hit.addr, hit.bits)) {
-                results.push(hit);
-                if results.len() >= MAX_RESULTS {
-                    return results;
-                }
-            }
-        }
-    }
-    results
-}
-
-/// Auto refine: per-result, re-check using that result's own type.
-fn auto_search_refine(mem: &Mem, want_bits: u64, previous: &[SearchResult]) -> Vec<SearchResult> {
-    let mut results = Vec::new();
-    for result in previous {
-        let Some(bits) = result.vtype.read_at(mem, result.addr) else {
-            continue;
-        };
-        let pattern = match result.vtype {
-            VType::U8 | VType::I8 => want_bits & 0xFF,
-            VType::U16 | VType::I16 => want_bits & 0xFFFF,
-            VType::U32 | VType::I32 | VType::F32 => want_bits & 0xFFFFFFFF,
-            VType::Auto => want_bits,
-        };
-        if bits == pattern {
-            results.push(SearchResult {
-                addr: result.addr,
-                vtype: result.vtype,
-                bits,
-                changed: false,
-            });
-            if results.len() >= MAX_RESULTS {
-                break;
-            }
-        }
-    }
-    results
-}
-
 /// Single-type byte scan (the concrete-type part of `search_all`).
 fn scan_bits(mem: &Mem, vtype: VType, want_bits: u64) -> Vec<SearchResult> {
     let size = vtype.size() as usize;
     let mut results = Vec::new();
     for (addr, alloc_size) in mem.live_allocations() {
-        if alloc_size < size as GuestUSize || alloc_size > MAX_SCAN_ALLOCATION {
+        if addr < mem.null_segment_size()
+            || alloc_size < size as GuestUSize
+            || alloc_size > MAX_SCAN_ALLOCATION
+        {
             continue;
         }
         let bytes = match mem.get_bytes_fallible(
@@ -889,6 +1058,7 @@ fn scan_bits(mem: &Mem, vtype: VType, want_bits: u64) -> Vec<SearchResult> {
                     vtype,
                     bits: want_bits,
                     changed: false,
+                    analysis: Analysis::default(),
                 });
                 if results.len() >= MAX_RESULTS {
                     return results;
@@ -899,3 +1069,6 @@ fn scan_bits(mem: &Mem, vtype: VType, want_bits: u64) -> Vec<SearchResult> {
     }
     results
 }
+
+#[cfg(test)]
+mod tests;

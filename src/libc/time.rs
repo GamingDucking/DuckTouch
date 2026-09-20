@@ -12,7 +12,7 @@ use crate::libc::stdio::printf::{isspace, isspace_inner};
 use crate::mem::{guest_size_of, ConstPtr, GuestUSize, MutPtr, Ptr, SafeRead};
 use crate::Environment;
 use std::ops::Range;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 #[derive(Default)]
 pub struct State {
@@ -56,13 +56,13 @@ fn clock(env: &mut Environment) -> clock_t {
     // времени.
     // Иначе delta time = 0.0, что ведет к делению на ноль -> NaN ->
     // отрицательный sleep -> Crash.
-    Instant::now().duration_since(env.startup_time).as_micros() as clock_t
+    env.guest_clock.now().duration_since(env.startup_time).as_micros() as clock_t
 }
 
 fn time(env: &mut Environment, out: MutPtr<time_t>) -> time_t {
     // TODO: handle errno properly
     set_errno(env, 0);
-    let time64 = SystemTime::now()
+    let time64 = env.guest_clock.system_time()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_secs();
@@ -599,7 +599,7 @@ fn gettimeofday(
         return 0;
     }
 
-    let time = SystemTime::now()
+    let time = env.guest_clock.system_time()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap();
 
@@ -629,7 +629,7 @@ fn nanosleep(env: &mut Environment, rqtp: ConstPtr<timespec>, _rmtp: MutPtr<time
     log_dbg!("nanosleep {} {}", tv_sec, tv_nsec);
 
     let total_sleep = Duration::from_secs(tv_sec) + Duration::from_nanos(tv_nsec);
-    env.sleep(total_sleep);
+    env.sleep_guest(total_sleep);
 
     0
 }
