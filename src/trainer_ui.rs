@@ -402,7 +402,7 @@ fn compute_layout(ui: &TrainerUi, viewport: (u32, u32, u32, u32)) -> Layout {
     let (_vx, _vy, vw, vh) = viewport;
     let (vx, vy, vw, vh) = (0.0_f32, 0.0_f32, vw as f32, vh as f32);
     // Fit the complete panel, including speed controls, in both orientations.
-    let s = (vh / 580.0).min(vw / if ui.watch_open && ui.open { 600.0 } else { 320.0 }).clamp(0.1, 4.0);
+    let s = (vh / 545.0).min(vw / if ui.watch_open && ui.open { 600.0 } else { 320.0 }).clamp(0.1, 4.0);
     let btn = 30.0 * s;
     let button = Rect {
         x: vx + vw - btn - 6.0 * s,
@@ -414,34 +414,34 @@ fn compute_layout(ui: &TrainerUi, viewport: (u32, u32, u32, u32)) -> Layout {
         let pw = (vw - 12.0 * s).min(300.0 * s);
         let px = vx + vw - pw - 6.0 * s;
         // Leave room for the button row above the panel.
-        let py = button.y + button.h + 4.0 * s;
-        let row_h = 24.0 * s;
-        let small_h = 20.0 * s;
-        let key_h = 26.0 * s;
+        let py = button.y + button.h + 3.0 * s;
+        let row_h = 22.0 * s;
+        let small_h = 18.0 * s;
+        let key_h = 24.0 * s;
         let mut widgets = Vec::new();
-        let mut y = py + 4.0 * s;
+        let mut y = py + 3.0 * s;
         let mut push_widget = |id: u16, wx: f32, wy: f32, ww: f32, wh: f32, widgets: &mut Vec<(u16, Rect)>| {
             widgets.push((id, Rect { x: wx, y: wy, w: ww, h: wh }));
         };
         // Header row (title + close button).
         push_widget(W_CLOSE, px + pw - small_h - 4.0 * s, y, small_h, small_h, &mut widgets);
-        y += small_h + 4.0 * s;
+        y += small_h + 3.0 * s;
         // Type and latched safe-mode toggle share a row.
         push_widget(W_TYPE, px + 6.0 * s, y, 110.0 * s, row_h, &mut widgets);
         push_widget(W_SAFE_MODE, px + 120.0 * s, y, pw - 126.0 * s, row_h, &mut widgets);
-        y += row_h + 4.0 * s;
+        y += row_h + 3.0 * s;
         // Game speed: minus, current value (tap to reset), plus.
         let speed_side = 38.0 * s;
         push_widget(W_SPEED_DOWN, px + 6.0 * s, y, speed_side, row_h, &mut widgets);
         push_widget(W_SPEED_RESET, px + 48.0 * s, y, pw - 96.0 * s, row_h, &mut widgets);
         push_widget(W_SPEED_UP, px + pw - 44.0 * s, y, speed_side, row_h, &mut widgets);
-        y += row_h + 4.0 * s;
+        y += row_h + 3.0 * s;
         // Latched IAP emulation toggle (StoreKit free in-app purchases).
         push_widget(W_IAP, px + 6.0 * s, y, pw - 12.0 * s, row_h, &mut widgets);
-        y += row_h + 4.0 * s;
+        y += row_h + 3.0 * s;
         // Search value field.
         push_widget(W_FIELD_SEARCH, px + 6.0 * s, y, pw - 12.0 * s, row_h, &mut widgets);
-        y += row_h + 4.0 * s;
+        y += row_h + 3.0 * s;
         // Keypad: 4 columns x 4 rows.
         let key_w = (pw - 12.0 * s) / 4.0;
         for (row_idx, row) in KEYPAD.iter().enumerate() {
@@ -461,25 +461,25 @@ fn compute_layout(ui: &TrainerUi, viewport: (u32, u32, u32, u32)) -> Layout {
                 );
             }
         }
-        y += key_h * 4.0 + 4.0 * s;
+        y += key_h * 4.0 + 3.0 * s;
         // Actions row.
         let third = (pw - 12.0 * s - 8.0 * s) / 3.0;
         for (i, id) in [W_SEARCH, W_REFINE, W_RESET].iter().enumerate() {
             push_widget(*id, px + 6.0 * s + (third + 4.0 * s) * i as f32, y, third, row_h, &mut widgets);
         }
-        y += row_h + 4.0 * s;
+        y += row_h + 3.0 * s;
         // Explicit before/after comparison: independent of live refresh.
         let fifth = (pw - 12.0 * s - 8.0 * s) / 5.0;
         for (i, id) in [W_MARK, W_CHANGED, W_SAME, W_INCREASED, W_DECREASED].iter().enumerate() {
             push_widget(*id, px + 6.0 * s + (fifth + 2.0 * s) * i as f32, y, fifth, row_h, &mut widgets);
         }
-        y += row_h + 4.0 * s;
+        y += row_h + 3.0 * s;
         // Category selector: guesses always keep a question mark.
         push_widget(W_CATEGORY, px + 6.0 * s, y, pw - 12.0 * s, row_h, &mut widgets);
-        y += row_h + 4.0 * s;
+        y += row_h + 3.0 * s;
         // Results header + scroll buttons.
         let results_header_y = y;
-        let res_h = 18.0 * s;
+        let res_h = 16.0 * s;
         push_widget(W_SCROLL_UP, px + pw - 2.0 * (res_h + 3.0 * s), y, res_h, res_h, &mut widgets);
         push_widget(W_SCROLL_DOWN, px + pw - res_h - 3.0 * s, y, res_h, res_h, &mut widgets);
         y += res_h + 2.0 * s;
@@ -491,21 +491,21 @@ fn compute_layout(ui: &TrainerUi, viewport: (u32, u32, u32, u32)) -> Layout {
         y += 3.0 * s;
         // Set value field.
         push_widget(W_FIELD_SET, px + 6.0 * s, y, pw - 12.0 * s, row_h, &mut widgets);
-        y += row_h + 4.0 * s;
+        y += row_h + 3.0 * s;
         // Set / set-all / freeze row.
         let quarter = (pw - 12.0 * s - 12.0 * s) / 4.0;
         for (i, id) in [W_SET, W_SET_ALL, W_FREEZE, W_UNFREEZE].iter().enumerate() {
             push_widget(*id, px + 6.0 * s + (quarter + 4.0 * s) * i as f32, y, quarter, row_h, &mut widgets);
         }
-        y += row_h + 4.0 * s;
+        y += row_h + 3.0 * s;
         // Activity window with inline editing, plus dump/save.
         let third = (pw - 12.0 * s - 8.0 * s) / 3.0;
         for (i, id) in [W_DUMP, W_SAVE, W_WATCH].iter().enumerate() {
             push_widget(*id, px + 6.0 * s + (third + 4.0 * s) * i as f32, y, third, row_h, &mut widgets);
         }
-        y += row_h + 4.0 * s;
+        y += row_h + 3.0 * s;
         // Status line (not interactive).
-        let ph = y + small_h + 4.0 * s - py;
+        let ph = y + small_h + 3.0 * s - py;
         Some(PanelLayout {
             rect: Rect { x: px, y: py, w: pw, h: ph },
             widgets,
@@ -723,9 +723,9 @@ fn activate_widget(ui: &mut TrainerUi, id: u16) {
             ui.iap = !ui.iap;
             crate::frameworks::store_kit::set_emulation_enabled(ui.iap);
             ui.status = if ui.iap {
-                "IAP ON: IN-APP BUYS AUTO-SUCCEED"
+                "IN-APP ON: PURCHASES FREE"
             } else {
-                "IAP OFF: PURCHASES FAIL"
+                "IN-APP OFF: PURCHASES FAIL"
             }
             .to_string();
         }
@@ -1387,7 +1387,7 @@ unsafe fn build_scene(
                 W_IAP => {
                     let (background, foreground) = safe_mode_colors(ui_state.iap);
                     push_rect(&mut quads, *rect, background);
-                    let label = "IAP: FREE BUYS";
+                    let label = "IN-APP: FREE BUYS";
                     let size = 11.0 * bs;
                     let tw = text_width(atlas, label, size);
                     push_text(&mut quads, atlas, label,

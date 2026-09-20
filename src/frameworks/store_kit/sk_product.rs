@@ -133,6 +133,16 @@ fn deliver_products_response(env: &mut Environment, this: id) {
             "Warning: SKProductsRequestDelegate does not respond to productsRequest:didReceiveResponse:; response dropped."
         );
     }
+    // SKRequestDelegate: real StoreKit finishes the request after the
+    // response. Some games build their identifier-to-amount table only in
+    // requestDidFinish:, and without this callback they would credit 0.
+    let finish_sel = env
+        .objc
+        .register_host_selector("requestDidFinish:".to_string(), &mut env.mem);
+    let responds: bool = msg![env; delegate respondsToSelector:finish_sel];
+    if responds {
+        let _: () = msg![env; delegate requestDidFinish:this];
+    }
 }
 
 
@@ -201,6 +211,17 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (bool)downloadable {
+    false
+}
+
+// Era-appropriate aliases: iOS 3–6 games check `isDownloadable` (and some
+// very old builds `contentDownloadable`) before enabling their buy buttons;
+// an unimplemented selector returns 0 here, but we silence the warning spam.
+- (bool)isDownloadable {
+    false
+}
+
+- (bool)contentDownloadable {
     false
 }
 

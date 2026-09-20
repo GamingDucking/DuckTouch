@@ -288,7 +288,7 @@ Two fixes target games where swipes or taps randomly stopped registering
 
 ## In-app purchase emulation (IAP)
 
-The Quick Options panel has a latched **IAP: FREE BUYS** button, a
+The Quick Options panel has a latched **IN-APP: FREE BUYS** button, a
 Lucky Patcher-style switch for StoreKit in-app purchases. It can also be
 forced on for a session with the `TOUCHHLE_IAP_EMULATION` environment
 variable. It is off by default and resets with the process.
@@ -302,6 +302,13 @@ While enabled:
   `SKPaymentTransactionStatePurchased` with a fresh
   `touchHLE.iap.N` transaction identifier, and the observer receives
   `paymentQueue:updatedTransactions:` normally.
+- Purchased/restored transactions answer `[SKPaymentTransaction receipt]`
+  with a stable opaque NSData blob (`touchHLE-IAP-receipt/v1:<identifier>`)
+  and `transactionDate` with the current time. Games of this era commonly
+  gate crediting on a non-nil/non-empty receipt; without this they silently
+  grant nothing (observed as "0 currency").
+- `SKProduct` answers `isDownloadable` and `contentDownloadable` (false), and
+  the products delegate also receives `requestDidFinish:` after the response.
 - `restoreCompletedTransactions` re-delivers every identifier bought this
   session as restored transactions.
 - With the switch off, `addPayment:` delivers a well-formed **failed**

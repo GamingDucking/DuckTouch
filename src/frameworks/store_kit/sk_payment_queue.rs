@@ -17,7 +17,7 @@
 //! `SKPaymentTransactionStateFailed` transaction so well-behaved games can
 //! show their "purchases are disabled" path instead of hanging.
 
-use crate::frameworks::foundation::{ns_string, NSInteger};
+use crate::frameworks::foundation::{ns_string, NSInteger, NSUInteger};
 use crate::frameworks::store_kit::{
     emulation_enabled, SK_PAYMENT_TRANSACTION_STATE_FAILED, SK_PAYMENT_TRANSACTION_STATE_PURCHASED,
     SK_PAYMENT_TRANSACTION_STATE_RESTORED,
@@ -504,6 +504,43 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)error {
     nil
+}
+
+- (id)receipt {
+    let state = env
+        .objc
+        .borrow::<SKPaymentTransactionHostObject>(this)
+        .state;
+    if state != SK_PAYMENT_TRANSACTION_STATE_PURCHASED
+        && state != SK_PAYMENT_TRANSACTION_STATE_RESTORED
+    {
+        // Real StoreKit reports a nil receipt for transactions that have not
+        // (successfully) run.
+        return nil;
+    }
+    let identifier_object: id = msg![env; this transactionIdentifier];
+    let identifier = identifier_string(env, identifier_object);
+    release(env, identifier_object);
+    // Games of this era commonly gate crediting on a non-empty receipt
+    // (nil-check or length-check, sometimes a local parse, often a POST to
+    // their server). We cannot produce a genuinely signed App Store receipt,
+    // but a stable opaque blob passes the presence checks, so games credit
+    // the purchase instead of silently granting nothing.
+    let mut blob = b"touchHLE-IAP-receipt/v1:".to_vec();
+    blob.extend_from_slice(identifier.as_bytes());
+    let len = blob.len() as NSUInteger;
+    let bytes = env.mem.alloc(len);
+    env.mem
+        .bytes_at_mut(bytes.cast(), len)
+        .copy_from_slice(&blob);
+    let receipt: id = msg_class![env; NSData dataWithBytes:bytes length:len];
+    // dataWithBytes:length: copies the buffer, so free our temporary memory.
+    env.mem.free(bytes.cast_void());
+    autorelease(env, receipt)
+}
+
+- (id)transactionDate {
+    msg_class![env; NSDate date]
 }
 
 - (())dealloc {
