@@ -47,6 +47,10 @@ fn make_product(env: &mut Environment, product_identifier: id) -> id {
     product
 }
 
+pub const CLASSES: ClassExports = objc_classes! {
+
+(env, this, _cmd);
+
 @implementation SKProduct: NSObject
 
 + (id)allocWithZone:(NSZonePtr)_zone {
