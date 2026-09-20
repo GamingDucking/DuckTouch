@@ -85,6 +85,8 @@ struct TrainerUi {
     bulk_preview: bool,
     /// Latched preference for this session, not the current touch state.
     safe_mode: bool,
+    /// Latched StoreKit IAP emulation (Lucky Patcher-style free in-app buys).
+    iap: bool,
     speed: Speed,
     speed_dirty: bool,
     /// Widget id pressed but not yet released (pending activation).
@@ -162,6 +164,7 @@ impl TrainerUi {
             frozen_count: 0,
             bulk_preview: false,
             safe_mode: true,
+            iap: crate::frameworks::store_kit::emulation_enabled(),
             speed: Speed::Normal,
             speed_dirty: false,
             pending: None,
@@ -332,6 +335,7 @@ const W_DECREASED: u16 = 27;
 const W_WATCH_PAUSE: u16 = 28;
 const W_WATCH_CLEAR: u16 = 29;
 const W_WATCH_CLOSE: u16 = 30;
+const W_IAP: u16 = 31;
 const W_WATCH_NEWER: u16 = 45;
 const W_WATCH_OLDER: u16 = 46;
 const W_WATCH_FIELD: u16 = 47;
@@ -429,6 +433,9 @@ fn compute_layout(ui: &TrainerUi, viewport: (u32, u32, u32, u32)) -> Layout {
         push_widget(W_SPEED_DOWN, px + 6.0 * s, y, speed_side, row_h, &mut widgets);
         push_widget(W_SPEED_RESET, px + 48.0 * s, y, pw - 96.0 * s, row_h, &mut widgets);
         push_widget(W_SPEED_UP, px + pw - 44.0 * s, y, speed_side, row_h, &mut widgets);
+        y += row_h + 4.0 * s;
+        // Latched IAP emulation toggle (StoreKit free in-app purchases).
+        push_widget(W_IAP, px + 6.0 * s, y, pw - 12.0 * s, row_h, &mut widgets);
         y += row_h + 4.0 * s;
         // Search value field.
         push_widget(W_FIELD_SEARCH, px + 6.0 * s, y, pw - 12.0 * s, row_h, &mut widgets);
@@ -709,6 +716,16 @@ fn activate_widget(ui: &mut TrainerUi, id: u16) {
             } else {
                 "SAFE MODE OFF: EXTRA CRASH RISK"
             }.to_string();
+        }
+        W_IAP => {
+            ui.iap = !ui.iap;
+            crate::frameworks::store_kit::set_emulation_enabled(ui.iap);
+            ui.status = if ui.iap {
+                "IAP ON: IN-APP BUYS AUTO-SUCCEED"
+            } else {
+                "IAP OFF: PURCHASES FAIL"
+            }
+            .to_string();
         }
         W_SPEED_DOWN | W_SPEED_RESET | W_SPEED_UP => {
             ui.speed = match id {
@@ -1357,6 +1374,18 @@ unsafe fn build_scene(
                     let (background, foreground) = safe_mode_colors(ui_state.safe_mode);
                     push_rect(&mut quads, *rect, background);
                     let label = "SAFE MODE";
+                    let size = 11.0 * bs;
+                    let tw = text_width(atlas, label, size);
+                    push_text(&mut quads, atlas, label,
+                        rect.x + (rect.w - tw) / 2.0,
+                        rect.y + (rect.h - atlas.height * (size / FONT_PX)) / 2.0,
+                        size, foreground,
+                    );
+                }
+                W_IAP => {
+                    let (background, foreground) = safe_mode_colors(ui_state.iap);
+                    push_rect(&mut quads, *rect, background);
+                    let label = "IAP: FREE BUYS";
                     let size = 11.0 * bs;
                     let tw = text_width(atlas, label, size);
                     push_text(&mut quads, atlas, label,

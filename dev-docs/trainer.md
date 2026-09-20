@@ -285,3 +285,30 @@ Two fixes target games where swipes or taps randomly stopped registering
    `TOUCH-END #n: view=... moves=... delta=(...)`, and Move/Up events for
    fingers whose Down never arrived are warned as `untracked finger`. These
    lines separate "host lost events" from "game ignored a complete gesture".
+
+## In-app purchase emulation (IAP)
+
+The Quick Options panel has a latched **IAP: FREE BUYS** button, a
+Lucky Patcher-style switch for StoreKit in-app purchases. It can also be
+forced on for a session with the `TOUCHHLE_IAP_EMULATION` environment
+variable. It is off by default and resets with the process.
+
+While enabled:
+
+- `+[SKPaymentQueue canMakePayments]` returns true, so purchase buttons appear.
+- `SKProductsRequest` answers locally: every requested identifier becomes a
+  product with price 0.00 (title/description copied from the identifier).
+- `-[SKPaymentQueue addPayment:]` completes immediately as
+  `SKPaymentTransactionStatePurchased` with a fresh
+  `touchHLE.iap.N` transaction identifier, and the observer receives
+  `paymentQueue:updatedTransactions:` normally.
+- `restoreCompletedTransactions` re-delivers every identifier bought this
+  session as restored transactions.
+- With the switch off, `addPayment:` delivers a well-formed **failed**
+  transaction instead of silence, so games show their "purchases unavailable"
+  path instead of hanging.
+
+Scope and honesty: this only affects the guest app inside touchHLE. No App
+Store, receipts or Apple servers are contacted, nothing outside the emulator
+changes, and server-verified purchases in online games will still fail on the
+game's own backend checks.

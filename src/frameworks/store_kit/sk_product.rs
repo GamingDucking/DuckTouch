@@ -1,24 +1,333 @@
 /*
  * This Source Code Form is subject to the terms of the Mozilla Public
- * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * License, v. 2.0.
+ * If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
+//! `SKProduct`, `SKProductsRequest` and `SKProductsResponse`.
+//!
+//! With IAP emulation enabled, a products request answers locally: every
+//! requested identifier becomes a purchasable product (title/description
+//! copied from the identifier, price 0.00), so games that hide their buy
+//! buttons until the product list arrives show them and the queue completes
+//! the purchase (see `sk_payment_queue.rs`).
 
-use crate::objc::{id, nil, objc_classes, ClassExports};
+use crate::frameworks::foundation::ns_string;
+use crate::objc::{id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr};
+use crate::Environment;
 
-pub const CLASSES: ClassExports = objc_classes! {
+// MARK: - SKProduct
 
-(env, this, _cmd);
+#[derive(Default)]
+struct SKProductHostObject {
+    /// All three are retained NSStrings (or nil).
+    product_identifier: id,
+    localized_title: id,
+    localized_description: id,
+    /// Emulated price. IAP emulation makes everything free.
+    price: f64,
+}
+impl HostObject for SKProductHostObject {}
+
+fn make_product(env: &mut Environment, product_identifier: id) -> id {
+    let product: id = msg_class![env; SKProduct alloc];
+    {
+        let host = env.objc.borrow_mut::<SKProductHostObject>(product);
+        host.product_identifier = product_identifier;
+        host.localized_title = product_identifier;
+        host.localized_description = product_identifier;
+        host.price = 0.0;
+    }
+    retain(env, product_identifier);
+    // One more retain backs the title/description aliases.
+    retain(env, product_identifier);
+    // And one for the localized_description field.
+    retain(env, product_identifier);
+    autorelease(env, product);
+    product
+}
 
 @implementation SKProduct: NSObject
-// TODO
+
++ (id)allocWithZone:(NSZonePtr)_zone {
+    env.objc
+        .alloc_object(this, Box::<SKProductHostObject>::default(), &mut env.mem)
+}
+
+- (id)productIdentifier {
+    let identifier = env
+        .objc
+        .borrow::<SKProductHostObject>(this)
+        .product_identifier;
+    if identifier == nil {
+        ns_string::get_static_str(env, "")
+    } else {
+        retain(env, identifier);
+        identifier
+    }
+}
+
+- (id)localizedTitle {
+    let title = env.objc.borrow::<SKProductHostObject>(this).localized_title;
+    if title == nil {
+        ns_string::get_static_str(env, "")
+    } else {
+        retain(env, title);
+        title
+    }
+}
+
+- (id)title {
+    msg![env; this localizedTitle]
+}
+
+- (id)localizedDescription {
+    let description = env
+        .objc
+        .borrow::<SKProductHostObject>(this)
+        .localized_description;
+    if description == nil {
+        ns_string::get_static_str(env, "")
+    } else {
+        retain(env, description);
+        description
+    }
+}
+
+- (id)description {
+    msg![env; this localizedDescription]
+}
+
+- (id)price {
+    let price = env.objc.borrow::<SKProductHostObject>(this).price;
+    msg_class![env; NSNumber numberWithDouble:price]
+}
+
+- (id)priceLocale {
+    msg_class![env; NSLocale currentLocale]
+}
+
+- (bool)downloadable {
+    false
+}
+
+- (())dealloc {
+    let (product_identifier, title, description) = {
+        let host = env.objc.borrow::<SKProductHostObject>(this);
+        (
+            host.product_identifier,
+            host.localized_title,
+            host.localized_description,
+        )
+    };
+    release(env, product_identifier);
+    release(env, title);
+    release(env, description);
+    env.objc.dealloc_object(this, &mut env.mem)
+}
+
 @end
 
-@implementation SKProductsRequest: NSObject
-- (id)initWithProductIdentifiers:(id)_ids { // NSSet *
-    // TODO
-    nil
+// MARK: - SKProductsResponse
+
+#[derive(Default)]
+struct SKProductsResponseHostObject {
+    /// Retained NSArray of SKProduct.
+    products: id,
+    /// Retained NSArray of NSString.
+    invalid_product_identifiers: id,
 }
+impl HostObject for SKProductsResponseHostObject {}
+
+@implementation SKProductsResponse: NSObject
+
++ (id)allocWithZone:(NSZonePtr)_zone {
+    env.objc.alloc_object(
+        this,
+        Box::<SKProductsResponseHostObject>::default(),
+        &mut env.mem,
+    )
+}
+
+- (id)products {
+    let products = env
+        .objc
+        .borrow::<SKProductsResponseHostObject>(this)
+        .products;
+    if products == nil {
+        msg_class![env; NSArray array]
+    } else {
+        retain(env, products);
+        products
+    }
+}
+
+- (id)invalidProductIdentifiers {
+    let invalid = env
+        .objc
+        .borrow::<SKProductsResponseHostObject>(this)
+        .invalid_product_identifiers;
+    if invalid == nil {
+        msg_class![env; NSArray array]
+    } else {
+        retain(env, invalid);
+        invalid
+    }
+}
+
+- (())dealloc {
+    let (products, invalid) = {
+        let host = env.objc.borrow::<SKProductsResponseHostObject>(this);
+        (host.products, host.invalid_product_identifiers)
+    };
+    release(env, products);
+    release(env, invalid);
+    env.objc.dealloc_object(this, &mut env.mem)
+}
+
+@end
+
+// MARK: - SKProductsRequest
+
+#[derive(Default)]
+struct SKProductsRequestHostObject {
+    /// Retained NSSet of NSString product identifiers.
+    product_identifiers: id,
+    /// SKProductsRequestDelegate — weak reference.
+    delegate: id,
+    /// Pending response NSTimer, if `start` was called. Retained.
+    timer: id,
+}
+impl HostObject for SKProductsRequestHostObject {}
+
+fn stop_response_timer(env: &mut Environment, this: id) {
+    let timer = std::mem::replace(
+        &mut env
+            .objc
+            .borrow_mut::<SKProductsRequestHostObject>(this)
+            .timer,
+        nil,
+    );
+    if timer != nil {
+        () = msg![env; timer invalidate];
+        release(env, timer);
+    }
+}
+
+fn deliver_products_response(env: &mut Environment, this: id) {
+    let product_identifiers = {
+        let host = env.objc.borrow::<SKProductsRequestHostObject>(this);
+        host.product_identifiers
+    };
+    let products: id = msg_class![env; NSMutableArray array];
+    let mut requested = 0usize;
+    if product_identifiers != nil {
+        let array: id = msg![env; product_identifiers allObjects];
+        let count: crate::frameworks::foundation::NSUInteger = msg![env; array count];
+        for i in 0..count {
+            let identifier: id = msg![env; array objectAtIndex:i];
+            () = msg![env; products addObject:make_product(env, identifier)];
+            requested += 1;
+        }
+    }
+    let invalid: id = msg_class![env; NSMutableArray array];
+    let response: id = msg_class![env; SKProductsResponse alloc];
+    {
+        let host = env.objc.borrow_mut::<SKProductsResponseHostObject>(response);
+        host.products = products;
+        host.invalid_product_identifiers = invalid;
+    }
+    retain(env, products);
+    retain(env, invalid);
+    autorelease(env, response);
+
+    let delegate = env.objc.borrow::<SKProductsRequestHostObject>(this).delegate;
+    log!(
+        "SKProductsRequest: IAP emulation answered locally with {} product(s) (all free).",
+        requested
+    );
+    if delegate == nil {
+        return;
+    }
+    let sel = env.objc.register_host_selector(
+        "productsRequest:didReceiveResponse:".to_string(),
+        &mut env.mem,
+    );
+    let responds: bool = msg![env; delegate respondsToSelector:sel];
+    if responds {
+        let _: () = msg![env; delegate productsRequest:this didReceiveResponse:response];
+    } else {
+        log!(
+            "Warning: SKProductsRequestDelegate does not respond to productsRequest:didReceiveResponse:; response dropped."
+        );
+    }
+}
+
+@implementation SKProductsRequest: NSObject
+
++ (id)allocWithZone:(NSZonePtr)_zone {
+    env.objc.alloc_object(
+        this,
+        Box::<SKProductsRequestHostObject>::default(),
+        &mut env.mem,
+    )
+}
+
+- (id)initWithProductIdentifiers:(id)product_identifiers { // NSSet*
+    {
+        let host = env.objc.borrow_mut::<SKProductsRequestHostObject>(this);
+        host.product_identifiers = product_identifiers;
+    }
+    if product_identifiers != nil {
+        retain(env, product_identifiers);
+    }
+    this
+}
+
+- (())setDelegate:(id)delegate {
+    let host = env.objc.borrow_mut::<SKProductsRequestHostObject>(this);
+    host.delegate = delegate;
+}
+
+- (id)delegate {
+    env.objc
+        .borrow::<SKProductsRequestHostObject>(this)
+        .delegate
+}
+
+- (bool)start {
+    stop_response_timer(env, this);
+    let Some(selector) = env.objc.lookup_selector("_touchHLE_iapProductsTimer:") else {
+        log!("Warning: SKProductsRequest timer selector missing; cannot answer.");
+        return false;
+    };
+    let timer: id = msg_class![env; NSTimer scheduledTimerWithTimeInterval:0.05 target:this selector:selector userInfo:nil repeats:false];
+    retain(env, timer);
+    env.objc
+        .borrow_mut::<SKProductsRequestHostObject>(this)
+        .timer = timer;
+    true
+}
+
+- (())cancel {
+    stop_response_timer(env, this);
+}
+
+- (())_touchHLE_iapProductsTimer:(id)_timer {
+    stop_response_timer(env, this);
+    deliver_products_response(env, this);
+}
+
+- (())dealloc {
+    stop_response_timer(env, this);
+    let product_identifiers = env
+        .objc
+        .borrow::<SKProductsRequestHostObject>(this)
+        .product_identifiers;
+    release(env, product_identifiers);
+    env.objc.dealloc_object(this, &mut env.mem)
+}
+
 @end
 
 };
