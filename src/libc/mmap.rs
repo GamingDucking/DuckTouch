@@ -121,10 +121,27 @@ fn munmap(env: &mut Environment, addr: MutVoidPtr, len: GuestUSize) -> i32 {
     log_dbg!("munmap({:?}, {})", addr, len);
 
     if len == 0 {
-        set_errno(env, EINVAL);
-        // TODO: should we clear allocations for `addr` here too?
-        log!("Warning: munmap({:?}, {}) failed, returning -1", addr, len);
-        return -1;
+        // Darwin returns EINVAL for `munmap(addr, 0)`, but several apps
+        // (e.g. the UE3-based BioShock port) call it this way in a loop to
+        // release cached buffers and treat any failure as fatal for their
+        // allocator bookkeeping. Be permissive: if the whole mapping at
+        // `addr` is known, release it in full (its recorded length is what
+        // the caller means); otherwise treat the call as a successful no-op.
+        // This matches Linux's munmap(NULL-adjacent) tolerance and keeps the
+        // guest allocator's state consistent.
+        if let Some(&expected_len) = env.libc_state.mmap.allocations.get(&addr) {
+            log_dbg!(
+                "munmap({:?}, 0): zero length, unmapping whole {}-byte mapping",
+                addr,
+                expected_len
+            );
+            env.mem.free(addr);
+            env.libc_state.mmap.allocations.remove(&addr);
+        } else {
+            log_dbg!("munmap({:?}, 0): unknown mapping, treating as no-op", addr);
+        }
+        set_errno(env, 0);
+        return 0;
     }
 
     if let Some(&expected_len) = env.libc_state.mmap.allocations.get(&addr) {

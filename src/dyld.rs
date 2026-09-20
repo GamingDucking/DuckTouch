@@ -964,10 +964,17 @@ impl Dyld {
                 || name == "__ZTIPc"
                 || name == "__ZTIPv"
                 || name == "__ZTIPKv"
+                || name == "__ZTIw"
+                || name == "__ZTIPw"
+                || name == "__ZTIPKw"
+                || name == "__ZTIw"
+                || name == "__ZTIPw"
+                || name == "__ZTIPKw"
             {
                 // C++ RTTI type_info objects for fundamental types (double,
                 // float, int, long, unsigned int, short, char, void, bool,
-                // const char*, char*, void*, const void*).
+                // wchar_t, const char*, char*, void*, const void*,
+                // wchar_t*, wchar_t const*).
                 //
                 // The Itanium ABI requires each fundamental type to have a
                 // unique type_info object with a specific mangled name. Apps
@@ -1430,6 +1437,12 @@ impl Dyld {
                 || symbol == "__ZTIPc"
                 || symbol == "__ZTIPv"
                 || symbol == "__ZTIPKv"
+                || symbol == "__ZTIw"
+                || symbol == "__ZTIPw"
+                || symbol == "__ZTIPKw"
+                || symbol == "__ZTIw"
+                || symbol == "__ZTIPw"
+                || symbol == "__ZTIPKw"
             {
                 let ti = link_cxxabi_typeinfo(symbol, &mut cxxabi_vtable_addrs, mem);
                 mem.write(ptr_ptr, ti);
