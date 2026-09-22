@@ -418,12 +418,33 @@ pub fn pthread_self(env: &mut Environment) -> pthread_t {
         );
     }
 
-    let (&ptr, _) = State::get(env)
+    if let Some((&ptr, _)) = State::get(env)
         .threads
         .iter()
         .find(|&(_ptr, host_obj)| host_obj.thread_id == current_thread)
-        .unwrap();
-    ptr
+    {
+        return ptr;
+    }
+    // No registered pthread object for this thread yet (e.g. a raw host-side
+    // thread that entered emulated code without calling pthread_create --
+    // Gameloft games on 3GS do this, and the previous code panicked here,
+    // which unwound across a coroutine boundary and aborted the whole
+    // process). Registering a synthetic object is safe: it behaves exactly
+    // like a pthread_self()-created thread object.
+    let opaque = env.mem.alloc_and_write(OpaqueThread {
+        magic: MAGIC_THREAD,
+    });
+    assert!(!State::get(env).threads.contains_key(&opaque));
+    State::get(env)
+        .threads
+        .insert(opaque, ThreadHostObject::new(current_thread, DEFAULT_ATTR));
+    log!(
+        "Warning: pthread_self: thread {} had no registered pthread object; \
+         created synthetic object {:?} instead of panicking",
+        current_thread,
+        opaque
+    );
+    opaque
 }
 
 pub fn pthread_exit(env: &mut Environment, retval: MutVoidPtr) {
