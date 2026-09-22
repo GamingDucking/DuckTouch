@@ -138,6 +138,11 @@ pub struct Environment {
     /// Tracks repeated UndefinedInstruction bypasses. See `debug_cpu_error`.
     udf_bypass_last: Option<(u32, u32)>,
     udf_bypass_count: u32,
+    /// Total number of UndefinedInstruction bypasses, independent of the call
+    /// site. Logging is keyed on this so a guest that cycles through many
+    /// different `(pc, lr)` pairs (each with a pair count of 1) cannot flood
+    /// the log with one "occurrence 1" line per pair. See `debug_cpu_error`.
+    udf_bypass_total: u32,
     /// Tracks consecutive UndefinedInstruction bypasses that all fake-return
     /// to the *same* LR, regardless of the faulting PC. This catches runaway
     /// loops where the faulting PC alternates between several bogus addresses
@@ -864,6 +869,7 @@ impl Environment {
             panic_cell: Rc::new(Cell::new(None)),
             udf_bypass_last: None,
             udf_bypass_count: 0,
+            udf_bypass_total: 0,
             udf_bypass_last_lr: None,
             udf_bypass_lr_count: 0,
             guest_termination_requested: false,
@@ -1032,6 +1038,7 @@ impl Environment {
             panic_cell: Rc::new(Cell::new(None)),
             udf_bypass_last: None,
             udf_bypass_count: 0,
+            udf_bypass_total: 0,
             udf_bypass_last_lr: None,
             udf_bypass_lr_count: 0,
             guest_termination_requested: false,
@@ -1102,6 +1109,7 @@ impl Environment {
             panic_cell: Rc::new(Cell::new(None)),
             udf_bypass_last: None,
             udf_bypass_count: 0,
+            udf_bypass_total: 0,
             udf_bypass_last_lr: None,
             udf_bypass_lr_count: 0,
             guest_termination_requested: false,
@@ -2268,6 +2276,8 @@ impl Environment {
                     self.udf_bypass_count = 1;
                     1
                 };
+                self.udf_bypass_total = self.udf_bypass_total.saturating_add(1);
+                let total = self.udf_bypass_total;
 
                 // Independently track how many times in a row we've faked a
                 // return to the SAME LR, ignoring the faulting PC. The `(pc,
@@ -2310,7 +2320,10 @@ impl Environment {
                     );
                 }
 
-                if count == 1 || count % LOG_RATE == 0 {
+                // Log the first sight of each new bypass site, but keyed on
+                // the *total* count so guests that cycle through many distinct
+                // (PC, LR) pairs stop flooding the log after LOG_RATE lines.
+                if total <= LOG_RATE && (count == 1 || count % LOG_RATE == 0) {
                     log_no_panic!(
                         "Warning: Ignored UndefinedInstruction at {:#x}. \
                          Faking function return to LR ({:#x}) to bypass crash! \
@@ -2323,6 +2336,15 @@ impl Environment {
                         instruction_len,
                         count,
                         BYPASS_LIMIT
+                    );
+                } else if total == LOG_RATE + 1 {
+                    log_no_panic!(
+                        "Warning: Ignored UndefinedInstruction bypass still active \
+                         ({} total so far); suppressing further per-site lines until \
+                         a new call site appears. Latest PC {:#x}, LR {:#x}.",
+                        total,
+                        pc,
+                        lr
                     );
                 }
 

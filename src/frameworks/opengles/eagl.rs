@@ -824,15 +824,58 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     std::mem::drop(gles);
 
-    let Some(&drawable) = env
+    let bindings: Vec<(GLuint, id)> = env
         .objc
         .borrow::<EAGLContextHostObject>(this)
         .renderbuffer_drawable_bindings
         .borrow()
-        .get(&renderbuffer) else {
-        log_dbg!("Can't present a renderbuffer {:?} not bound to a drawable!", renderbuffer);
-        return false;
+        .iter()
+        .map(|(&rb, &drawable)| (rb, drawable))
+        .collect();
+
+    // The renderbuffer reported by the driver must be the drawable's colour
+    // renderbuffer, and that is what gets keyed in the map. Some engines
+    // (cocos2d 2.x, e.g. Geometry Dash) leave a different binding current
+    // around presentRenderbuffer:, which makes the driver-reported id miss
+    // the map — on iOS the renderbuffer attached to the drawable is still
+    // presented, so fall back to the single registered binding instead of
+    // silently dropping the frame (the silent drop manifests as a permanent
+    // black screen).
+    let drawable = match bindings.iter().find(|(rb, _)| *rb == renderbuffer) {
+        Some(&(_, drawable)) => drawable,
+        None => {
+            if bindings.len() == 1 {
+                let (rb, drawable) = bindings[0];
+                {
+                    static MISMATCH_LOGGED: std::sync::Once = std::sync::Once::new();
+                    MISMATCH_LOGGED.call_once(|| {
+                        log!(
+                            "[EAGLContext presentRenderbuffer:] renderbuffer binding \
+                             mismatch: driver reports {:#x}, drawable is bound to \
+                             {:#x}; presenting the bound drawable anyway. \
+                             [this log will only be shown once]",
+                            renderbuffer,
+                            rb
+                        );
+                    });
+                }
+                drawable
+            } else {
+                log!(
+                    "Warning: can't present a renderbuffer {:#x} not bound to a \
+                     drawable ({} bound renderbuffer(s): {:?}) - frame skipped.",
+                    renderbuffer,
+                    bindings.len(),
+                    bindings.iter().map(|(rb, _)| *rb).collect::<Vec<_>>(),
+                );
+                if let Some(frame_due) = frame_due {
+                    pace_frame(env, frame_due);
+                }
+                return false;
+            }
+        }
     };
+    drop(bindings);
 
     // We're presenting to the opaque CAEAGLLayer that covers the screen.
     // We can use the fast path where we skip composition and present directly.
@@ -953,11 +996,18 @@ pub const CLASSES: ClassExports = objc_classes! {
         // copied back to system RAM, and then will have to be copied to VRAM
         // again during composition. find_fullscreen_eagl_layer() exists to
         // avoid this.
-        log_dbg!(
-            "There is no fullscreen layer, presenting renderbuffer {:?} to layer {:?} by copying to RAM (slow path).",
-            renderbuffer,
-            drawable,
-        );
+        {
+            static SLOW_PATH_LOGGED: std::sync::Once = std::sync::Once::new();
+            SLOW_PATH_LOGGED.call_once(|| {
+                log!(
+                    "EAGL presenter: no fullscreen layer found; presenting renderbuffer \
+                     {:#x} to layer {:?} via RAM readback (slow path). [this log will \
+                     only be shown once]",
+                    renderbuffer,
+                    drawable
+                );
+            });
+        }
         let pixels_vec = get_pixels_vec_for_presenting(env, drawable);
         // re-borrow
         let read_result = {
