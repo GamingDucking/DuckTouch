@@ -16,7 +16,7 @@ use crate::abi::{CallFromHost, GuestFunction};
 use crate::audio::openal::OpenALManager;
 use crate::cpu::Cpu;
 use crate::libc::semaphore::sem_t;
-use crate::mem::{self, GuestUSize, MutPtr, MutVoidPtr};
+use crate::mem::{self, GuestUSize, MutPtr, MutVoidPtr, Ptr};
 use crate::{
     abi, bundle, cpu, dyld, frameworks, fs, gdb, image, libc, mach_o, objc, options, stack, window,
 };
@@ -2970,8 +2970,16 @@ impl Environment {
                             // Write the return value, unless the pointer to
                             // write to is null.
                             if !ptr.is_null() {
-                                self.mem
-                                    .write(ptr, self.threads[joinee_thread].return_value.unwrap());
+                                if let Some(rv) = self.threads[joinee_thread].return_value {
+                                    self.mem.write(ptr, rv);
+                                } else {
+                                    log_dbg!(
+                                        "Thread {} joined thread {} which has no return value (pthread_exit?); writing NULL",
+                                        self.current_thread,
+                                        joinee_thread
+                                    );
+                                    self.mem.write(ptr, Ptr::null());
+                                }
                             }
                             self.threads[thread_id].blocked_by = ThreadBlock::NotBlocked;
                             return thread_id;

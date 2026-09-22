@@ -49,14 +49,12 @@ use crate::dyld::{export_c_func, FunctionExports};
 use crate::frameworks::core_foundation::cf_allocator::kCFAllocatorDefault;
 use crate::frameworks::core_foundation::cf_data::{CFDataCreate, CFDataGetBytePtr, CFDataGetLength};
 use crate::frameworks::core_foundation::cf_dictionary::{
-    CFDictionaryCreateMutable, CFDictionaryGetCount, CFDictionaryGetKeysAndValues,
+    CFDictionaryGetCount, CFDictionaryGetKeysAndValues,
 };
 use crate::frameworks::core_foundation::cf_type::{CFRelease, CFRetain, CFTypeRef};
-use crate::frameworks::core_foundation::cf_run_loop::CFRunLoopGetMain;
-use crate::frameworks::core_foundation::cf_string::kCFStringEncodingUTF8;
 use crate::frameworks::foundation::ns_string;
-use crate::mem::{ConstPtr, ConstVoidPtr, GuestISize, MutPtr, MutVoidPtr, Ptr, SafeRead};
-use crate::objc::{msg, msg_class, nil, objc_classes, release, ClassExports, HostObject, NSZonePtr, id};
+use crate::mem::{ConstPtr, GuestISize, MutPtr, MutVoidPtr, Ptr, SafeRead};
+use crate::objc::{autorelease, msg, msg_class, nil, objc_classes, ClassExports, HostObject, NSZonePtr, id};
 use crate::Environment;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
@@ -319,7 +317,7 @@ impl MdnsSocket {
     }
 }
 
-fn service_full_name(name: &str, service_type: &str, domain: &str) -> String {
+pub fn service_full_name(name: &str, service_type: &str, domain: &str) -> String {
     let type_and_domain = if domain.is_empty() {
         service_type.to_string()
     } else if service_type.ends_with(&format!(".{}", domain)) {
@@ -643,7 +641,7 @@ fn cf_data_from_vec(env: &mut Environment, bytes: Vec<u8>) -> CFTypeRef {
 /// `len(0..=255) "key=value"` (bare `"key"` for empty/absent values).
 /// Keys must be CFStrings; values may be CFData (used verbatim) or CFString
 /// (flattened to its UTF-8 bytes), per the documented contract.
-fn CFNetServiceCreateTXTDataWithDictionary(
+pub fn CFNetServiceCreateTXTDataWithDictionary(
     env: &mut Environment,
     _alloc: CFTypeRef,
     dict: CFTypeRef,
@@ -721,7 +719,7 @@ fn CFNetServiceCreateTXTDataWithDictionary(
 ///
 /// Stores the TXT record bytes on the service. They are answered in mDNS
 /// TXT queries and picked up by the monitor, mirroring registration.
-fn CFNetServiceSetTXTData(
+pub fn CFNetServiceSetTXTData(
     env: &mut Environment,
     service: CFNetServiceRef,
     txt: CFTypeRef,
@@ -865,7 +863,7 @@ fn CFNetServiceGetTXTRecords(
 /// announcement. Asynchronous mode (client set + scheduled) behaves the same
 /// because announcement is immediate; the client callback fires right after
 /// with no error, matching "registration succeeded".
-fn CFNetServiceRegisterWithOptions(
+pub fn CFNetServiceRegisterWithOptions(
     env: &mut Environment,
     service: CFNetServiceRef,
     options: CFOptionFlags,
@@ -999,7 +997,7 @@ fn CFNetServiceRegisterWithOptions(
     true
 }
 
-fn CFNetServiceRegister(
+pub fn CFNetServiceRegister(
     env: &mut Environment,
     service: CFNetServiceRef,
     error: MutPtr<CFStreamError>,
@@ -1013,7 +1011,7 @@ fn CFNetServiceRegister(
 /// set) the same lookup runs immediately and the client callback is invoked
 /// with the service on completion — the documented contract being that the
 /// callback fires once resolution succeeds or fails.
-fn CFNetServiceResolveWithTimeout(
+pub fn CFNetServiceResolveWithTimeout(
     env: &mut Environment,
     service: CFNetServiceRef,
     timeout: CFTimeInterval,
@@ -1098,7 +1096,7 @@ fn CFNetServiceResolveWithTimeout(
     ok
 }
 
-fn CFNetServiceCancel(env: &mut Environment, service: CFNetServiceRef) {
+pub fn CFNetServiceCancel(env: &mut Environment, service: CFNetServiceRef) {
     if service == nil {
         return;
     }
@@ -1338,21 +1336,21 @@ fn CFNetServiceBrowserStopSearch(env: &mut Environment, browser: CFNetServiceBro
     }
 }
 
-struct DiscoveredService {
+pub struct DiscoveredService {
     /// Full instance name `Instance._type._tcp.local`.
-    full_name: String,
-    service_type: String,
-    domain: String,
-    port: u16,
-    host: String,
-    addr: Option<Ipv4Addr>,
-    txt: Option<Vec<u8>>,
+    pub full_name: String,
+    pub service_type: String,
+    pub domain: String,
+    pub port: u16,
+    pub host: String,
+    pub addr: Option<Ipv4Addr>,
+    pub txt: Option<Vec<u8>>,
 }
 
 /// Runs a real mDNS browse: sends a PTR query for `<type>.<domain>`, listens
 /// on the multicast socket for the given window, and additionally resolves
 /// SRV/TXT/A for each instance discovered.
-fn browse_services(
+pub fn browse_services(
     service_type: &str,
     domain: &str,
     window: Duration,
@@ -1490,7 +1488,7 @@ fn browse_services(
 }
 
 /// Synchronous resolve of one service instance.
-fn resolve_service(full_name: &str, window: Duration) -> Option<DiscoveredService> {
+pub fn resolve_service(full_name: &str, window: Duration) -> Option<DiscoveredService> {
     // Same-device case first: our own registry knows already.
     {
         let registry = REGISTERED_SERVICES.lock().unwrap();
@@ -1741,3 +1739,83 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CFNetServiceBrowserSearchForServices(_, _, _)),
     export_c_func!(CFNetServiceBrowserSearchForDomains(_, _)),
 ];
+
+// MARK: - Rust-side helpers for the Cocoa NSNetService wrappers
+
+/// Creates a `CFNetServiceRef` from raw Rust strings. Returns `nil` ref
+/// semantics (a null CFTypeRef) when inputs are empty.
+pub fn cf_service_from_parts(
+    env: &mut Environment,
+    domain: &str,
+    service_type: &str,
+    name: &str,
+    port: i32,
+) -> CFNetServiceRef {
+    if service_type.is_empty() || name.is_empty() {
+        return nil;
+    }
+    let domain_ns = ns_string::from_rust_string(env, domain.to_string());
+    autorelease(env, domain_ns);
+    let type_ns = ns_string::from_rust_string(env, service_type.to_string());
+    autorelease(env, type_ns);
+    let name_ns = ns_string::from_rust_string(env, name.to_string());
+    autorelease(env, name_ns);
+    CFNetServiceCreate(env, kCFAllocatorDefault, domain_ns, type_ns, name_ns, port)
+}
+
+/// Registers the service (publish) — thin re-export of the C function for
+/// Rust callers.
+pub fn cf_service_register_with_options(
+    env: &mut Environment,
+    service: CFNetServiceRef,
+    options: CFOptionFlags,
+    error: MutPtr<CFStreamError>,
+) -> bool {
+    CFNetServiceRegisterWithOptions(env, service, options, error)
+}
+
+/// Resolves the service — thin re-export of the C function for Rust callers.
+pub fn cf_service_resolve_with_timeout(
+    env: &mut Environment,
+    service: CFNetServiceRef,
+    timeout: CFTimeInterval,
+    error: MutPtr<CFStreamError>,
+) -> bool {
+    CFNetServiceResolveWithTimeout(env, service, timeout, error)
+}
+
+/// Sets the TXT record from an `NSData*` holding DNS-SD formatted bytes.
+/// Accepts either raw key=value TXT bytes or an NSDictionary (delegating to
+/// `CFNetServiceCreateTXTDataWithDictionary`).
+pub fn cf_service_set_txt_data_with_dict(env: &mut Environment, service: CFNetServiceRef, data: id) {
+    if service == nil || data == nil {
+        return;
+    }
+    // If it's not NSData, treat it as an NSDictionary of key/value pairs.
+    let data_class = env.objc.try_get_known_class("NSData", &mut env.mem);
+    let is_data = data_class
+        .map(|dc| {
+            let res: bool = msg![env; data isKindOfClass:dc];
+            res
+        })
+        .unwrap_or(false);
+    let txt_ref: CFTypeRef = if is_data {
+        data.cast()
+    } else {
+        CFNetServiceCreateTXTDataWithDictionary(env, nil, data.cast())
+    };
+    if txt_ref != nil {
+        CFNetServiceSetTXTData(env, service, txt_ref);
+
+    }
+}
+
+/// Returns the TXT record bytes as `NSData*` (or nil).
+pub fn cf_service_get_txt_records(env: &mut Environment, service: CFNetServiceRef) -> id {
+    let data = CFNetServiceGetTXTRecords(env, service);
+    if data == nil {
+        nil
+    } else {
+        data.cast()
+    }
+}

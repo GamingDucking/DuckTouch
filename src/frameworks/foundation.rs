@@ -87,6 +87,7 @@ pub mod ns_time_zone;
 pub mod ns_timer;
 pub mod ns_ubiquitous_key_value_store;
 pub mod ns_undo_manager;
+pub mod ns_net_service;
 pub mod ns_url;
 pub mod ns_user_defaults;
 pub mod url_protocol;
@@ -1562,6 +1563,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ns_timer::CLASSES,
         ns_ubiquitous_key_value_store::CLASSES,
         ns_undo_manager::CLASSES,
+        ns_net_service::CLASSES,
         ns_url::CLASSES,
         ns_url_connection::CLASSES,
         ns_url_request::CLASSES,

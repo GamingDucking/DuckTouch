@@ -11,6 +11,33 @@ use crate::libc::errno::{set_errno, ENOENT, ENXIO};
 use crate::mem::{ConstPtr, GuestUSize, MutPtr, MutVoidPtr, SafeRead};
 use crate::Environment;
 
+// BSD interface flags (net/if.h) as seen by 32-bit iOS guests.
+const IFF_UP: u32 = 0x1;
+const IFF_BROADCAST: u32 = 0x2;
+const IFF_LOOPBACK: u32 = 0x8;
+const IFF_RUNNING: u32 = 0x40;
+const IFF_MULTICAST: u32 = 0x8000;
+
+/// BSD `struct sockaddr` as laid out for 32-bit ARM guests (16 bytes).
+#[repr(C, packed)]
+struct guest_sockaddr_in {
+    sa_len: u8,
+    sa_family: u8,
+    sa_data: [u8; 14],
+}
+unsafe impl SafeRead for guest_sockaddr_in {}
+
+fn guest_sockaddr_from_ipv4(octets: [u8; 4], port: u16) -> guest_sockaddr_in {
+    let mut sa = guest_sockaddr_in {
+        sa_len: 16,
+        sa_family: 2, // AF_INET
+        sa_data: [0; 14],
+    };
+    sa.sa_data[0..2].copy_from_slice(&port.to_be_bytes());
+    sa.sa_data[2..6].copy_from_slice(&octets);
+    sa
+}
+
 // Mirrors the POSIX `struct ifaddrs` layout as seen by 32-bit ARM guests.
 // All pointer fields are 4-byte guest pointers.
 #[allow(non_camel_case_types)]
@@ -41,31 +68,199 @@ unsafe impl SafeRead for ifaddrs {}
 
 /// `int getifaddrs(struct ifaddrs **ifap)`
 ///
-/// Returns success (0) with an empty interface list (*ifap = NULL).
-/// Network-aware apps interpret an empty list as "no network interfaces
-/// available" and gracefully fall back to offline mode, which is the
-/// correct behavior for an emulator that doesn't expose host networking.
+/// Enumerates the HOST device's real IPv4 network interfaces and mirrors
+/// them into a guest-allocated linked list with iOS-style interface names:
+/// the loopback interface is always named `lo0` and real LAN interfaces are
+/// mapped in order to `en0`, `en1`, … (matching an iPhone where `en0` is
+/// Wi-Fi). Each node carries the interface's actual IPv4 address, netmask
+/// and broadcast address, so games that discover their own LAN IP for
+/// local multiplayer (Gameloft, ngmoco, etc.) see the same address that
+/// other devices on the network can reach via the guest sockets.
 fn getifaddrs(env: &mut Environment, ifap: MutPtr<MutPtr<ifaddrs>>) -> i32 {
-    // Write NULL into *ifap — an empty linked list means no interfaces.
-    if !ifap.is_null() {
-        env.mem.write(ifap, MutPtr::null());
+    use std::net::IpAddr;
+
+    if ifap.is_null() {
+        set_errno(env, ENOENT);
+        return -1;
     }
 
-    log_dbg!("getifaddrs() => 0 (empty list, no interfaces exposed to guest)");
+    unsafe fn host_interfaces() -> Option<Vec<(String, Option<u32>, Option<u32>, Option<u32>, u32)>> {
+        let mut ifap_host: *mut ::libc::ifaddrs = std::ptr::null_mut();
+        if ::libc::getifaddrs(&mut ifap_host) != 0 {
+            return None;
+        }
+        let mut out = Vec::new();
+        let mut cursor = ifap_host;
+        let mut lan_index = 0u32;
+        while !cursor.is_null() {
+            let ia = &*cursor;
+            let name = if ia.ifa_name.is_null() {
+                String::new()
+            } else {
+                std::ffi::CStr::from_ptr(ia.ifa_name)
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let sa = ia.ifa_addr;
+            let mut addr = None;
+            let mut netmask = None;
+            let mut broadcast = None;
+            if !sa.is_null() && (*sa).sa_family as i32 == ::libc::AF_INET {
+                let sin = sa as *const ::libc::sockaddr_in;
+                let octets = u32::from_be((*sin).sin_addr.s_addr).to_be_bytes();
+                addr = Some(u32::from_be_bytes(octets));
+                if !ia.ifa_netmask.is_null() {
+                    let nm = ia.ifa_netmask as *const ::libc::sockaddr_in;
+                    netmask = Some(u32::from_be((*nm).sin_addr.s_addr));
+                }
+                // libc's ifaddrs union: ifu_dstaddr aliases ifu_broadaddr
+                if !ia.ifa_ifu.is_null() {
+                    let bc = ia.ifa_ifu.cast::<::libc::sockaddr_in>();
+                    if (*bc).sin_family as i32 == ::libc::AF_INET {
+                        broadcast = Some(u32::from_be((*bc).sin_addr.s_addr));
+                    }
+                }
+            }
+            let flags = ia.ifa_flags as u32;
+            let is_loopback = flags & (::libc::IFF_LOOPBACK as u32) != 0;
+            // Only expose IPv4-enabled, up interfaces; skip IPv6-only entries.
+            if addr.is_some() {
+                let ios_name = if is_loopback {
+                    "lo0".to_string()
+                } else {
+                    let name = format!("en{}", lan_index);
+                    lan_index += 1;
+                    name
+                };
+                out.push((ios_name, addr, netmask, broadcast, flags));
+            }
+            cursor = (*ia).ifa_next;
+        }
+        ::libc::freeifaddrs(ifap_host);
+        Some(out)
+    }
+
+    let interfaces = match unsafe { host_interfaces() } {
+        Some(list) if !list.is_empty() => list,
+        _ => {
+            // Fall back to the loopback-only view so apps that treat an
+            // empty list as "no network at all" still behave sanely.
+            vec![(
+                "lo0".to_string(),
+                Some(u32::from_be_bytes([127, 0, 0, 1])),
+                Some(u32::from_be_bytes([255, 0, 0, 0])),
+                None,
+                IFF_UP | IFF_LOOPBACK | IFF_RUNNING,
+            )]
+        }
+    };
+
+    // Compute the total allocation size: one ifaddrs node + one sockaddr per
+    // address family slot + one name string (with NUL) per interface.
+    const SOCKADDR_SIZE: GuestUSize = 16;
+    let mut total: GuestUSize = 0;
+    for (name, addr, netmask, broadcast, _) in &interfaces {
+        let _ = (addr, netmask, broadcast);
+        total += std::mem::size_of::<ifaddrs>() as GuestUSize;
+        total += name.len() as GuestUSize + 1;
+        total += SOCKADDR_SIZE; // addr
+        total += SOCKADDR_SIZE; // netmask
+        if broadcast.is_some() {
+            total += SOCKADDR_SIZE;
+        }
+    }
+    // Terminator node (NULL next pointer).
+    total += std::mem::size_of::<ifaddrs>() as GuestUSize;
+
+    let base: MutPtr<u8> = env.mem.alloc(total).cast();
+    if base.is_null() {
+        set_errno(env, ENOENT);
+        env.mem.write(ifap, MutPtr::null());
+        return -1;
+    }
+
+    let mut cursor_bits = base.to_bits();
+    let mut first_ptr: MutPtr<ifaddrs> = MutPtr::null();
+    let mut prev_ptr: MutPtr<ifaddrs> = MutPtr::null();
+
+    for (name, addr, netmask, broadcast, flags) in interfaces.iter().cloned() {
+        let node_ptr: MutPtr<ifaddrs> = MutPtr::from_bits(cursor_bits);
+        cursor_bits += std::mem::size_of::<ifaddrs>() as GuestUSize;
+
+        // Name string.
+        let name_ptr: MutPtr<u8> = MutPtr::from_bits(cursor_bits);
+        for (i, byte) in name.bytes().chain(std::iter::once(0)).enumerate() {
+            env.mem.write(name_ptr + i as u32, byte);
+        }
+        cursor_bits += name.len() as GuestUSize + 1;
+
+        let mut write_sockaddr = |bits: &mut GuestUSize, octets: [u8; 4]| -> MutVoidPtr {
+            let sa_ptr: MutPtr<guest_sockaddr_in> = MutPtr::from_bits(*bits);
+            *bits += SOCKADDR_SIZE;
+            env.mem.write(sa_ptr, guest_sockaddr_from_ipv4(octets, 0));
+            sa_ptr.cast()
+        };
+
+        let addr_ptr = addr.map(|a| {
+            write_sockaddr(&mut cursor_bits, a.to_be_bytes())
+        });
+        let netmask_ptr = netmask.map(|a| {
+            write_sockaddr(&mut cursor_bits, a.to_be_bytes())
+        });
+        let broadcast_ptr = broadcast.map(|a| {
+            write_sockaddr(&mut cursor_bits, a.to_be_bytes())
+        });
+
+        let mut ifa_flags = flags;
+        ifa_flags |= IFF_UP | IFF_RUNNING | IFF_MULTICAST;
+        if broadcast.is_some() {
+            ifa_flags |= IFF_BROADCAST;
+        }
+        if name == "lo0" {
+            ifa_flags |= IFF_LOOPBACK;
+            ifa_flags &= !IFF_BROADCAST;
+        }
+
+        env.mem.write(
+            node_ptr,
+            ifaddrs {
+                ifa_next: MutPtr::null(),
+                ifa_name: name_ptr.cast_const(),
+                ifa_flags,
+                ifa_addr: addr_ptr.map(|p| p.to_bits()).unwrap_or(0),
+                ifa_netmask: netmask_ptr.map(|p| p.to_bits()).unwrap_or(0),
+                ifa_broadaddr: broadcast_ptr.map(|p| p.to_bits()).unwrap_or(0),
+                ifa_data: 0,
+            },
+        );
+
+        if !prev_ptr.is_null() {
+            let mut prev = env.mem.read(prev_ptr);
+            prev.ifa_next = node_ptr;
+            env.mem.write(prev_ptr, prev);
+        } else {
+            first_ptr = node_ptr;
+        }
+        prev_ptr = node_ptr;
+    }
+
+    env.mem.write(ifap, first_ptr);
+    log_dbg!(
+        "getifaddrs() => {} interface(s): {:?}",
+        interfaces.len(),
+        interfaces.iter().map(|(n, a, ..)| (n.clone(), a.unwrap_or(0))).collect::<Vec<_>>()
+    );
     0 // success
 }
 
 /// `void freeifaddrs(struct ifaddrs *ifa)`
 ///
-/// Since our `getifaddrs` never allocates anything, this is a no-op. If a
-/// future implementation does allocate, the deallocation logic belongs here.
-fn freeifaddrs(_env: &mut Environment, ifa: MutPtr<ifaddrs>) {
+/// Frees the single guest allocation backing the linked list returned by
+/// [getifaddrs].
+fn freeifaddrs(env: &mut Environment, ifa: MutPtr<ifaddrs>) {
     if !ifa.is_null() {
-        // Future: walk the linked list and free each node + name string.
-        log!(
-            "TODO: freeifaddrs({:#x}) – list was not allocated by us, ignoring",
-            ifa.to_bits()
-        );
+        let base: MutVoidPtr = ifa.cast();
+        env.mem.free(base);
     }
 }
 
