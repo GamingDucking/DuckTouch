@@ -456,7 +456,16 @@ pub fn pthread_exit(env: &mut Environment, retval: MutVoidPtr) {
 fn pthread_join(env: &mut Environment, thread: pthread_t, retval: MutPtr<MutVoidPtr>) -> i32 {
     let current_thread = env.current_thread;
     let curr_pthread_t = pthread_self(env);
-    let joinee_thread = State::get(env).threads.get_mut(&thread).unwrap().thread_id;
+    // POSIX: joining a thread handle that no longer exists (already exited
+    // and reclaimed, or a stale pthread_t) is ESRCH, not a panic. Guest code
+    // (e.g. Gameloft games on 3GS) can legally do this.
+    let Some(joinee_thread) = State::get(env).threads.get(&thread).map(|t| t.thread_id) else {
+        log_dbg!(
+            "pthread_join: thread handle {:?} not found, returning ESRCH",
+            thread
+        );
+        return ESRCH;
+    };
 
     assert!(joinee_thread != 0);
     if joinee_thread == current_thread {
@@ -464,7 +473,13 @@ fn pthread_join(env: &mut Environment, thread: pthread_t, retval: MutPtr<MutVoid
         return EDEADLK;
     }
 
-    let host_obj_curr = State::get(env).threads.get(&curr_pthread_t).unwrap();
+    let Some(host_obj_curr) = State::get(env).threads.get(&curr_pthread_t) else {
+        log_dbg!(
+            "pthread_join: current thread handle {:?} not registered, returning ESRCH",
+            curr_pthread_t
+        );
+        return ESRCH;
+    };
     if let Some(thread) = host_obj_curr.joined_by {
         if thread == joinee_thread {
             log_dbg!("Thread attempted deadlocking join, returning EDEADLK!");
@@ -472,7 +487,13 @@ fn pthread_join(env: &mut Environment, thread: pthread_t, retval: MutPtr<MutVoid
         }
     }
 
-    let host_obj_joinee = State::get(env).threads.get_mut(&thread).unwrap();
+    let Some(host_obj_joinee) = State::get(env).threads.get_mut(&thread) else {
+        log_dbg!(
+            "pthread_join: thread handle {:?} disappeared, returning ESRCH",
+            thread
+        );
+        return ESRCH;
+    };
     if host_obj_joinee.attr.detachstate == PTHREAD_CREATE_DETACHED {
         log_dbg!("Thread attempted join with detached thread, returning EINVAL!");
         return EINVAL;
