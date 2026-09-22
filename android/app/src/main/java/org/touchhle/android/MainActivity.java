@@ -44,6 +44,42 @@ public class MainActivity extends SDLActivity {
     // lifetime; released when the activity is destroyed.
     private static android.net.wifi.WifiManager.MulticastLock multicastLock;
 
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        // Acquire the multicast lock here (not just declare it): Android
+        // Wi-Fi drivers drop multicast unless the app holds it, which broke
+        // Bonjour/NSNetService LAN discovery (GameKit, Gameloft games).
+        try {
+            android.net.wifi.WifiManager wm =
+                    (android.net.wifi.WifiManager) getApplicationContext()
+                            .getSystemService(android.content.Context.WIFI_SERVICE);
+            if (wm != null && multicastLock == null) {
+                multicastLock = wm.createMulticastLock("touchHLE_mdns");
+                multicastLock.setReferenceCounted(false);
+                multicastLock.acquire();
+                Log.i(TAG, "Wi-Fi multicast lock acquired (mDNS discovery enabled)");
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Couldn't acquire Wi-Fi multicast lock", e);
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        try {
+            if (multicastLock != null) {
+                if (multicastLock.isHeld()) {
+                    multicastLock.release();
+                }
+                multicastLock = null;
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Couldn't release Wi-Fi multicast lock", e);
+        }
+        super.onDestroy();
+    }
+
     // Message ID sent from the Rust app picker (see window.rs) to open the
     // .ipa file picker. Must match window.rs ADD_IPA_COMMAND.
     private static final int MSG_ADD_IPA = 0x8000;
