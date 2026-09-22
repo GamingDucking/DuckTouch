@@ -878,8 +878,16 @@ pub const CLASSES: ClassExports = objc_classes! {
             // (its glDrawArrays is the fixed-function emulation itself), so
             // it keeps using readback unless explicitly overridden.
             PresentMode::Auto => {
+                // Native ES 1.1 games keep the readback presenter by default.
+                // The GPU-copy path changes guest-visible fixed-function state
+                // in ways 2D engines (cocos2d etc.) notice — sprite
+                // blending/tinting breaks even though the frame is not black,
+                // so the automatic black-frame fallback never triggers. ES 2.0
+                // backends keep the fast GPU path (its save/restore is exact,
+                // and that is where the 3D games live).
                 backend_is_translator
-                    || (backend_is_native_es1 && direct_present_is_broken())
+                    || backend_is_native_es1
+                    || (backend_is_es2 && direct_present_is_broken())
             }
         };
         {
@@ -2351,6 +2359,11 @@ unsafe fn present_renderbuffer(
     // To avoid confusing the guest app, we need to be able to undo any
     // state changes we make.
     let old_framebuffer: GLuint = get_int(gles, gles11::FRAMEBUFFER_BINDING_OES) as _;
+    let old_active_texture: GLuint = get_int(gles, gles11::ACTIVE_TEXTURE) as _;
+    // The present texture must be bound on unit 0: the guest may have left a
+    // different unit active, and binding to it would both draw the present
+    // quad with the wrong texture and corrupt the guest's unit binding.
+    gles.ActiveTexture(gles11::TEXTURE0);
     let old_texture_2d: GLuint = get_int(gles, gles11::TEXTURE_BINDING_2D) as _;
     {
         static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2499,7 +2512,27 @@ unsafe fn present_renderbuffer(
     // presenter can do on a tile-based GPU (it serialises CPU and GPU and
     // defeats the driver's frame pipelining), so it is opt-in now:
     // --present-finish / TOUCHHLE_PRESENT_FINISH=1.
-    if options.present_finish {
+    // Tile-based GPUs resolve the app's draws to the renderbuffer's main
+    // memory at well-defined sync points. CopyTex(Sub)Image2D is spec-ordered
+    // after the app's draws, but real ES 1.1 surfaces (Adreno/Mali, native or
+    // over ANGLE) have historically needed an explicit drain for alpha-blended
+    // 2D scenes (many small quads): without it, the copy can race the tile
+    // resolve and produce partially-drawn / garbled frames, while 3D scenes
+    // (few big depth-tested draws) usually happen to be fine. Keep the full
+    // drain as the default on native ES 1.1 backends (it was unconditional
+    // before the GPU-present rework); on ES 2.0 shader backends the resolve
+    // is reliable, so it stays opt-in there.
+    let native_es1 = gles.is_native_es1();
+    let finish_before_copy = options.present_finish
+        || (native_es1 && !crate::env_flag_cached!("TOUCHHLE_NO_PRESENT_FINISH"));
+    if finish_before_copy && !options.present_finish {
+        log_once!(
+            "EAGL presenter: native ES1.1 backend - forcing glFinish before the \
+             renderbuffer copy (tile-resolve safety for 2D alpha-blended games; \
+             opt out with TOUCHHLE_NO_PRESENT_FINISH=1)."
+        );
+    }
+    if finish_before_copy {
         gles.Finish();
     }
     if storage_valid {
@@ -3125,8 +3158,11 @@ unsafe fn present_renderbuffer(
         );
     }
 
-    // Restore the other bindings
+    // Restore the other bindings. The present texture was bound on unit 0
+    // (see the ActiveTexture switch at the top), so restore both the unit
+    // and the texture binding.
     gles.BindTexture(gles11::TEXTURE_2D, old_texture_2d);
+    gles.ActiveTexture(old_active_texture);
     gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, old_framebuffer);
     {
         static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
