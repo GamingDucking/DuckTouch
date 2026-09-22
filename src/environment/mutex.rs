@@ -169,15 +169,28 @@ impl Environment {
             match mutex.type_ {
                 MutexType::PTHREAD_MUTEX_NORMAL => {
                     // POSIX says behaviour is undefined here; on real iOS the
-                    // guest deadlocks. We can't deadlock a single host thread
-                    // safely, and panicking tears the whole emulator down for
-                    // a guest bug. Treat it like an error-checking mutex and
-                    // surface EDEADLK so the guest at least has a chance to
-                    // notice rather than corrupting host state.
-                    log!(
-                        "Warning: pthread_mutex_lock: non-error-checking mutex #{mutex_id} would deadlock on thread {current_thread}; returning EDEADLK instead of panicking the host.",
-                    );
-                    return Err(EDEADLK);
+                    // guest would deadlock forever. We can't deadlock a single
+                    // host thread safely, and returning an error is actively
+                    // harmful: guests rarely check pthread_mutex_lock's return
+                    // value, and the failed lock sends them into corrupted
+                    // lock/unlock states that end in guest aborts (observed
+                    // with N.O.V.A. 3, which spun a mutex-unlock loop for
+                    // seconds after receiving EDEADLK here and then aborted).
+                    // The most benign emulation is a successful no-op: the
+                    // guest proceeds exactly as it would have had the lock
+                    // succeeded, and its matching unlock still leaves the
+                    // original ownership intact.
+                    static SELF_LOCK_LOGGED: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let bit = 1u64 << (mutex_id % 64);
+                    let logged =
+                        SELF_LOCK_LOGGED.fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
+                    if logged & bit == 0 {
+                        log!(
+                            "Warning: pthread_mutex_lock: non-error-checking mutex #{mutex_id} would deadlock on thread {current_thread}; succeeding as a no-op instead (real iOS would deadlock here).",
+                        );
+                    }
+                    return Ok(1);
                 }
                 MutexType::PTHREAD_MUTEX_ERRORCHECK => {
                     log_dbg!("Attempted to lock error-checking mutex #{} for thread {}, already locked by same thread! Returning EDEADLK.", mutex_id, current_thread);

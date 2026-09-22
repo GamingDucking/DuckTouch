@@ -169,6 +169,11 @@ mod imp {
         unsafe { libc::close(fd) };
         let text = String::from_utf8_lossy(&buf[..off]).into_owned();
         let mut out = String::from("relevant /proc/self/maps entries:\n");
+        // Track the lowest mapping of libtouchHLE.so together with its file
+        // offset, so native backtrace frames can be converted to ELF file
+        // addresses for offline symbolization:
+        //   file_vaddr = frame_addr - load_base, load_base = map_start - map_offset
+        let mut touchhle_load_base: Option<(usize, usize)> = None;
         for line in text.lines() {
             // "start-end perms offset dev inode path"
             let mut it = line.splitn(2, ' ');
@@ -183,6 +188,15 @@ mod imp {
                 ) else {
                     continue;
                 };
+                if line.contains("libtouchHLE.so") && touchhle_load_base.is_none() {
+                    // Offset is the third field.
+                    let offset = line
+                        .split_whitespace()
+                        .nth(2)
+                        .and_then(|o| usize::from_str_radix(o, 16).ok())
+                        .unwrap_or(0);
+                    touchhle_load_base = Some((start.saturating_sub(offset), offset));
+                }
                 if addrs.iter().any(|a| {
                     let a = *a as usize;
                     a >= start && a < end
@@ -191,6 +205,12 @@ mod imp {
                     out.push('\n');
                 }
             }
+        }
+        if let Some((base, _)) = touchhle_load_base {
+            out.push_str(&format!(
+                "libtouchHLE.so load base: {:#x} (symbolize native frames with: llvm-symbolizer --obj=libtouchHLE.so <frame - base>)\n",
+                base
+            ));
         }
         out
     }
