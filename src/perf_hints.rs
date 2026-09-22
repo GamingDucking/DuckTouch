@@ -55,6 +55,7 @@ impl PerfHints {
                 return PerfHints { inner: None };
             }
             android::raise_thread_priority();
+            android::pin_to_big_cores();
             PerfHints {
                 inner: android::HintSession::open(target_frame_time),
             }
@@ -109,6 +110,132 @@ mod android {
                     before,
                     std::io::Error::last_os_error()
                 );
+            }
+        }
+    }
+
+    /// Pin the calling thread to the "big" CPU cluster: the cores whose
+    /// maximum frequency matches the fastest core on the device (typically a
+    /// big.LITTLE or tri-cluster SoC where the scheduler is otherwise free to
+    /// migrate the single hot emulator thread between clusters, losing L2/L3
+    /// locality and risking idle-clock time on the slower cores).
+    ///
+    /// Cores are discovered from sysfs (`cpufreq/cpuinfo_max_freq`); every
+    /// core within 10% of the fastest core's frequency is included, which
+    /// keeps a homogeneous (all-big or all-mid) device un-pinned when the
+    /// "cluster" would be the whole CPU anyway.
+    ///
+    /// Override with `TOUCHHLE_AFFINITY`: `off` disables pinning, `all` is a
+    /// synonym, otherwise a comma-separated CPU list (e.g. `4-7`) pins to
+    /// exactly those CPUs.
+    pub fn pin_to_big_cores() {
+        let override_ = std::env::var("TOUCHHLE_AFFINITY").unwrap_or_default();
+        let override_ = override_.trim();
+        if override_.is_empty() || override_.eq_ignore_ascii_case("big") {
+            if let Some(cores) = big_core_cpus() {
+                if set_affinity(&cores, "big cluster") {
+                    return;
+                }
+            }
+            return;
+        }
+        if override_.eq_ignore_ascii_case("off") || override_.eq_ignore_ascii_case("all") {
+            log!("CPU affinity override: staying on all cores.");
+            return;
+        }
+        let cores: Vec<usize> = override_
+            .split(',')
+            .flat_map(|part| match part.split_once('-') {
+                Some((a, b)) => {
+                    let a: usize = a.trim().parse().unwrap_or(usize::MAX);
+                    let b: usize = b.trim().parse().unwrap_or(usize::MAX);
+                    (a..=b).collect::<Vec<usize>>()
+                }
+                None => match part.trim().parse() {
+                    Ok(cpu) => vec![cpu],
+                    Err(_) => Vec::new(),
+                },
+            })
+            .collect();
+        if cores.is_empty() {
+            log!("TOUCHHLE_AFFINITY={override_}: no valid CPU list, ignoring.");
+            return;
+        }
+        set_affinity(&cores, &format!("CPU list {override_}"));
+    }
+
+    /// The CPUs of the big cluster, discovered from sysfs. `None` when the
+    /// layout can't be determined or there is nothing to pin to.
+    fn big_core_cpus() -> Option<Vec<usize>> {
+        let mut freqs: Vec<(usize, u64)> = Vec::new();
+        for cpu in 0..64 {
+            let path = format!("/sys/devices/system/cpu/cpu{cpu}/cpufreq/cpuinfo_max_freq");
+            if !std::path::Path::new(&path).exists() {
+                if cpu == 0 {
+                    return None;
+                }
+                continue;
+            }
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if let Ok(khz) = text.trim().parse::<u64>() {
+                    freqs.push((cpu, khz));
+                }
+            }
+        }
+        if freqs.len() < 2 {
+            return None;
+        }
+        let max = freqs.iter().map(|(_, f)| *f).max()?;
+        // A core is "big" when within 10% of the fastest core: 2.7 GHz
+        // against a 2.2 GHz mid cluster does not qualify, sibling big cores
+        // (e.g. 3.19 GHz vs 3.00 GHz on the same SoC) do.
+        let big: Vec<usize> = freqs
+            .iter()
+            .filter(|(_, f)| *f * 10 >= max * 9)
+            .map(|(cpu, _)| *cpu)
+            .collect();
+        // Nothing to gain from pinning when every core qualifies.
+        if big.len() == freqs.len() {
+            log!(
+                "CPU affinity: all {} cores run at the same maximum frequency, leaving the scheduler alone.",
+                freqs.len()
+            );
+            return None;
+        }
+        Some(big)
+    }
+
+    /// Apply a CPU affinity mask to the calling thread. Logging is best
+    /// effort: affinity is an optimization, never a correctness requirement.
+    fn set_affinity(cores: &[usize], what: &str) -> bool {
+        // SAFETY: a zeroed `cpu_set_t` is valid (an empty set), and
+        // `CPU_SET` refuses indices >= CPU_SETSIZE.
+        unsafe {
+            let mut set: ::libc::cpu_set_t = std::mem::zeroed();
+            ::libc::CPU_ZERO(&mut set);
+            for &cpu in cores {
+                ::libc::CPU_SET(cpu, &mut set);
+            }
+            let res = ::libc::sched_setaffinity(
+                0,
+                std::mem::size_of::<::libc::cpu_set_t>(),
+                &set,
+            );
+            if res == 0 {
+                log!(
+                    "Emulator thread pinned to the {} (cores {:?}).",
+                    what,
+                    cores
+                );
+                true
+            } else {
+                log!(
+                    "Could not pin the emulator thread to the {} (cores {:?}): {}",
+                    what,
+                    cores,
+                    std::io::Error::last_os_error()
+                );
+                false
             }
         }
     }
