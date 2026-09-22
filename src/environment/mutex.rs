@@ -249,9 +249,17 @@ impl Environment {
                 MutexType::PTHREAD_MUTEX_NORMAL => {
                     // This case is undefined,
                     // but tests on macOS/iOS shows it is allowed!
-                    log!(
-                        "Warning: Allowing to unlock non-error-checking mutex #{mutex_id} for thread {current_thread}, locked by different thread {locking_thread}!",
-                    );
+                    // Logging is capped: games like N.O.V.A. 3 unlock this mutex
+                    // from another thread every frame, flooding the log.
+                    static CROSS_UNLOCK_LOGGED: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    let n = CROSS_UNLOCK_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n < 8 || n == 1000 {
+                        log!(
+                            "Warning: Allowing to unlock non-error-checking mutex #{mutex_id} for thread {current_thread}, locked by different thread {locking_thread}! (occurrence {})",
+                            n + 1
+                        );
+                    }
                 }
                 MutexType::PTHREAD_MUTEX_ERRORCHECK | MutexType::PTHREAD_MUTEX_RECURSIVE => {
                     log_dbg!(
