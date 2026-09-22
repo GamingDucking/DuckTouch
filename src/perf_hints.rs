@@ -41,11 +41,13 @@ pub struct PerfHints {
 
 impl PerfHints {
     /// `target_frame_time` is the frame interval the emulator paces to (or
-    /// the display's interval if it doesn't pace).
-    pub fn new(enabled: bool, target_frame_time: Duration) -> PerfHints {
+    /// the display's interval if it doesn't pace). `affinity` comes from
+    /// `--affinity=` (`big` / `all` / `off` / a CPU list); the
+    /// `TOUCHHLE_AFFINITY` environment variable, when set, takes precedence.
+    pub fn new(enabled: bool, target_frame_time: Duration, affinity: Option<&str>) -> PerfHints {
         #[cfg(not(target_os = "android"))]
         {
-            let _ = (enabled, target_frame_time);
+            let _ = (enabled, target_frame_time, affinity);
             PerfHints {}
         }
         #[cfg(target_os = "android")]
@@ -55,7 +57,7 @@ impl PerfHints {
                 return PerfHints { inner: None };
             }
             android::raise_thread_priority();
-            android::pin_to_big_cores();
+            android::pin_to_big_cores(affinity);
             PerfHints {
                 inner: android::HintSession::open(target_frame_time),
             }
@@ -125,11 +127,14 @@ mod android {
     /// keeps a homogeneous (all-big or all-mid) device un-pinned when the
     /// "cluster" would be the whole CPU anyway.
     ///
-    /// Override with `TOUCHHLE_AFFINITY`: `off` disables pinning, `all` is a
-    /// synonym, otherwise a comma-separated CPU list (e.g. `4-7`) pins to
-    /// exactly those CPUs.
-    pub fn pin_to_big_cores() {
-        let override_ = std::env::var("TOUCHHLE_AFFINITY").unwrap_or_default();
+    /// `affinity_override` comes from `--affinity=`; the `TOUCHHLE_AFFINITY`
+    /// environment variable, when set, takes precedence over it.
+    pub fn pin_to_big_cores(affinity_override: Option<&str>) {
+        let override_ = std::env::var("TOUCHHLE_AFFINITY")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| affinity_override.map(|v| v.to_string()))
+            .unwrap_or_default();
         let override_ = override_.trim();
         if override_.is_empty() || override_.eq_ignore_ascii_case("big") {
             if let Some(cores) = big_core_cpus() {

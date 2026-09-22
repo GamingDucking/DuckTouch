@@ -174,6 +174,10 @@ pub struct Options {
     /// through touchHLE's desktop OpenGL 2.1 compatibility backend.
     pub gles2_compat: bool,
     pub direct_memory_access: bool,
+    /// CPU affinity policy for the emulator thread on Android
+    /// (`--affinity=`): `None` = default (big cores), or one of
+    /// `all` / `off` / `big` / an explicit CPU list like `4-7`.
+    pub affinity: Option<String>,
     pub gdb_listen_addrs: Option<Vec<SocketAddr>>,
     pub preferred_languages: Option<Vec<String>>,
     pub headless: bool,
@@ -278,6 +282,7 @@ impl Default for Options {
             gles1_implementation: None,
             gles2_compat: false,
             direct_memory_access: true,
+            affinity: None,
             gdb_listen_addrs: None,
             preferred_languages: None,
             headless: false,
@@ -498,6 +503,8 @@ impl Options {
             );
         } else if arg == "--gles2-compat" {
             self.gles2_compat = true;
+        } else if let Some(value) = arg.strip_prefix("--affinity=") {
+            self.affinity = Some(value.to_string());
         } else if arg == "--disable-direct-memory-access" {
             self.direct_memory_access = false;
         } else if let Some(address) = arg.strip_prefix("--gdb=") {

@@ -1096,6 +1096,7 @@ impl Window {
                     .fps_limit
                     .map(|fps| Duration::from_secs_f64(1.0 / fps))
                     .unwrap_or(Duration::from_micros(16_667)),
+                options.affinity.as_deref(),
             ),
             on_main_stack: true,
         };
