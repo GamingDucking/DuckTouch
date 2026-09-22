@@ -11,6 +11,126 @@ use crate::libc::errno::{set_errno, ENOENT, ENXIO};
 use crate::mem::{ConstPtr, GuestUSize, MutPtr, MutVoidPtr, SafeRead};
 use crate::Environment;
 
+unsafe fn host_interfaces() -> Option<Vec<(String, Option<u32>, Option<u32>, Option<u32>, u32)>> {
+    #[cfg(not(windows))]
+    {
+        let mut ifap_host: *mut ::libc::ifaddrs = std::ptr::null_mut();
+        if ::libc::getifaddrs(&mut ifap_host) != 0 {
+            return None;
+        }
+        let mut out = Vec::new();
+        let mut cursor = ifap_host;
+        let mut lan_index = 0u32;
+        while !cursor.is_null() {
+            let ia = &*cursor;
+            let name = if ia.ifa_name.is_null() {
+                String::new()
+            } else {
+                std::ffi::CStr::from_ptr(ia.ifa_name)
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let sa = ia.ifa_addr;
+            let mut addr = None;
+            let mut netmask = None;
+            let mut broadcast = None;
+            if !sa.is_null() && (*sa).sa_family as i32 == ::libc::AF_INET {
+                let sin = sa as *const ::libc::sockaddr_in;
+                let octets = u32::from_be((*sin).sin_addr.s_addr).to_be_bytes();
+                addr = Some(u32::from_be_bytes(octets));
+                if !ia.ifa_netmask.is_null() {
+                    let nm = ia.ifa_netmask as *const ::libc::sockaddr_in;
+                    netmask = Some(u32::from_be((*nm).sin_addr.s_addr));
+                }
+                // The dstaddr/broadaddr field: a plain `ifa_dstaddr` on
+                // BSD/macOS, a `ifu` union on Linux (aliases broadaddr).
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                let dst = ia.ifa_ifu;
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                let dst = ia.ifa_dstaddr;
+                if !dst.is_null() {
+                    let bc = dst.cast::<::libc::sockaddr_in>();
+                    if (*bc).sin_family as i32 == ::libc::AF_INET {
+                        broadcast = Some(u32::from_be((*bc).sin_addr.s_addr));
+                    }
+                }
+            }
+            let flags = ia.ifa_flags as u32;
+            let is_loopback = flags & (::libc::IFF_LOOPBACK as u32) != 0;
+            // Only expose IPv4-enabled, up interfaces; skip IPv6-only entries.
+            if addr.is_some() {
+                let ios_name = if is_loopback {
+                    "lo0".to_string()
+                } else {
+                    let name = format!("en{}", lan_index);
+                    lan_index += 1;
+                    name
+                };
+                out.push((ios_name, addr, netmask, broadcast, flags));
+            }
+            cursor = (*ia).ifa_next;
+        }
+        ::libc::freeifaddrs(ifap_host);
+        Some(out)
+    }
+    #[cfg(windows)]
+    {
+        // libc's ifaddrs API isn't available on Windows. Discover the
+        // LAN address with a connected UDP socket instead: the routing
+        // table picks the interface that would reach the address, so
+        // the socket's local endpoint is the address other LAN devices
+        // can reach. No packets are sent (UDP connect is local-only).
+        use std::net::UdpSocket;
+        let sock = match UdpSocket::bind("0.0.0.0:0") {
+            Ok(s) => s,
+            Err(_) => return None,
+        };
+        if sock.connect("10.255.255.255:9").is_err() {
+            return None;
+        }
+        let local = match sock.local_addr() {
+            Ok(a) => a,
+            Err(_) => return None,
+        };
+        if let std::net::IpAddr::V4(v4) = local.ip() {
+            let addr = u32::from(v4);
+            // A common Class C /24 netmask is a reasonable guess; LAN
+            // games generally only compare the network prefix.
+            let netmask = 0xffff_ff00u32.to_be();
+            // Limited broadcast; GameKit-style discovery also accepts it.
+            let broadcast = 0xffff_ffffu32.to_be();
+            // IFF_UP (0x1) | IFF_BROADCAST (0x2) | IFF_MULTICAST (0x800);
+            // values are stable across platforms, no libc dep needed.
+            const IFF_UP: u32 = 0x1;
+            const IFF_BROADCAST: u32 = 0x2;
+            const IFF_MULTICAST: u32 = 0x800;
+            return Some(vec![(
+                "en0".to_string(),
+                Some(addr),
+                Some(netmask),
+                Some(broadcast),
+                IFF_UP | IFF_BROADCAST | IFF_MULTICAST,
+            )]);
+        }
+        None
+    }
+}
+
+
+/// Best-effort primary LAN IPv4 of the host, as a dotted-quad string.
+/// `None` when no non-loopback IPv4 interface exists. Used by `netdb`
+/// to map `.local` hostnames to the address peers can actually reach.
+pub fn primary_lan_ipv4() -> Option<String> {
+    let list = unsafe { host_interfaces() }?;
+    list.into_iter()
+        .find(|(_, addr, _, _, flags)| addr.is_some() && *flags & IFF_LOOPBACK == 0)
+        .and_then(|(_, addr, _, _, _)| addr)
+        .map(|a| {
+            let b = a.to_be_bytes();
+            format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])
+        })
+}
+
 // BSD interface flags (net/if.h) as seen by 32-bit iOS guests.
 const IFF_UP: u32 = 0x1;
 const IFF_BROADCAST: u32 = 0x2;
@@ -82,110 +202,6 @@ fn getifaddrs(env: &mut Environment, ifap: MutPtr<MutPtr<ifaddrs>>) -> i32 {
         return -1;
     }
 
-    unsafe fn host_interfaces() -> Option<Vec<(String, Option<u32>, Option<u32>, Option<u32>, u32)>> {
-        #[cfg(not(windows))]
-        {
-            let mut ifap_host: *mut ::libc::ifaddrs = std::ptr::null_mut();
-            if ::libc::getifaddrs(&mut ifap_host) != 0 {
-                return None;
-            }
-            let mut out = Vec::new();
-            let mut cursor = ifap_host;
-            let mut lan_index = 0u32;
-            while !cursor.is_null() {
-                let ia = &*cursor;
-                let name = if ia.ifa_name.is_null() {
-                    String::new()
-                } else {
-                    std::ffi::CStr::from_ptr(ia.ifa_name)
-                        .to_string_lossy()
-                        .into_owned()
-                };
-                let sa = ia.ifa_addr;
-                let mut addr = None;
-                let mut netmask = None;
-                let mut broadcast = None;
-                if !sa.is_null() && (*sa).sa_family as i32 == ::libc::AF_INET {
-                    let sin = sa as *const ::libc::sockaddr_in;
-                    let octets = u32::from_be((*sin).sin_addr.s_addr).to_be_bytes();
-                    addr = Some(u32::from_be_bytes(octets));
-                    if !ia.ifa_netmask.is_null() {
-                        let nm = ia.ifa_netmask as *const ::libc::sockaddr_in;
-                        netmask = Some(u32::from_be((*nm).sin_addr.s_addr));
-                    }
-                    // The dstaddr/broadaddr field: a plain `ifa_dstaddr` on
-                    // BSD/macOS, a `ifu` union on Linux (aliases broadaddr).
-                    #[cfg(any(target_os = "linux", target_os = "android"))]
-                    let dst = ia.ifa_ifu;
-                    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-                    let dst = ia.ifa_dstaddr;
-                    if !dst.is_null() {
-                        let bc = dst.cast::<::libc::sockaddr_in>();
-                        if (*bc).sin_family as i32 == ::libc::AF_INET {
-                            broadcast = Some(u32::from_be((*bc).sin_addr.s_addr));
-                        }
-                    }
-                }
-                let flags = ia.ifa_flags as u32;
-                let is_loopback = flags & (::libc::IFF_LOOPBACK as u32) != 0;
-                // Only expose IPv4-enabled, up interfaces; skip IPv6-only entries.
-                if addr.is_some() {
-                    let ios_name = if is_loopback {
-                        "lo0".to_string()
-                    } else {
-                        let name = format!("en{}", lan_index);
-                        lan_index += 1;
-                        name
-                    };
-                    out.push((ios_name, addr, netmask, broadcast, flags));
-                }
-                cursor = (*ia).ifa_next;
-            }
-            ::libc::freeifaddrs(ifap_host);
-            Some(out)
-        }
-        #[cfg(windows)]
-        {
-            // libc's ifaddrs API isn't available on Windows. Discover the
-            // LAN address with a connected UDP socket instead: the routing
-            // table picks the interface that would reach the address, so
-            // the socket's local endpoint is the address other LAN devices
-            // can reach. No packets are sent (UDP connect is local-only).
-            use std::net::UdpSocket;
-            let sock = match UdpSocket::bind("0.0.0.0:0") {
-                Ok(s) => s,
-                Err(_) => return None,
-            };
-            if sock.connect("10.255.255.255:9").is_err() {
-                return None;
-            }
-            let local = match sock.local_addr() {
-                Ok(a) => a,
-                Err(_) => return None,
-            };
-            if let std::net::IpAddr::V4(v4) = local.ip() {
-                let addr = u32::from(v4);
-                // A common Class C /24 netmask is a reasonable guess; LAN
-                // games generally only compare the network prefix.
-                let netmask = 0xffff_ff00u32.to_be();
-                // Limited broadcast; GameKit-style discovery also accepts it.
-                let broadcast = 0xffff_ffffu32.to_be();
-                // IFF_UP (0x1) | IFF_BROADCAST (0x2) | IFF_MULTICAST (0x800);
-                // values are stable across platforms, no libc dep needed.
-                const IFF_UP: u32 = 0x1;
-                const IFF_BROADCAST: u32 = 0x2;
-                const IFF_MULTICAST: u32 = 0x800;
-                return Some(vec![(
-                    "en0".to_string(),
-                    Some(addr),
-                    Some(netmask),
-                    Some(broadcast),
-                    IFF_UP | IFF_BROADCAST | IFF_MULTICAST,
-                )]);
-            }
-            None
-        }
-    }
     let interfaces = match unsafe { host_interfaces() } {
         Some(list) if !list.is_empty() => list,
         _ => {

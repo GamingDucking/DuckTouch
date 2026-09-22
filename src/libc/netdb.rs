@@ -292,6 +292,21 @@ fn gethostbyname(env: &mut Environment, name: ConstPtr<u8>) -> MutPtr<u8> {
         match hostname.as_str() {
             "localhost" | "loopback" | "touchHLE" => [127, 0, 0, 1],
             "broadcasthost" => [255, 255, 255, 255],
+            // Games (e.g. Gameloft titles) broadcast LAN discovery to the
+            // name of their own service or to wildcard hostnames; also map
+            // names ending in `.local` to the host's primary LAN address so
+            // peer connections land on the emulator's real interface.
+            _ if hostname.to_lowercase().ends_with(".local") => {
+                let host_ip = crate::libc::ifaddrs::primary_lan_ipv4()
+                    .and_then(|s| s.parse::<std::net::Ipv4Addr>().ok())
+                    .unwrap_or(std::net::Ipv4Addr::LOCALHOST);
+                log!(
+                    "gethostbyname(\"{}\"): .local -> host LAN address {}",
+                    hostname,
+                    host_ip
+                );
+                host_ip.octets()
+            }
             _ => {
                 if !env.options.network_access {
                     log!(
@@ -830,3 +845,4 @@ pub const CONSTANTS: ConstantExports = &[(
     "_h_errno",
     HostConstant::Custom(|env| -> ConstVoidPtr { h_errno_ptr(env).cast().cast_const() }),
 )];
+
