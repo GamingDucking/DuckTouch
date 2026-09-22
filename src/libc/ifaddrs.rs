@@ -115,9 +115,9 @@ fn getifaddrs(env: &mut Environment, ifap: MutPtr<MutPtr<ifaddrs>>) -> i32 {
                     }
                     // The dstaddr/broadaddr field: a plain `ifa_dstaddr` on
                     // BSD/macOS, a `ifu` union on Linux (aliases broadaddr).
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
                     let dst = ia.ifa_ifu;
-                    #[cfg(not(target_os = "linux"))]
+                    #[cfg(not(any(target_os = "linux", target_os = "android")))]
                     let dst = ia.ifa_dstaddr;
                     if !dst.is_null() {
                         let bc = dst.cast::<::libc::sockaddr_in>();
