@@ -36,6 +36,13 @@ struct Mutex {
     /// The `NonZeroU32` is the number of locks on this thread (if it's a
     /// recursive mutex).
     locked: Option<(ThreadId, NonZeroU32)>,
+    /// Counts of "phantom" no-op locks per thread, created when a NORMAL
+    /// mutex self-lock that would deadlock on real iOS is instead allowed to
+    /// succeed (see `Environment::lock_mutex`). Each phantom lock must be
+    /// paired with a matching unlock that releases nothing, so the guest's
+    /// lock/unlock bookkeeping stays consistent with the real lock held by
+    /// the original owner.
+    phantom_locks: HashMap<ThreadId, u32>,
 }
 
 #[repr(i32)]
@@ -73,6 +80,7 @@ impl MutexState {
                 type_: mutex_type,
                 waiting_count: 0,
                 locked: None,
+                phantom_locks: HashMap::new(),
             },
         );
         log_dbg!("Created mutex #{}, type {:?}", mutex_id, mutex_type);
@@ -176,10 +184,11 @@ impl Environment {
                     // lock/unlock states that end in guest aborts (observed
                     // with N.O.V.A. 3, which spun a mutex-unlock loop for
                     // seconds after receiving EDEADLK here and then aborted).
-                    // The most benign emulation is a successful no-op: the
-                    // guest proceeds exactly as it would have had the lock
-                    // succeeded, and its matching unlock still leaves the
-                    // original ownership intact.
+                    // We grant a "phantom" lock: it succeeds without changing
+                    // real ownership, and is consumed by a matching unlock
+                    // (see `unlock_mutex`), so the guest's lock/unlock pair
+                    // bookkeeping stays balanced without touching the lock
+                    // actually held by the other thread.
                     static SELF_LOCK_LOGGED: std::sync::atomic::AtomicU64 =
                         std::sync::atomic::AtomicU64::new(0);
                     let bit = 1u64 << (mutex_id % 64);
@@ -187,9 +196,14 @@ impl Environment {
                         SELF_LOCK_LOGGED.fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
                     if logged & bit == 0 {
                         log!(
-                            "Warning: pthread_mutex_lock: non-error-checking mutex #{mutex_id} would deadlock on thread {current_thread}; succeeding as a no-op instead (real iOS would deadlock here).",
+                            "Warning: pthread_mutex_lock: non-error-checking mutex #{mutex_id} would deadlock on thread {current_thread}; granting phantom lock instead (real iOS would deadlock here).",
                         );
                     }
+                    *mutex
+                        .phantom_locks
+                        .entry(current_thread)
+                        .and_modify(|c| *c += 1)
+                        .or_insert(1);
                     return Ok(1);
                 }
                 MutexType::PTHREAD_MUTEX_ERRORCHECK => {
@@ -223,6 +237,25 @@ impl Environment {
     pub fn unlock_mutex(&mut self, mutex_id: MutexId) -> Result<u32, i32> {
         let current_thread = self.current_thread;
         let mutex: &mut _ = self.mutex_state.mutexes.get_mut(&mutex_id).unwrap();
+
+        // If this thread holds a phantom lock (granted when a NORMAL mutex
+        // self-lock that would deadlock was allowed to succeed instead), an
+        // unlock just consumes the phantom and releases nothing: the real
+        // lock belongs to whichever thread owns it.
+        if let Some(phantom_count) = mutex.phantom_locks.get_mut(&current_thread) {
+            if *phantom_count > 0 {
+                *phantom_count -= 1;
+                if *phantom_count == 0 {
+                    mutex.phantom_locks.remove(&current_thread);
+                }
+                log_dbg!(
+                    "Consumed phantom lock on mutex #{} for thread {}.",
+                    mutex_id,
+                    current_thread
+                );
+                return Ok(0);
+            }
+        }
 
         let Some((locking_thread, lock_count)) = mutex.locked else {
             match mutex.type_ {
