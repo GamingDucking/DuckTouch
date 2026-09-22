@@ -106,6 +106,31 @@ macro_rules! echo {
     }
 }
 
+/// Like [echo], but only writes to the in-file log: nothing is sent to
+/// logcat/stderr. Intended for opt-in tracing of extremely hot paths (e.g.
+/// per-call `--verbose-gles` output), where the logcat round-trip alone is a
+/// measurable frame-time cost on Android.
+macro_rules! echo_file_only {
+    ($($arg:tt)+) => {
+        {
+            let formatted_str = format!($($arg)+);
+
+            if let Ok(mut log_file) = $crate::log::get_log_file().lock() {
+                let _ = std::io::Write::write_all(&mut *log_file, formatted_str.as_bytes());
+                let _ = std::io::Write::write_all(&mut *log_file, b"\n");
+            }
+        }
+    };
+}
+
+/// Like [log], but only writes to the in-file log (never logcat/stderr). To
+/// be used for per-call traces that can emit thousands of lines per second.
+macro_rules! log_file_only {
+    ($($arg:tt)+) => {
+        echo_file_only!("{}: {}", module_path!(), format_args!($($arg)+))
+    };
+}
+
 /// Same as [echo], but silently fails on panic instead of
 /// panicking.
 macro_rules! echo_no_panic {

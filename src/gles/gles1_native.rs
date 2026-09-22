@@ -51,6 +51,14 @@ pub struct GLES1NativeContext {
     /// to the first `make_current` because we need a current GL context to
     /// query `GL_EXTENSIONS`.
     pvrtc_native_checked: bool,
+    /// Whether the host ES 1.1 driver exports `glDiscardFramebufferEXT`
+    /// (`GL_EXT_discard_framebuffer`). Checked together with `pvrtc_native`
+    /// in `make_current` (needs a current context to query `GL_EXTENSIONS`).
+    /// Honouring the guest's discard hints lets tile-based mobile GPUs
+    /// (Mali, Adreno, PowerVR) skip writing depth/stencil tile memory back to
+    /// system RAM at the end of a frame.
+    discard_ext: bool,
+    discard_ext_checked: bool,
 }
 
 /// Texture parameters that only exist in OpenGL ES 2.0+ (or are otherwise
@@ -110,6 +118,8 @@ impl GLESContext for GLES1NativeContext {
             is_loaded: false,
             pvrtc_native: false,
             pvrtc_native_checked: false,
+            discard_ext: false,
+            discard_ext_checked: false,
         })
     }
 
@@ -122,6 +132,7 @@ impl GLESContext for GLES1NativeContext {
                 _gl_lifetime: PhantomData,
                 pending_synthetic_error: std::cell::Cell::new(gles11::NO_ERROR),
                 pvrtc_native: self.pvrtc_native,
+                discard_ext: self.discard_ext,
             });
         }
 
@@ -132,6 +143,9 @@ impl GLESContext for GLES1NativeContext {
         self.is_loaded = true;
         if !self.pvrtc_native_checked {
             self.pvrtc_native = unsafe { detect_pvrtc_support() };
+            self.discard_ext =
+                unsafe { host_extension_present("GL_EXT_discard_framebuffer") };
+            self.discard_ext_checked = true;
             self.pvrtc_native_checked = true;
             log!(
                 "GLES1Native: GL_IMG_texture_compression_pvrtc {} (PVRTC textures will \
@@ -152,6 +166,7 @@ impl GLESContext for GLES1NativeContext {
             _gl_lifetime: PhantomData,
             pending_synthetic_error: std::cell::Cell::new(gles11::NO_ERROR),
             pvrtc_native: self.pvrtc_native,
+            discard_ext: self.discard_ext,
         })
     }
 
@@ -165,6 +180,7 @@ impl GLESContext for GLES1NativeContext {
                 _gl_lifetime: PhantomData,
                 pending_synthetic_error: std::cell::Cell::new(gles11::NO_ERROR),
                 pvrtc_native: self.pvrtc_native,
+                discard_ext: self.discard_ext,
             });
         }
 
@@ -173,12 +189,15 @@ impl GLESContext for GLES1NativeContext {
         self.is_loaded = true;
         if !self.pvrtc_native_checked {
             self.pvrtc_native = detect_pvrtc_support();
+            self.discard_ext = host_extension_present("GL_EXT_discard_framebuffer");
+            self.discard_ext_checked = true;
             self.pvrtc_native_checked = true;
         }
         Box::new(GLES1Native {
             _gl_lifetime: PhantomData,
             pending_synthetic_error: std::cell::Cell::new(gles11::NO_ERROR),
             pvrtc_native: self.pvrtc_native,
+            discard_ext: self.discard_ext,
         })
     }
 }
@@ -204,6 +223,19 @@ unsafe fn detect_pvrtc_support() -> bool {
         .any(|ext| ext == "GL_IMG_texture_compression_pvrtc")
 }
 
+/// Whether the host ES 1.1 driver exports `glDiscardFramebufferEXT`
+/// (`GL_EXT_discard_framebuffer`). Must be called with a current GL context.
+unsafe fn host_extension_present(name: &str) -> bool {
+    let raw = gles11::GetString(gles11::EXTENSIONS);
+    if raw.is_null() {
+        return false;
+    }
+    let Ok(s) = CStr::from_ptr(raw as *const _).to_str() else {
+        return false;
+    };
+    s.split(' ').any(|ext| ext == name)
+}
+
 pub struct GLES1Native<'gl_ctx> {
     _gl_lifetime: PhantomData<&'gl_ctx ()>,
     /// Synthetic error queue for OpenGL ES 2.0 entry points that are not
@@ -222,10 +254,34 @@ pub struct GLES1Native<'gl_ctx> {
     /// time so the per-call `CompressedTexImage2D` path doesn't have to
     /// re-query `GL_EXTENSIONS`.
     pvrtc_native: bool,
+    /// Mirror of [`GLES1NativeContext::discard_ext`]; copied at make_current
+    /// time so the per-call discard path doesn't have to re-query anything.
+    discard_ext: bool,
 }
 
 impl GLES for GLES1Native<'_> {
     fn is_native_es1(&self) -> bool {
+        true
+    }
+
+    fn discard_ext_supported(&self) -> bool {
+        self.discard_ext
+    }
+
+    unsafe fn DiscardFramebufferEXT(
+        &mut self,
+        target: GLenum,
+        num_attachments: GLsizei,
+        attachments: *const GLenum,
+    ) -> bool {
+        if !self.discard_ext
+            || target != 0x8D40 // GL_FRAMEBUFFER (not in the ES 1.1 registry)
+            || num_attachments <= 0
+            || attachments.is_null()
+        {
+            return false;
+        }
+        gles11::DiscardFramebufferEXT(target, num_attachments, attachments);
         true
     }
     unsafe fn driver_description(&self) -> String {

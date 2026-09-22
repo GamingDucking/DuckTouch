@@ -146,6 +146,18 @@ impl<'a> GLES for LoggingGLES<'a> {
     fn is_gles1_on_gl2(&self) -> bool {
         self.inner.is_gles1_on_gl2()
     }
+    fn discard_ext_supported(&self) -> bool {
+        self.inner.discard_ext_supported()
+    }
+    unsafe fn DiscardFramebufferEXT(
+        &mut self,
+        target: GLenum,
+        num_attachments: GLsizei,
+        attachments: *const GLenum,
+    ) -> bool {
+        self.inner
+            .DiscardFramebufferEXT(target, num_attachments, attachments)
+    }
     unsafe fn driver_description(&self) -> String {
         self.inner.driver_description()
     }
@@ -153,49 +165,49 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn GetError(&mut self) -> GLenum {
         let err = self.inner.GetError();
         if self.verbose {
-            log!("GL Error: {:#x}", err);
+            log_file_only!("GL Error: {:#x}", err);
         }
         err
     }
 
     unsafe fn Clear(&mut self, mask: GLbitfield) {
         if self.verbose {
-            log!("glClear(mask={:#x})", mask);
+            log_file_only!("glClear(mask={:#x})", mask);
         }
         self.inner.Clear(mask);
     }
 
     unsafe fn Viewport(&mut self, x: GLint, y: GLint, width: GLsizei, height: GLsizei) {
         if self.verbose {
-            log!("glViewport({}, {}, {}, {})", x, y, width, height);
+            log_file_only!("glViewport({}, {}, {}, {})", x, y, width, height);
         }
         self.inner.Viewport(x, y, width, height);
     }
 
     unsafe fn DrawArrays(&mut self, mode: GLenum, first: GLint, count: GLsizei) {
         if self.verbose {
-            log!("glDrawArrays(mode={:#x}, first={}, count={})", mode, first, count);
+            log_file_only!("glDrawArrays(mode={:#x}, first={}, count={})", mode, first, count);
         }
         self.inner.DrawArrays(mode, first, count);
     }
 
     unsafe fn DrawElements(&mut self, mode: GLenum, count: GLsizei, type_: GLenum, indices: *const GLvoid) {
         if self.verbose {
-            log!("glDrawElements(mode={:#x}, count={}, type={:#x})", mode, count, type_);
+            log_file_only!("glDrawElements(mode={:#x}, count={}, type={:#x})", mode, count, type_);
         }
         self.inner.DrawElements(mode, count, type_, indices);
     }
 
     unsafe fn BindFramebuffer(&mut self, target: GLenum, framebuffer: GLuint) {
         if self.verbose {
-            log!("glBindFramebuffer(target={:#x}, fb={})", target, framebuffer);
+            log_file_only!("glBindFramebuffer(target={:#x}, fb={})", target, framebuffer);
         }
         self.inner.BindFramebuffer(target, framebuffer);
     }
 
     unsafe fn FramebufferRenderbuffer(&mut self, target: GLenum, attachment: GLenum, renderbuffertarget: GLenum, renderbuffer: GLuint) {
         if self.verbose {
-            log!("glFramebufferRenderbuffer(target={:#x}, attach={:#x}, rb_target={:#x}, rb={})", target, attachment, renderbuffertarget, renderbuffer);
+            log_file_only!("glFramebufferRenderbuffer(target={:#x}, attach={:#x}, rb_target={:#x}, rb={})", target, attachment, renderbuffertarget, renderbuffer);
         }
         self.inner.FramebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer);
     }
@@ -213,14 +225,14 @@ impl<'a> GLES for LoggingGLES<'a> {
         pixels: *const GLvoid,
     ) {
         if self.verbose {
-            log!("glTexImage2D(target={:#x}, level={}, int_fmt={:#x}, size={}x{}, format={:#x}, type={:#x})", target, level, internalformat, width, height, format, type_);
+            log_file_only!("glTexImage2D(target={:#x}, level={}, int_fmt={:#x}, size={}x{}, format={:#x}, type={:#x})", target, level, internalformat, width, height, format, type_);
         }
         self.inner.TexImage2D(target, level, internalformat, width, height, border, format, type_, pixels);
     }
 
     unsafe fn BindTexture(&mut self, target: GLenum, texture: GLuint) {
         if self.verbose {
-            log!("glBindTexture(target={:#x}, tex={})", target, texture);
+            log_file_only!("glBindTexture(target={:#x}, tex={})", target, texture);
         }
         self.inner.BindTexture(target, texture);
     }
@@ -236,28 +248,28 @@ impl<'a> GLES for LoggingGLES<'a> {
         pixels: *mut GLvoid,
     ) {
         if self.verbose {
-            log!("glReadPixels({}, {}, {}, {}, format={:#x}, type={:#x})", x, y, width, height, format, type_);
+            log_file_only!("glReadPixels({}, {}, {}, {}, format={:#x}, type={:#x})", x, y, width, height, format, type_);
         }
         self.inner.ReadPixels(x, y, width, height, format, type_, pixels);
     }
 
     unsafe fn GetIntegerv(&mut self, pname: GLenum, params: *mut GLint) {
         if self.verbose {
-            log!("glGetIntegerv(pname={:#x})", pname);
+            log_file_only!("glGetIntegerv(pname={:#x})", pname);
         }
         self.inner.GetIntegerv(pname, params);
     }
 
     unsafe fn Finish(&mut self) {
         if self.verbose {
-            log!("glFinish()");
+            log_file_only!("glFinish()");
         }
         self.inner.Finish();
     }
 
     unsafe fn Flush(&mut self) {
         if self.verbose {
-            log!("glFlush()");
+            log_file_only!("glFlush()");
         }
         self.inner.Flush();
     }

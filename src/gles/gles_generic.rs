@@ -111,6 +111,34 @@ pub trait GLES {
     fn is_gles1_on_gl2(&self) -> bool {
         false
     }
+    /// Forward the guest's `glDiscardFramebufferEXT` call to the host driver.
+    ///
+    /// `GL_EXT_discard_framebuffer` is a bandwidth hint: the app promises not
+    /// to rely on the contents of the named attachments until they are
+    /// reloaded. Tile-based mobile GPUs (ARM Mali, Qualcomm Adreno, PowerVR)
+    /// can then skip writing tile memory back to system RAM at the end of the
+    /// frame, which is a measurable fragment-bandwidth win — see the
+    /// "External memory bandwidth" / tile write-back sections of ARM's
+    /// Mali-G57 performance counters reference guide.
+    ///
+    /// `attachments` must already be translated to attachment enums the host
+    /// driver accepts (`GL_COLOR_EXT` / `GL_DEPTH_EXT` / `GL_STENCIL_EXT` or
+    /// the equivalent attachment enums). Returns `true` if the host call was
+    /// made, `false` when the backend has no equivalent (callers treat the
+    /// discard as consumed either way — it is only a hint).
+    unsafe fn DiscardFramebufferEXT(
+        &mut self,
+        _target: GLenum,
+        _num_attachments: GLsizei,
+        _attachments: *const GLenum,
+    ) -> bool {
+        false
+    }
+    /// Whether this backend can forward `glDiscardFramebufferEXT` to the
+    /// host driver (host extension support was detected).
+    fn discard_ext_supported(&self) -> bool {
+        false
+    }
     // Generic state manipulation
     unsafe fn GetError(&mut self) -> GLenum {
         unimplemented!("GetError not implemented by this backend")

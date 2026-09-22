@@ -1327,13 +1327,24 @@ fn glResolveMultisampleFramebufferAPPLE(env: &mut Environment) {
 }
 fn glDiscardFramebufferEXT(
     env: &mut Environment,
-    _target: GLenum,
-    _numAttachments: GLsizei,
-    _attachments: ConstPtr<GLenum>,
+    target: GLenum,
+    numAttachments: GLsizei,
+    attachments: ConstPtr<GLenum>,
 ) {
-    with_ctx_and_mem(env, |_gles, _mem| {
-        // GL_EXT_discard_framebuffer is a hint; safe to ignore.
-    })
+    // GL_EXT_discard_framebuffer is a bandwidth hint. On tile-based GPUs
+    // (ARM Mali, Qualcomm Adreno, PowerVR) honouring it lets the driver skip
+    // writing tile memory back to system RAM at the end of the frame. The
+    // guest attachment enums (GL_COLOR_EXT / GL_DEPTH_EXT / GL_STENCIL_EXT)
+    // share their values with the host extension, so forward them unchanged.
+    with_ctx_and_mem(env, |gles, mem| unsafe {
+        let n = numAttachments.max(0) as GuestUSize;
+        let ptr = if n == 0 || attachments.is_null() {
+            std::ptr::null()
+        } else {
+            mem.bytes_at(attachments.cast(), n * 4).as_ptr().cast()
+        };
+        gles.DiscardFramebufferEXT(target, numAttachments, ptr);
+    });
 }
 
 /// `glPushGroupMarkerEXT` — debug marker from `GL_EXT_debug_marker`.
