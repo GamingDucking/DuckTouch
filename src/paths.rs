@@ -209,6 +209,23 @@ pub fn url_for_opening_apps_dir() -> Result<String, String> {
     }
 }
 
+/// Remove the legacy on-disk PVRTC decode cache directory. The PVRTC decode
+/// cache was removed (both the in-memory tier and this on-disk tier) because
+/// decoded RGBA8 entries used a lot of host memory and disk space.
+pub fn remove_legacy_pvrtc_disk_cache() {
+    let dir = user_data_base_path().join("touchHLE_pvrtc_cache");
+    if dir.exists() {
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => log!("Removed legacy PVRTC disk cache directory {}", dir.display()),
+            Err(e) => log!(
+                "Warning: couldn't remove legacy PVRTC disk cache {}: {}",
+                dir.display(),
+                e
+            ),
+        }
+    }
+}
+
 /// Only meaningful on certain OSes: create the user data directory if it
 /// doesn't exist, and populate it with templates or README files. (On other
 /// platforms these are simply bundled with touchHLE in a ZIP file.)
