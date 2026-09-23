@@ -217,6 +217,18 @@ pub struct Options {
     /// command line. Apps that legitimately rely on the ES 1.1 fixed-function
     /// pipeline should NOT enable this flag.
     pub prefer_gles2_context: bool,
+    /// Force EAGL `initWithAPI:` to create an OpenGL ES 1.1 (fixed-function)
+    /// context even when the app requested an OpenGL ES 2.0/3.x context.
+    ///
+    /// The inverse of `--prefer-gles2-context`. Games built on engines that
+    /// support both backends (cocos2d-x 2.x: Geometry Dash, etc.) pick ES 2.0
+    /// whenever context creation succeeds, even though they also ship a fully
+    /// working ES 1.1 fixed-function path. On hosts where the ES 2.0 path
+    /// misrenders, downgrading the context to ES 1.1 makes such engines take
+    /// their ES 1.1 code path instead. Enable with `--force-gles1-context`
+    /// (per-app via the options file) or `TOUCHHLE_FORCE_GLES1_CONTEXT=1`.
+    /// Apps that are ES 2.0-only will fail to create a context with this set.
+    pub force_gles1_context: bool,
     pub network_access: bool,
     pub popup_errors: bool,
     pub dumping_options: DumpingOptions,
@@ -308,6 +320,12 @@ impl Default for Options {
                 .map(|value| value != "0")
                 .unwrap_or(true),
             prefer_gles2_context: false,
+            force_gles1_context: std::env::var("TOUCHHLE_FORCE_GLES1_CONTEXT")
+                .map(|value| {
+                    let value = value.trim();
+                    value != "0" && !value.is_empty()
+                })
+                .unwrap_or(false),
             network_access: false,
             popup_errors: true,
             dumping_options: Default::default(),
@@ -561,6 +579,11 @@ impl Options {
             self.perf_hints = false;
         } else if arg == "--prefer-gles2-context" {
             self.prefer_gles2_context = true;
+        } else if arg == "--force-gles1-context" {
+            self.force_gles1_context = true;
+            // GLES-native backend selection and EAGL both read this env var
+            // (the GLES backend layer has no `Options` access).
+            std::env::set_var("TOUCHHLE_FORCE_GLES1_CONTEXT", "1");
         } else if arg == "--allow-network-access" {
             self.network_access = true;
         } else if arg == "--no-error-popup" {
