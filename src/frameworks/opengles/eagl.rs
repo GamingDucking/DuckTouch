@@ -1517,6 +1517,12 @@ unsafe fn present_renderbuffer_es2(
         if present_finish {
             gles.Finish();
         }
+        // The guest's scissor test clips glCopyTexSubImage2D readouts the
+        // same way it clips the ES 1.1 path's copies (2D engines that keep
+        // scissor enabled at present time produce glitched frames). Save the
+        // enable state, copy with the test disabled, restore.
+        let es2_scissor_was_on = gles.IsEnabled(gles2::SCISSOR_TEST) != 0;
+        gles.Disable(gles2::SCISSOR_TEST);
         gles.ActiveTexture(gles2::TEXTURE0);
         gles.BindTexture(gles2::TEXTURE_2D, present_objects.texture);
         let texture_size = PRESENT_TEXTURE_SIZE.with(|cell| cell.get());
@@ -1544,6 +1550,9 @@ unsafe fn present_renderbuffer_es2(
             width,
             height,
         );
+        if es2_scissor_was_on {
+            gles.Enable(gles2::SCISSOR_TEST);
+        }
         gles.BindFramebuffer(gles2::FRAMEBUFFER, old_framebuffer as _);
         static LOGGED: std::sync::Once = std::sync::Once::new();
         LOGGED.call_once(|| {
@@ -2585,6 +2594,25 @@ unsafe fn present_renderbuffer(
     if finish_before_copy {
         gles.Finish();
     }
+    // A guest that renders 2D UI (level-select lists, HUD panels, ...) very
+    // commonly leaves GL_SCISSOR_TEST enabled at present time — iOS titles
+    // never notice because iOS's own present path ignores scissor when
+    // resolving the drawable. Our CopyTex(Sub)Image2D readout is NOT
+    // ignored: pixels outside the guest's scissor box are never copied, so
+    // every frame would present only the scissored sub-region while the
+    // rest of the texture keeps stale content from older frames (the
+    // "Geometry Dash glitched frame" symptom). Disable the test for the
+    // copy; the generic caps save/restore loop below puts the enable flag
+    // back for the guest after the present quad.
+    let old_scissor_box: [GLint; 4] = get_ints(gles, gles11::SCISSOR_BOX);
+    gles.Disable(gles11::SCISSOR_TEST);
+    // Same story for the pack alignment: glCopyTex(Sub)Image2D reads rows
+    // with GL_PACK_ALIGNMENT, and a guest that uploaded odd-stride data
+    // with a non-default alignment skews every copied row and mangles the
+    // presented image. RGBA8 rows are always 4-byte aligned, so alignment
+    // 1 is always valid here and never changes the image.
+    let old_pack_alignment: GLint = get_int(gles, gles11::PACK_ALIGNMENT);
+    gles.PixelStorei(gles11::PACK_ALIGNMENT, 1);
     if storage_valid {
         // Steady state: copy into the preallocated storage without
         // redefining it.
@@ -2621,6 +2649,17 @@ unsafe fn present_renderbuffer(
             "after Finish + CopyTexImage2D",
         );
     }
+    // Restore the guest's pixel-store state now that the copy is done; the
+    // scissor box is restored too so a guest that reads pixels itself
+    // (screenshots) is unaffected. The scissor TEST stays disabled until
+    // the generic caps restore loop re-enables it after the present quad.
+    gles.PixelStorei(gles11::PACK_ALIGNMENT, old_pack_alignment);
+    gles.Scissor(
+        old_scissor_box[0],
+        old_scissor_box[1],
+        old_scissor_box[2],
+        old_scissor_box[3],
+    );
     // Black-frame detector, part 1: sample the source while the framebuffer
     // we copied from is still bound.
     let probe_source_max = if probe_active {
