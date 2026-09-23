@@ -170,6 +170,7 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         let base_path = paths::user_data_base_path();
         log!("Base path for touchHLE files: {}", base_path.display());
         paths::prepopulate_user_data_dir();
+        paths::remove_legacy_pvrtc_disk_cache();
     }
 
     let _ = args.next().unwrap(); // skip argv[0]
