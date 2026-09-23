@@ -547,14 +547,20 @@ fn app_picker_inner(
         None,
     );
 
-    let quick_options_stuff = setup_quick_options(env, delegate, main_view, app_frame);
+    let mut quick_options_cheat_engine = quick_options_trainer_enabled(&env.options);
+    let quick_options_stuff = setup_quick_options(
+        env,
+        delegate,
+        main_view,
+        app_frame,
+        quick_options_cheat_engine,
+    );
     let mut quick_options_scale_hack: Option<NonZeroU32> = None;
     let mut quick_options_fullscreen: Option<()> = None;
     let mut quick_options_orientation: Option<DeviceOrientation> = None;
     let mut quick_options_analog_stick_tilt_controls = true;
     let mut quick_options_network = false;
     let mut quick_options_show_fps = false;
-    let mut quick_options_cheat_engine = true;
     let mut quick_options_trace_gl_errors = false;
     let mut quick_options_verbose_gles = false;
     let mut quick_options_device_tag: Option<i32> = None;
@@ -876,9 +882,7 @@ fn app_picker_inner(
     if quick_options_network {
         option_args.push("--allow-network-access".to_string());
     }
-    if !quick_options_cheat_engine {
-        option_args.push("--no-trainer".to_string());
-    }
+    option_args.push(quick_options_trainer_argument(quick_options_cheat_engine).to_string());
 
     if quick_options_show_fps {
         // Reuse existing CLI flag to enable FPS logging/counter behaviour.
@@ -1398,6 +1402,7 @@ fn setup_quick_options(
     delegate: id,
     super_view: id,
     app_frame: CGRect,
+    cheat_engine_enabled: bool,
 ) -> QuickOptionsStuff {
     // UIView*
     let main_frame = CGRect {
@@ -1491,7 +1496,7 @@ fn setup_quick_options(
         RowKind::Label("Device model"),
         RowKind::DeviceDropdown,
         RowKind::Label("Cheat Engine"),
-        RowKind::Switch("cheatEngine:", true),
+        RowKind::Switch("cheatEngine:", cheat_engine_enabled),
         RowKind::Label("Network access"),
         RowKind::Switch("network:", false),
         RowKind::Label("Show FPS"),
@@ -1852,4 +1857,40 @@ fn make_device_model_dropdown(
     () = msg![env; menu_view addSubview:down_btn];
 
     (button, menu_view, items, thumb_view)
+}
+
+fn quick_options_trainer_enabled(options: &Options) -> bool {
+    !options.trainer_disabled
+}
+
+fn quick_options_trainer_argument(enabled: bool) -> &'static str {
+    if enabled {
+        "--trainer"
+    } else {
+        "--no-trainer"
+    }
+}
+
+#[cfg(test)]
+mod quick_options_trainer_tests {
+    use super::*;
+
+    #[test]
+    fn trainer_toggle_defaults_off_and_emits_explicit_launch_option() {
+        let mut options = Options::default();
+
+        let mut enabled = quick_options_trainer_enabled(&options);
+        assert!(!enabled);
+        assert_eq!(quick_options_trainer_argument(enabled), "--no-trainer");
+
+        options.parse_argument("--trainer").unwrap();
+        enabled = quick_options_trainer_enabled(&options);
+        assert!(enabled);
+        assert_eq!(quick_options_trainer_argument(enabled), "--trainer");
+
+        options.parse_argument("--no-trainer").unwrap();
+        enabled = quick_options_trainer_enabled(&options);
+        assert!(!enabled);
+        assert_eq!(quick_options_trainer_argument(enabled), "--no-trainer");
+    }
 }

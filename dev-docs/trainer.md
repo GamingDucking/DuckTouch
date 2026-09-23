@@ -3,6 +3,9 @@
 This is HyperHLE's built-in trainer panel, not a connection to the external
 Cheat Engine desktop application. Quick Options calls it `Cheat Engine`, the
 floating button reads `CE`, and `--trainer` / `--no-trainer` remain compatible.
+The Quick Options switch starts off unless `--trainer` was supplied on the
+command line, and always passes an explicit launch flag for its selected state,
+overriding app options.
 
 ## Game speed
 
