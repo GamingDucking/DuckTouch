@@ -187,7 +187,8 @@ impl TrainerUi {
 static UI: Mutex<TrainerUi> = Mutex::new(TrainerUi::new());
 static HARDWARE_ENABLED: AtomicBool = AtomicBool::new(true);
 
-/// Master switch, driven by the `--no-trainer` option.
+/// Master switch. The trainer is disabled by default; `--trainer` opts in
+/// and `--no-trainer` forces it off again.
 pub fn set_hardware_enabled(enabled: bool) {
     HARDWARE_ENABLED.store(enabled, Ordering::SeqCst);
 }

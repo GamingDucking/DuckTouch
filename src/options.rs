@@ -149,7 +149,8 @@ pub struct Options {
     /// `--device-family=auto` (from the host display) or via the explicit
     /// `--screen-size=WxH` override below.
     pub host_screen_size: Option<(u32, u32)>,
-    /// Disable the Cheat Engine-style memory trainer overlay.
+    /// Disable the Cheat Engine-style memory trainer overlay. The trainer
+    /// is off by default; opt in with `--trainer`.
     pub trainer_disabled: bool,
     pub initial_orientation: DeviceOrientation,
     /// iOS version reported to guest applications. `None` uses the latest compatibility version.
@@ -273,7 +274,7 @@ impl Default for Options {
     fn default() -> Self {
         Options {
             fullscreen: false,
-            trainer_disabled: false,
+            trainer_disabled: true,
             device_family: None,
             auto_device_family: false,
             host_screen_size: None,
