@@ -1620,6 +1620,87 @@ fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsize
         }
     })
 }
+
+/// One-shot state dump at the first guest draw call, gated by
+/// `TOUCHHLE_DEBUG_ES2_DRAW`. Helps diagnose "render loop alive but
+/// renderbuffer stays black" situations.
+unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, mem: &Mem) {
+    if !crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") {
+        return;
+    }
+    static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut fbo: GLint = 0;
+    gles.GetIntegerv(0x8CA6 /* GL_FRAMEBUFFER_BINDING */, &mut fbo);
+    let mut program: GLint = 0;
+    gles.GetIntegerv(0x8B8D /* GL_CURRENT_PROGRAM */, &mut program);
+    let mut tex: GLint = 0;
+    gles.GetIntegerv(0x8069 /* GL_TEXTURE_BINDING_2D */, &mut tex);
+    let mut arr_buf: GLint = 0;
+    gles.GetIntegerv(0x8894 /* GL_ARRAY_BUFFER_BINDING */, &mut arr_buf);
+    let mut elem_buf: GLint = 0;
+    gles.GetIntegerv(0x8895 /* GL_ELEMENT_ARRAY_BUFFER_BINDING */, &mut elem_buf);
+    let mut viewport = [0 as GLint; 4];
+    gles.GetIntegerv(0x0BA2 /* GL_VIEWPORT */, viewport.as_mut_ptr());
+    let mut rb: GLint = 0;
+    gles.GetIntegerv(0x8CA7 /* GL_RENDERBUFFER_BINDING */, &mut rb);
+    let status = gles.CheckFramebufferStatus(0x8D40 /* GL_FRAMEBUFFER */);
+    // Drain any error the queries raised so the guest doesn't inherit it.
+    let mut err = gles.GetError();
+    let mut errs = Vec::new();
+    while err != 0 && errs.len() < 4 {
+        errs.push(err);
+        err = gles.GetError();
+    }
+    let mut color_mask = [0u8; 4];
+    gles.GetBooleanv(0x0C23 /* GL_COLOR_WRITEMASK */, color_mask.as_mut_ptr());
+    let states = [0x0BE2, 0x0B71, 0x0B44, 0x0C11, 0x0B90]
+        .map(|cap| gles.IsEnabled(cap) != 0);
+    let mut attribs = Vec::new();
+    for name in ["a_position", "a_texCoord", "a_color"] {
+        let name_c = std::ffi::CString::new(name).unwrap();
+        let loc = gles.GetAttribLocation(program as GLuint, name_c.as_ptr());
+        if loc < 0 { continue; }
+        let i = loc as GLuint;
+        let mut enabled = 0;
+        let mut size = 0;
+        let mut type_ = 0;
+        let mut stride = 0;
+        let mut buffer = 0;
+        let mut ptr: *mut GLvoid = std::ptr::null_mut();
+        gles.GetVertexAttribiv(i, 0x8622, &mut enabled);
+        gles.GetVertexAttribiv(i, 0x8623, &mut size);
+        gles.GetVertexAttribiv(i, 0x8625, &mut type_);
+        gles.GetVertexAttribiv(i, 0x8624, &mut stride);
+        gles.GetVertexAttribiv(i, 0x889F, &mut buffer);
+        gles.GetVertexAttribPointerv(i, 0x8645, &mut ptr);
+        let first = if buffer == 0 && type_ as u32 == 0x1406 && !ptr.is_null() && mem.is_host_ptr_in_guest_mem(ptr) {
+            Some(std::slice::from_raw_parts(ptr.cast::<f32>(), (size as usize).min(4)).to_vec())
+        } else { None };
+        attribs.push((name, loc, enabled, size, type_, stride, buffer, ptr as usize, first));
+    }
+    log!(
+        "ES2 draw state: fbo={} status={:#x} program={} texture={} \
+         array_buf={} elem_buf={} renderbuffer={} viewport={:?} color_mask={:?} states={:?} attribs={:?} \
+         generic_attribs_used={} err={:?}",
+        fbo,
+        status,
+        program,
+        tex,
+        arr_buf,
+        elem_buf,
+        rb,
+        viewport,
+        color_mask,
+        states,
+        attribs,
+        shadow.generic_attribs_used,
+        errs,
+    );
+}
+
 fn glDrawElements(
     env: &mut Environment,
     mode: GLenum,
@@ -1657,6 +1738,7 @@ fn glDrawElements(
         return;
     }
     with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        log_es2_draw_state_once(gles, shadow, mem);
         let disabled_arrays = guard_client_vertex_arrays(gles, mem, shadow);
         let fog_state_backup = clamp_fog_state_values(gles, shadow);
         if crate::env_flag_cached!("TOUCHHLE_POTATO_NATIVE_GLES2_PC_STATE") {
@@ -1677,6 +1759,35 @@ fn glDrawElements(
         let indices =
             translate_pointer_or_offset_to_host(gles, mem, shadow, indices, ELEMENT_ARRAY_BUFFER);
         gles.DrawElements(mode, count, type_, indices);
+        if crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") {
+            static FB_DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !FB_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let mut vp = [0 as GLint; 4];
+                gles.GetIntegerv(0x0BA2 /* GL_VIEWPORT */, vp.as_mut_ptr());
+                if vp[2] > 0 && vp[3] > 0 {
+                    let w = vp[2] as usize;
+                    let h = vp[3] as usize;
+                    let mut pix = vec![0u8; w * h * 4];
+                    gles.ReadPixels(
+                        vp[0],
+                        vp[1],
+                        vp[2],
+                        vp[3],
+                        0x1908, /* GL_RGBA */
+                        0x1401, /* GL_UNSIGNED_BYTE */
+                        pix.as_mut_ptr() as *mut _,
+                    );
+                    dump_rgb_ppm(&pix, w as u32, h as u32, 0x1908, 0x1401, "/tmp/a8run/fb_after_draw.ppm");
+                }
+                let mut err = gles.GetError();
+                let mut errs = Vec::new();
+                while err != 0 && errs.len() < 4 {
+                    errs.push(err);
+                    err = gles.GetError();
+                }
+                log!("[ES2DIAG] post-draw ReadPixels errs={:?}", errs);
+            }
+        }
         restore_fog_state_values(gles, fog_state_backup);
         for index in disabled_arrays {
             gles.EnableVertexAttribArray(index);
@@ -2270,6 +2381,7 @@ fn glTexImage2D(
             }
         }
     }
+    let guest_pixels = pixels;
     let fix_filter = env.options.fix_texture_min_filter && level == 0;
     with_ctx_and_mem(env, |gles, mem| unsafe {
         let pixels = if pixels.is_null() {
@@ -2290,6 +2402,34 @@ fn glTexImage2D(
             type_,
             pixels,
         );
+        if crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") {
+            static TEX_DUMP_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = TEX_DUMP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 8 && !pixels.is_null() && level == 0 {
+                let tex_id = {
+                    let mut t: GLint = 0;
+                    gles.GetIntegerv(0x8069 /* GL_TEXTURE_BINDING_2D */, &mut t);
+                    t
+                };
+                let bytes_pp: usize = match (format, type_) {
+                    (0x1908, 0x1401) => 4, // RGBA UNSIGNED_BYTE
+                    (0x1908, 0x8033) => 2, // RGBA UNSIGNED_SHORT_4_4_4_4
+                    (0x1907, 0x8363) => 2, // RGB UNSIGNED_SHORT_5_6_5
+                    _ => 0,
+                };
+                if bytes_pp > 0 {
+                    let px_count = (width as usize) * (height as usize);
+                    let byte_size = px_count * bytes_pp;
+                    let buf: Vec<u8> = mem
+                        .bytes_at(guest_pixels.cast::<u8>(), byte_size as u32)
+                        .to_vec();
+                    let path = format!(
+                        "/tmp/a8run/tex{}_id{}_{}x{}.ppm", n, tex_id, width, height
+                    );
+                    dump_rgb_ppm(&buf, width as u32, height as u32, format, type_, &path);
+                }
+            }
+        }
         if fix_filter {
             // Set GL_TEXTURE_MIN_FILTER to GL_LINEAR for the bound
             // texture so it isn't sampled as opaque black on strict
@@ -2797,6 +2937,48 @@ fn glIsFramebuffer(env: &mut Environment, framebuffer: GLuint) -> GLboolean {
 fn glIsRenderbuffer(env: &mut Environment, renderbuffer: GLuint) -> GLboolean {
     glIsRenderbufferOES(env, renderbuffer)
 }
+/// Dump raw pixel data (RGB) to a PPM file for diagnosis. Supports the
+/// formats Geometry Dash / cocos2d-x use (RGBA8, RGBA4444, RGB565).
+pub fn dump_rgb_ppm(pix: &[u8], width: u32, height: u32, format: u32, type_: u32, path: &str) {
+    let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+    match (format, type_) {
+        (0x1908, 0x1401) => {
+            for px in pix.chunks_exact(4) {
+                rgb.extend_from_slice(&[px[0], px[1], px[2]]);
+            }
+        }
+        (0x1908, 0x8033) => {
+            for px in pix.chunks_exact(2) {
+                let v = u16::from_be_bytes([px[0], px[1]]);
+                let r = (((v >> 12) & 0xF) * 17) as u8;
+                let g = (((v >> 8) & 0xF) * 17) as u8;
+                let b = (((v >> 4) & 0xF) * 17) as u8;
+                rgb.extend_from_slice(&[r, g, b]);
+            }
+        }
+        (0x1907, 0x8363) => {
+            for px in pix.chunks_exact(2) {
+                let v = u16::from_le_bytes([px[0], px[1]]);
+                let r = (((v >> 11) & 0x1F) * 255 / 31) as u8;
+                let g = (((v >> 5) & 0x3F) * 255 / 63) as u8;
+                let b = ((v & 0x1F) * 255 / 31) as u8;
+                rgb.extend_from_slice(&[r, g, b]);
+            }
+        }
+        _ => {
+            log!("dump_rgb_ppm: unsupported format=0x{:x} type=0x{:x}", format, type_);
+            return;
+        }
+    }
+    let header = format!("P6\n{} {}\n255\n", width, height);
+    let mut out = header.into_bytes();
+    out.extend_from_slice(&rgb);
+    match std::fs::write(path, &out) {
+        Ok(()) => log!("Dumped {}x{} pixels to {}", width, height, path),
+        Err(e) => log!("Failed to dump pixels to {}: {}", path, e),
+    }
+}
+
 fn glBindFramebuffer(env: &mut Environment, target: GLenum, framebuffer: GLuint) {
     glBindFramebufferOES(env, target, framebuffer)
 }
@@ -3080,8 +3262,14 @@ fn glBindAttribLocation(
     index: GLuint,
     name: ConstPtr<GLubyte>,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
         let cstr = read_guest_cstring(mem, name);
+        let name_str = String::from_utf8_lossy(cstr.as_bytes()).into_owned();
+        shadow
+            .guest_bound_attribs
+            .entry(program)
+            .or_default()
+            .insert(name_str);
         gles.BindAttribLocation(program, index, cstr.as_ptr());
     });
 }
@@ -3094,7 +3282,18 @@ fn glGetAttribLocation(env: &mut Environment, program: GLuint, name: ConstPtr<GL
 fn glGetUniformLocation(env: &mut Environment, program: GLuint, name: ConstPtr<GLubyte>) -> GLint {
     with_ctx_and_mem_no_skip(env, |gles, mem| unsafe {
         let cstr = read_guest_cstring(mem, name);
-        gles.GetUniformLocation(program, cstr.as_ptr())
+        let loc = gles.GetUniformLocation(program, cstr.as_ptr());
+        if crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") {
+            static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 64 {
+                log!(
+                    "[ES2DIAG] glGetUniformLocation(program={}, \"{}\") = {}",
+                    program,  String::from_utf8_lossy(cstr.as_bytes()).to_string(), loc
+                );
+            }
+        }
+        loc
     })
 }
 fn glUniformMatrix2fv(
@@ -3133,6 +3332,18 @@ fn glUniformMatrix4fv(
     with_ctx_and_mem(env, |gles, mem| unsafe {
         let n = (count as usize) * 16;
         let ptr = mem.ptr_at(value, n.try_into().unwrap_or(0));
+        if crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") && location >= 0 {
+            static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let seen = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if seen < 8 {
+                let mut m = [0.0_f32; 16];
+                std::ptr::copy_nonoverlapping(ptr, m.as_mut_ptr(), 16);
+                log!(
+                    "[ES2DIAG] glUniformMatrix4fv(loc={}, count={}, transpose={}, m0={:?})",
+                    location, count, transpose, m
+                );
+            }
+        }
         gles.UniformMatrix4fv(location, count, transpose, ptr);
     });
 }
@@ -3140,7 +3351,10 @@ fn glUseProgram(env: &mut Environment, program: GLuint) {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.UseProgram(program) });
 }
 fn glDeleteProgram(env: &mut Environment, program: GLuint) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.DeleteProgram(program) });
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        shadow.guest_bound_attribs.remove(&program);
+        gles.DeleteProgram(program)
+    });
 }
 fn glDeleteShader(env: &mut Environment, shader: GLuint) {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.DeleteShader(shader) });
@@ -3204,8 +3418,16 @@ fn glDetachShader(env: &mut Environment, program: GLuint, shader: GLuint) {
     });
 }
 fn glLinkProgram(env: &mut Environment, program: GLuint) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        if gles.is_es2() {
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        // If the app explicitly bound attribute locations for this program,
+        // respect them: forcing canonical bindings here would override the
+        // app's own vertex layout (on real hardware, app bindings made before
+        // glLinkProgram win, so our injected bindings must not clobber them).
+        let app_bound = shadow
+            .guest_bound_attribs
+            .get(&program)
+            .map_or(false, |names| !names.is_empty());
+        if gles.is_es2() && !app_bound {
             for (index, names) in [
                 (
                     0,
@@ -3223,8 +3445,12 @@ fn glLinkProgram(env: &mut Environment, program: GLuint) {
                     &["normal", "a_normal", "aNormal", "inNormal", "rm_Normal"][..],
                 ),
                 (
+                    1,
+                    &["a_color"][..],
+                ),
+                (
                     2,
-                    &["color", "a_color", "aColor", "inColor", "inVtxColor", "rm_Color"][..],
+                    &["color", "aColor", "inColor", "inVtxColor", "rm_Color", "a_texCoord"][..],
                 ),
                 (
                     3,
@@ -3232,7 +3458,6 @@ fn glLinkProgram(env: &mut Environment, program: GLuint) {
                         "texCoord",
                         "texcoord",
                         "inUV0",
-                        "a_texCoord",
                         "aTexCoord",
                         "inTexCoord",
                         "rm_TexCoord0",
@@ -3696,6 +3921,9 @@ fn glShaderSource(
 
     let cs = std::ffi::CString::new(bytes_vec).unwrap_or_default();
     let ptr = cs.as_ptr();
+    if crate::env_flag_cached!("TOUCHHLE_DUMP_SHADER_SOURCE") {
+        let _ = std::fs::write(format!("/tmp/a8run/shader_{}.glsl", shader), cs.as_bytes());
+    }
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.ShaderSource(shader, 1, &ptr, std::ptr::null());
     });

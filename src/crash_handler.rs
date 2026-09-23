@@ -278,10 +278,10 @@ mod imp {
             msg,
             (0..32)
                 .map(|i| {
-                    let idx = (crate::environment::GUEST_PC_RING_IDX
+                    let oldest_idx = crate::environment::GUEST_PC_RING_IDX
                         .load(Ordering::Relaxed)
-                        .wrapping_sub(1 - i as usize))
                         % 32;
+                    let idx = oldest_idx.wrapping_add(i) % 32;
                     format!(
                         " {:#x}",
                         crate::environment::GUEST_PC_RING[idx].load(Ordering::Relaxed)

@@ -151,6 +151,11 @@ pub(super) struct GLShadowState {
     /// Draw-call guards for generic vertex attributes are skipped entirely
     /// for the (very common) fixed-function-only apps that never use them.
     pub(super) generic_attribs_used: bool,
+    /// Programs for which the guest app explicitly bound attribute locations
+    /// via `glBindAttribLocation` before linking. For these, `glLinkProgram`
+    /// must not force-rebind canonical attribute names, because that would
+    /// override the app's own vertex layout (e.g. Gameloft's Jet engine).
+    pub(super) guest_bound_attribs: HashMap<GLuint, std::collections::HashSet<String>>,
 }
 impl Default for GLShadowState {
     fn default() -> Self {
@@ -162,6 +167,7 @@ impl Default for GLShadowState {
             fog_start: 0.0,
             fog_end: 1.0,
             generic_attribs_used: false,
+            guest_bound_attribs: HashMap::new(),
         }
     }
 }
@@ -200,11 +206,6 @@ pub(super) struct EAGLContextHostObject {
     fps_counter: Option<FpsCounter>,
     next_frame_due: Option<Instant>,
     pub mapped_buffers: HashMap<(GLenum, GLuint), (MutPtr<GLvoid>, *mut GLvoid, usize)>,
-    /// Programs for which the guest app explicitly bound attribute locations
-    /// via `glBindAttribLocation` before linking. For these, `glLinkProgram`
-    /// must not force-rebind canonical attribute names, because that would
-    /// override the app's own vertex layout (e.g. Gameloft's Jet engine).
-    pub guest_bound_attribs: HashMap<GLuint, std::collections::HashSet<String>>,
 }
 impl HostObject for EAGLContextHostObject {}
 
@@ -255,7 +256,6 @@ pub const CLASSES: ClassExports = objc_classes! {
         fps_counter: None,
         next_frame_due: None,
         mapped_buffers: HashMap::new(),
-        guest_bound_attribs: HashMap::new(),
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
@@ -1057,6 +1057,7 @@ pub const CLASSES: ClassExports = objc_classes! {
             }
             return false;
         };
+        dump_readback_ppm(&pixels_vec, width, height);
         present_pixels(env, drawable, pixels_vec, width, height);
 
         // The slow path stores the freshly rendered frame in `presented_pixels`
@@ -1090,6 +1091,42 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 };
 
+/// Dump one renderbuffer readback to a PPM for black-screen diagnosis
+/// (env var gated, as this is a developer-only diagnostic).
+fn dump_readback_ppm(pixels: &[u8], width: u32, height: u32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    if !crate::env_flag_cached!("TOUCHHLE_DUMP_READBACK") {
+        return;
+    }
+    let n = CALLS.fetch_add(1, Ordering::Relaxed);
+    // Dump at several points in the session: the first frame can legitimately
+    // be black (loading screen), so also sample later frames.
+    let targets = [0u32, 60, 300, 600, 1200, 2400];
+    let Some(idx) = targets.iter().position(|&t| t == n) else {
+        return;
+    };
+    let header = format!("P6\n{} {}\n255\n", width, height);
+    let mut out = header.into_bytes();
+    let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+    for px in pixels.chunks_exact(4) {
+        // read_renderbuffer gives RGBA8; PPM wants RGB.
+        rgb.extend_from_slice(&[px[0], px[1], px[2]]);
+    }
+    out.extend_from_slice(&rgb);
+    let path = format!("/tmp/a8run/readback_f{}.ppm", targets[idx]);
+    match std::fs::write(&path, &out) {
+        Ok(()) => log!(
+            "Dumped renderbuffer readback #{} ({}x{}) to {}",
+            n,
+            width,
+            height,
+            path
+        ),
+        Err(e) => log!("Failed to dump readback to {}: {}", path, e),
+    }
+}
+
 unsafe fn present_renderbuffer_readback(env: &mut Environment, renderbuffer: GLuint, drawable: id) {
     // PERF: recycle the layer's previous pixel buffer instead of allocating
     // (and page-faulting in) a fresh multi-megabyte Vec every frame.
@@ -1110,34 +1147,7 @@ unsafe fn present_renderbuffer_readback(env: &mut Environment, renderbuffer: GLu
         log!("Native ES1 readback skipped because the GL context disappeared.");
         return;
     };
-    // Dump the first readback to a PPM for black-screen diagnosis (env var
-    // gated, as this is a developer-only diagnostic).
-    {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static DUMPED: AtomicBool = AtomicBool::new(false);
-        if crate::env_flag_cached!("TOUCHHLE_DUMP_READBACK")
-            && !DUMPED.swap(true, Ordering::Relaxed)
-        {
-            let path = "/tmp/a8run/readback.ppm";
-            let header = format!("P6\n{} {}\n255\n", width, height);
-            let mut out = header.into_bytes();
-            let mut rgb = Vec::with_capacity((width * height * 3) as usize);
-            for px in pixels.chunks_exact(4) {
-                // read_renderbuffer gives RGBA8; PPM wants RGB.
-                rgb.extend_from_slice(&[px[0], px[1], px[2]]);
-            }
-            out.extend_from_slice(&rgb);
-            match std::fs::write(path, &out) {
-                Ok(()) => log!(
-                    "Dumped first renderbuffer readback ({}x{}) to {}",
-                    width,
-                    height,
-                    path
-                ),
-                Err(e) => log!("Failed to dump readback to {}: {}", path, e),
-            }
-        }
-    }
+    dump_readback_ppm(&pixels, width, height);
     present_pixels(env, drawable, pixels, width, height);
     let force_composition = env.options.force_composition;
     env.options.force_composition = true;
