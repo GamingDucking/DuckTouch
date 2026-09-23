@@ -2087,7 +2087,6 @@ impl Environment {
             if matches!(error, cpu::CpuError::UndefinedInstruction) {
                 let pc = self.cpu.regs()[cpu::Cpu::PC];
                 let lr = self.cpu.regs()[cpu::Cpu::LR];
-
                 // Potato Story Android hard fallback:
                 //
                 // The generic decoder did not match on-device, but Android
