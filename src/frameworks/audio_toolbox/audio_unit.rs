@@ -584,7 +584,8 @@ fn write_if_nonnull<T: crate::mem::SafeWrite>(env: &mut Environment, ptr: MutPtr
 /// Возвращает автоназначенный объект: словарь при вставке сделает retain.
 fn ns_number_from_i32(env: &mut Environment, value: i32) -> id {
     let num: id = msg_class![env; NSNumber alloc];
-    autorelease(env, msg![env; num initWithInt:value])
+    let num = msg![env; num initWithInt:value];
+    autorelease(env, num)
 }
 
 fn AudioUnitGetProperty(
@@ -620,11 +621,14 @@ fn AudioUnitGetProperty(
         // NSDictionary требует полного &mut env.
         let (ctype, csub, cman) = component_desc.unwrap_or((0, 0, 0));
         if !out_data.is_null() {
-            let key_type = autorelease(env, ns_string::from_rust_string(env, "type".to_string()));
-            let key_subtype =
-                autorelease(env, ns_string::from_rust_string(env, "subtype".to_string()));
-            let key_manufacturer =
-                autorelease(env, ns_string::from_rust_string(env, "manufacturer".to_string()));
+            // Вложенные вызовы с &mut Environment запрещены — сначала
+            // создаём объект, затем отдельно отдаём его в autorelease.
+            let key_type = ns_string::from_rust_string(env, "type".to_string());
+            let key_type = autorelease(env, key_type);
+            let key_subtype = ns_string::from_rust_string(env, "subtype".to_string());
+            let key_subtype = autorelease(env, key_subtype);
+            let key_manufacturer = ns_string::from_rust_string(env, "manufacturer".to_string());
+            let key_manufacturer = autorelease(env, key_manufacturer);
             let val_type = ns_number_from_i32(env, ctype as i32);
             let val_subtype = ns_number_from_i32(env, csub as i32);
             let val_manufacturer = ns_number_from_i32(env, cman as i32);
