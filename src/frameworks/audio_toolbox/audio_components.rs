@@ -89,6 +89,11 @@ pub struct State {
     pub audio_component: AudioComponent,
     pub audio_component_instances:
         HashMap<AudioComponentInstance, AudioComponentInstanceHostObject>,
+    /// Описание (type, subtype, manufacturer) последнего компонента,
+    /// найденного `AudioComponentFindNext`. Используется, чтобы заполнить
+    /// `AudioComponentInstanceHostObject::component_desc` при создании
+    /// инстанса — для ответов на `kAudioUnitProperty_ClassInfo`.
+    pub pending_component_desc: Option<(u32, u32, u32)>,
 }
 impl State {
     pub fn get(framework_state: &mut crate::frameworks::State) -> &mut Self {
@@ -121,6 +126,21 @@ pub struct AudioComponentInstanceHostObject {
     /// being used to capture microphone audio. Filled by
     /// `AudioUnitRender` with real host-mic samples when available.
     pub mic_input_enabled: bool,
+
+    /// Описание компонента (type, subtype, manufacturer), с которым был
+    /// создан инстанс (из `AudioComponentFindNext` или узла AUGraph).
+    /// Нужно для `kAudioUnitProperty_ClassInfo` — гость идентифицирует юнит
+    /// через CFDictionary с этими значениями.
+    pub component_desc: Option<(u32, u32, u32)>,
+
+    /// Сырые байты `kAudioUnitProperty_AudioChannelLayout`, записанные
+    /// гостем через `AudioUnitSetProperty`, ключ — (scope, element).
+    /// Возвращаются обратно через `AudioUnitGetProperty`.
+    pub audio_channel_layouts: HashMap<(u32, u32), Vec<u8>>,
+
+    /// Флаги `kAudioUnitProperty_ShouldAllocateBuffer` (property 51),
+    /// ключ — (scope, element); GET без SET отвечает 1 (как раньше).
+    pub should_allocate_buffers: HashMap<(u32, u32), u32>,
 }
 
 impl Default for AudioComponentInstanceHostObject {
@@ -152,6 +172,9 @@ impl Default for AudioComponentInstanceHostObject {
             is_3d_mixer: false,
             mixer_buses: HashMap::new(),
             mic_input_enabled: false,
+            component_desc: None,
+            audio_channel_layouts: HashMap::new(),
+            should_allocate_buffers: HashMap::new(),
         }
     }
 }
@@ -246,6 +269,7 @@ fn AudioComponentFindNext(
         comp_manufacturer,
         state.audio_component
     );
+    state.pending_component_desc = Some((comp_type, comp_sub_type, comp_manufacturer));
     state.audio_component
 }
 
@@ -260,6 +284,10 @@ fn AudioComponentInstanceNew(
 
     let mut host_object = AudioComponentInstanceHostObject::default();
     host_object.is_3d_mixer = true;
+    // Описание компонента, запомненное последним AudioComponentFindNext
+    // (см. State::pending_component_desc) — для kAudioUnitProperty_ClassInfo.
+    host_object.component_desc =
+        State::get(&mut env.framework_state).pending_component_desc;
 
     let guest_instance: AudioComponentInstance = env
         .mem
@@ -282,9 +310,15 @@ fn AudioComponentInstanceNew(
 /// Создать AudioUnit instance напрямую (используется из
 //`au_graph::AUGraphOpen`),
 /// минуя обычный путь `AudioComponentInstanceNew`.
-pub fn create_audio_unit_instance(env: &mut Environment) -> AudioComponentInstance {
+/// `component_desc` — (type, subtype, manufacturer) узла графа, если известны
+/// (иначе None; тогда ClassInfo вернёт нулевые значения).
+pub fn create_audio_unit_instance(
+    env: &mut Environment,
+    component_desc: Option<(u32, u32, u32)>,
+) -> AudioComponentInstance {
     let mut host_object = AudioComponentInstanceHostObject::default();
     host_object.is_3d_mixer = true;
+    host_object.component_desc = component_desc;
     let guest_instance: AudioComponentInstance = env
         .mem
         .alloc_and_write(OpaqueAudioComponentInstance { _pad: 0 });

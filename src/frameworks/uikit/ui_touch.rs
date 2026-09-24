@@ -212,10 +212,19 @@ fn touchhle_cocos_is_gl_or_game_view_name(class_name: &str) -> bool {
 fn touchhle_should_use_landscape_touch_remap(env: &Environment) -> bool {
     match env.bundle.bundle_identifier() {
         // Confirmed landscape Source/Cocos games.
+        //
+        // NOTE: com.robtop.geometryjump (Geometry Dash) is deliberately NOT in
+        // this list. GD mounts its cocos2d-x EAGLView as a UIViewController's
+        // view, so UIWindow's landscape autorotation transform makes
+        // -locationInView: already return coordinates in the game's landscape
+        // (480x320) space, aligned with what is on screen. Applying the
+        // portrait->landscape cocos remap on top of that rotated the
+        // already-correct point a second time (a squash-rotated 90° map), so
+        // taps landed on the wrong UI elements: pressing high opened the
+        // settings, pressing low opened the level menu.
         "at.source.veggie1"
         | "at.source.potato3D"
-        | "at.source.potpan"
-        | "com.robtop.geometryjump" => true,
+        | "at.source.potpan" => true,
 
         // TomatoZombie is native portrait.
         "at.source.tomzom" => false,
@@ -272,8 +281,7 @@ fn touchhle_cocos_remap_point(env: &mut Environment, view: id, point: CGPoint) -
         match env.bundle.bundle_identifier() {
             "at.source.veggie1"
             | "at.source.potato3D"
-            | "at.source.potpan"
-            | "com.robtop.geometryjump" => "scale".to_string(),
+            | "at.source.potpan" => "scale".to_string(),
             _ => crate::env_var_cached!("TOUCHHLE_COCOS_TOUCH_MODE")
                 .or(crate::env_var_cached!("TOUCHHLE_UNITY_TOUCH_MODE"))
                 .or(crate::env_var_cached!("TOUCHHLE_ENGINE_TOUCH_MODE"))

@@ -25,9 +25,11 @@ use crate::frameworks::audio_toolbox::audio_queue::log_if_broken_audio_format;
 use crate::frameworks::carbon_core::{paramErr, OSStatus};
 use crate::frameworks::core_audio_types::{fourcc, AudioStreamBasicDescription};
 use crate::frameworks::core_foundation::cf_run_loop::CFRunLoopGetMain;
+use crate::frameworks::foundation::ns_dictionary::dict_from_keys_and_objects;
 use crate::frameworks::foundation::ns_run_loop;
+use crate::frameworks::foundation::ns_string;
 use crate::mem::{guest_size_of, ConstVoidPtr, MutPtr, MutVoidPtr, SafeRead};
-use crate::objc::nil;
+use crate::objc::{autorelease, id, msg, msg_class, nil};
 
 use super::audio_components::{AURenderCallbackStruct, AudioComponentInstance};
 use super::audio_queue::decode_buffer;
@@ -243,10 +245,53 @@ fn AudioUnitRemovePropertyListener(
     in_unit: AudioUnit,
     in_id: AudioUnitPropertyID,
     in_proc: AudioUnitPropertyListenerProc,
+) -> OSStatus {
+    log_dbg!(
+        "AudioUnitRemovePropertyListener(unit={:?}, property={}, proc={:?})",
+        in_unit,
+        in_id,
+        in_proc
+    );
+
+    if in_unit.is_null() {
+        return paramErr;
+    }
+
+    let Some(host_object) = audio_components::State::get(&mut env.framework_state)
+        .audio_component_instances
+        .get_mut(&in_unit)
+    else {
+        return paramErr;
+    };
+
+    // Нативный API (без userData) удаляет первую регистрацию, совпавшую по
+    // (property, proc). Удаляется только одно совпадение: один и тот же
+    // колбэк может быть зарегистрирован несколько раз.
+    if let Some(index) = host_object
+        .property_listeners
+        .iter()
+        .position(|&(property_id, callback, _)| property_id == in_id && callback == in_proc)
+    {
+        host_object.property_listeners.remove(index);
+    }
+
+    0
+}
+
+/// `AudioUnitRemovePropertyListenerWithUserData` — как
+/// `AudioUnitRemovePropertyListener`, но регистрация считается своей только
+/// при полном совпадении (property, proc, userData), как при
+/// `AudioUnitAddPropertyListener`.
+fn AudioUnitRemovePropertyListenerWithUserData(
+    env: &mut Environment,
+    in_unit: AudioUnit,
+    in_id: AudioUnitPropertyID,
+    in_proc: AudioUnitPropertyListenerProc,
     in_proc_ref_con: MutVoidPtr,
 ) -> OSStatus {
     log_dbg!(
-        "AudioUnitRemovePropertyListener(unit={:?}, property={}, proc={:?}, ref_con={:?})",
+        "AudioUnitRemovePropertyListenerWithUserData(unit={:?}, property={}, proc={:?}, \
+         ref_con={:?})",
         in_unit,
         in_id,
         in_proc,
@@ -264,8 +309,7 @@ fn AudioUnitRemovePropertyListener(
         return paramErr;
     };
 
-    // Remove only one matching registration, preserving the behaviour of the
-    // native API when the same callback is registered more than once.
+    // Удаляется только одно полное совпадение (см. AudioUnitAddPropertyListener).
     if let Some(index) = host_object
         .property_listeners
         .iter()
@@ -513,6 +557,35 @@ fn AudioUnitSetProperty(
                 // Output / Global element counts are accepted silently —
                 // there is nothing extra to initialise on our side.
             }
+            kAudioUnitProperty_AudioChannelLayout => {
+                // Сохраняем сырые байты макета каналов (например,
+                // 32-байтовый layout с одним AudioChannelDescription) —
+                // возвращаем их затем через AudioUnitGetProperty.
+                if !in_data.is_null() && in_data_size > 0 {
+                    let bytes = env
+                        .mem
+                        .bytes_at(in_data.cast(), in_data_size)
+                        .to_vec();
+                    host_object
+                        .audio_channel_layouts
+                        .insert((in_scope, in_element), bytes);
+                } else {
+                    host_object
+                        .audio_channel_layouts
+                        .remove(&(in_scope, in_element));
+                }
+            }
+            kAudioUnitProperty_ShouldAllocateBuffer => {
+                // kAudioUnitProperty_ShouldAllocateBuffer (51): UInt32-флаг
+                // на (scope, element) — хост просит/не просит, чтобы юнит
+                // сам выделял буферы. Запоминаем, чтобы GET вернул то же.
+                if !in_data.is_null() && in_data_size >= guest_size_of::<u32>() {
+                    let flag: u32 = env.mem.read::<u32, false>(in_data.cast());
+                    host_object
+                        .should_allocate_buffers
+                        .insert((in_scope, in_element), flag);
+                }
+            }
             _ => {
                 log!(
                     "AudioUnitSetProperty: UNHANDLED property {} \
@@ -560,6 +633,14 @@ fn write_if_nonnull<T: crate::mem::SafeWrite>(env: &mut Environment, ptr: MutPtr
     }
 }
 
+/// NSNumber (int32) для построения CFDictionary вроде kAudioUnitProperty_ClassInfo.
+/// Возвращает автоназначенный объект: словарь при вставке сделает retain.
+fn ns_number_from_i32(env: &mut Environment, value: i32) -> id {
+    let num: id = msg_class![env; NSNumber alloc];
+    let num = msg![env; num initWithInt:value];
+    autorelease(env, num)
+}
+
 fn AudioUnitGetProperty(
     env: &mut Environment,
     in_unit: AudioUnit,
@@ -576,6 +657,48 @@ fn AudioUnitGetProperty(
         in_scope,
         in_element
     );
+    // Описание компонента (type, subtype, manufacturer) инстанса. Нужно для
+    // kAudioUnitProperty_ClassInfo; при отсутствии инстанса — как и раньше,
+    // сразу возвращаем paramErr.
+    let component_desc = {
+        let state = audio_components::State::get(&mut env.framework_state);
+        match state.audio_component_instances.get(&in_unit) {
+            Some(host) => host.component_desc,
+            None => return paramErr,
+        }
+    };
+    if in_id == kAudioUnitProperty_ClassInfo {
+        // Возвращаем CFDictionaryRef (правило Create — гость сам вызывает
+        // CFRelease): словарь-идентификатор юнита, как в AUPreset'е.
+        // Обрабатываем до заимствования host_object, т.к. построение
+        // NSDictionary требует полного &mut env.
+        let (ctype, csub, cman) = component_desc.unwrap_or((0, 0, 0));
+        if !out_data.is_null() {
+            // Вложенные вызовы с &mut Environment запрещены — сначала
+            // создаём объект, затем отдельно отдаём его в autorelease.
+            let key_type = ns_string::from_rust_string(env, "type".to_string());
+            let key_type = autorelease(env, key_type);
+            let key_subtype = ns_string::from_rust_string(env, "subtype".to_string());
+            let key_subtype = autorelease(env, key_subtype);
+            let key_manufacturer = ns_string::from_rust_string(env, "manufacturer".to_string());
+            let key_manufacturer = autorelease(env, key_manufacturer);
+            let val_type = ns_number_from_i32(env, ctype as i32);
+            let val_subtype = ns_number_from_i32(env, csub as i32);
+            let val_manufacturer = ns_number_from_i32(env, cman as i32);
+            let dict = dict_from_keys_and_objects(
+                env,
+                &[
+                    (key_type, val_type),
+                    (key_subtype, val_subtype),
+                    (key_manufacturer, val_manufacturer),
+                ],
+            );
+            write_if_nonnull(env, out_data.cast(), dict);
+        }
+        write_if_nonnull(env, io_data_size, guest_size_of::<MutVoidPtr>());
+        return 0;
+    }
+
     let Some(host_object) = audio_components::State::get(&mut env.framework_state)
         .audio_component_instances
         .get_mut(&in_unit)
@@ -644,8 +767,16 @@ fn AudioUnitGetProperty(
             write_if_nonnull(env, out_data.cast(), 0u32);
             write_if_nonnull(env, io_data_size, guest_size_of::<u32>());
         }
-        kAudioUnitProperty_ShouldAllocateBuffer
-        | kAudioUnitProperty_InPlaceProcessing
+        kAudioUnitProperty_ShouldAllocateBuffer => {
+            let flag = host_object
+                .should_allocate_buffers
+                .get(&(in_scope, in_element))
+                .copied()
+                .unwrap_or(1);
+            write_if_nonnull(env, out_data.cast(), flag);
+            write_if_nonnull(env, io_data_size, guest_size_of::<u32>());
+        }
+        kAudioUnitProperty_InPlaceProcessing
         | kAudioUnitProperty_BypassEffect => {
             // Булевые свойства — возвращаем 1 (да/включено) как заглушку.
             write_if_nonnull(env, out_data.cast(), 1u32);
@@ -655,6 +786,28 @@ fn AudioUnitGetProperty(
             // IO активен по умолчанию.
             write_if_nonnull(env, out_data.cast(), 1u32);
             write_if_nonnull(env, io_data_size, guest_size_of::<u32>());
+        }
+        kAudioUnitProperty_AudioChannelLayout => {
+            // Ранее записанные через SetProperty сырые байты, либо дефолтный
+            // 12-байтовый заголовок (mChannelLayoutTag=0 → UseChannelDescriptions).
+            let default_layout = [0u8; 12];
+            let bytes: &[u8] = host_object
+                .audio_channel_layouts
+                .get(&(in_scope, in_element))
+                .map(Vec::as_slice)
+                .unwrap_or(&default_layout);
+            let full_len = bytes.len() as u32;
+            if !out_data.is_null() {
+                let capacity = if io_data_size.is_null() {
+                    full_len
+                } else {
+                    env.mem.read::<u32, true>(io_data_size)
+                };
+                let copy_len = std::cmp::min(full_len, capacity) as usize;
+                let dst = env.mem.bytes_at_mut(out_data.cast(), copy_len as u32);
+                dst.copy_from_slice(&bytes[..copy_len]);
+            }
+            write_if_nonnull(env, io_data_size, full_len);
         }
         _ => {
             log!(
@@ -675,13 +828,21 @@ fn AudioUnitGetProperty(
 
 fn AudioUnitGetPropertyInfo(
     env: &mut Environment,
-    _in_unit: AudioUnit,
+    in_unit: AudioUnit,
     in_id: AudioUnitPropertyID,
-    _in_scope: AudioUnitScope,
-    _in_element: AudioUnitElement,
+    in_scope: AudioUnitScope,
+    in_element: AudioUnitElement,
     out_data_size: MutPtr<u32>,
     out_writable: MutPtr<bool>,
 ) -> OSStatus {
+    // Размер ранее записанного макета каналов (или дефолтные 12 байт).
+    let channel_layout_size = audio_components::State::get(&mut env.framework_state)
+        .audio_component_instances
+        .get(&in_unit)
+        .and_then(|h| h.audio_channel_layouts.get(&(in_scope, in_element)))
+        .map(|bytes| bytes.len() as u32)
+        .unwrap_or(12);
+
     let (size, writable) = match in_id {
         kAudioUnitProperty_StreamFormat => (guest_size_of::<AudioStreamBasicDescription>(), true),
         kAudioUnitProperty_SampleRate => (guest_size_of::<f64>(), true),
@@ -694,6 +855,8 @@ fn AudioUnitGetPropertyInfo(
         kAudioUnitProperty_ShouldAllocateBuffer
         | kAudioUnitProperty_InPlaceProcessing
         | kAudioUnitProperty_BypassEffect => (guest_size_of::<u32>(), true),
+        kAudioUnitProperty_ClassInfo => (guest_size_of::<MutVoidPtr>(), false),
+        kAudioUnitProperty_AudioChannelLayout => (channel_layout_size, true),
         _ => {
             log_dbg!("AudioUnitGetPropertyInfo: unknown property {}", in_id);
             return -1;
@@ -1772,7 +1935,8 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(AudioUnitInitialize(_)),
     export_c_func!(AudioUnitUninitialize(_)),
     export_c_func!(AudioUnitAddPropertyListener(_, _, _, _)),
-    export_c_func!(AudioUnitRemovePropertyListener(_, _, _, _)),
+    export_c_func!(AudioUnitRemovePropertyListener(_, _, _)),
+    export_c_func!(AudioUnitRemovePropertyListenerWithUserData(_, _, _, _)),
     export_c_func!(AudioUnitSetProperty(_, _, _, _, _, _)),
     export_c_func!(AudioUnitGetProperty(_, _, _, _, _, _)),
     export_c_func!(AudioUnitGetPropertyInfo(_, _, _, _, _, _)),
