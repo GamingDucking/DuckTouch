@@ -458,7 +458,9 @@ fn validate_segment_file_range(
     if filesize == 0 {
         return Ok(());
     }
-    let end = fileoff.checked_add(filesize).ok_or("Mach-O segment file range overflows")?;
+    let end = fileoff
+        .checked_add(filesize)
+        .ok_or("Mach-O segment file range overflows")?;
     if end > file_len as u64 {
         return Err("Mach-O segment extends past end of file; executable is truncated or malformed (check the IPA)");
     }
@@ -467,15 +469,22 @@ fn validate_segment_file_range(
 
 fn validate_segment_ranges(commands: &[MachCommand], file_len: usize) -> Result<(), &'static str> {
     for MachCommand(command, _) in commands {
-        if let LoadCommand::Segment { segname, fileoff, filesize, vmsize, .. } = command {
+        if let LoadCommand::Segment {
+            segname,
+            fileoff,
+            filesize,
+            vmsize,
+            ..
+        } = command
+        {
             // mach_object exposes these fields as usize. Use checked
             // conversions: usize does not implement Into<u64> in Rust.
-            let offset = u64::try_from(*fileoff)
-                .map_err(|_| "Segment file offset does not fit u64")?;
-            let size = u64::try_from(*filesize)
-                .map_err(|_| "Segment file size does not fit u64")?;
-            let virtual_size = u64::try_from(*vmsize)
-                .map_err(|_| "Segment virtual size does not fit u64")?;
+            let offset =
+                u64::try_from(*fileoff).map_err(|_| "Segment file offset does not fit u64")?;
+            let size =
+                u64::try_from(*filesize).map_err(|_| "Segment file size does not fit u64")?;
+            let virtual_size =
+                u64::try_from(*vmsize).map_err(|_| "Segment virtual size does not fit u64")?;
             if let Err(error) = validate_segment_file_range(offset, size, virtual_size, file_len) {
                 log!("Rejecting Mach-O: segment {} fileoff={:#x} filesize={:#x} vmsize={:#x}, file length={:#x}: {}",
                     segname, fileoff, filesize, vmsize, file_len, error);
@@ -513,7 +522,10 @@ impl MachO {
                         continue;
                     }
                     let Some(priority) = arm_subtype_priority(arch.cpusubtype) else {
-                        log!("Skipping unsupported ARM FAT subtype {:#x}", arch.cpusubtype);
+                        log!(
+                            "Skipping unsupported ARM FAT subtype {:#x}",
+                            arch.cpusubtype
+                        );
                         had_invalid_slice = true;
                         continue;
                     };
@@ -559,7 +571,11 @@ impl MachO {
                         _ => false,
                     };
                     if !usable {
-                        log!("Skipping invalid ARM FAT slice at {:#x} (subtype {:#x})", off, arch.cpusubtype);
+                        log!(
+                            "Skipping invalid ARM FAT slice at {:#x} (subtype {:#x})",
+                            off,
+                            arch.cpusubtype
+                        );
                         had_invalid_slice = true;
                         continue;
                     }
@@ -594,7 +610,11 @@ impl MachO {
             return Err("Executable is not 32-bit!");
         }
         if arm_subtype_priority(header.cpusubtype).is_none() {
-            log!("Rejecting {:?}: unsupported ARM CPU subtype {:#x}", name, header.cpusubtype);
+            log!(
+                "Rejecting {:?}: unsupported ARM CPU subtype {:#x}",
+                name,
+                header.cpusubtype
+            );
             return Err("Unsupported ARM CPU subtype or capabilities (expected ARM_ALL, ARMv6, ARMv7, ARMv7f or ARMv7s)");
         }
 
@@ -735,9 +755,8 @@ impl MachO {
                                 .checked_add(filesize_usize)
                                 .ok_or("Segment file range overflows host usize")?;
                             let src = &bytes[fileoff..file_end];
-                            let dst = into_mem.bytes_at_mut(
-                                Ptr::from_bits(vmaddr + slide), filesize,
-                            );
+                            let dst =
+                                into_mem.bytes_at_mut(Ptr::from_bits(vmaddr + slide), filesize);
                             dst.copy_from_slice(src);
                         }
                     }
@@ -1304,8 +1323,14 @@ mod segment_validation_tests {
         let mut mem = Mem::new();
         let image = MachO::load_from_bytes(&bytes, &mut mem, "fat-test".into(), 0).unwrap();
         assert_eq!(image.text_base, 0x9000);
-        assert_eq!(mem.bytes_at(Ptr::from_bits(0x9000), 84), &valid[..]);
-        assert!(mem.bytes_at(Ptr::from_bits(0x9000 + 84), 16).iter().all(|&b| b == 0));
+        assert_eq!(
+            mem.bytes_at(Ptr::<u8, false>::from_bits(0x9000), 84),
+            &valid[..]
+        );
+        assert!(mem
+            .bytes_at(Ptr::<u8, false>::from_bits(0x9000 + 84), 16)
+            .iter()
+            .all(|&b| b == 0));
     }
 
     #[test]
@@ -1313,11 +1338,24 @@ mod segment_validation_tests {
         for subtype in [0, 6, 9, 10, 11] {
             assert!(arm_subtype_priority(subtype).is_some());
         }
-        for subtype in [5u32, 7, 8, 12, 13, 14, 0x1234, 0x8000_0009, 0x0100_0006, u32::MAX] {
+        for subtype in [
+            5u32,
+            7,
+            8,
+            12,
+            13,
+            14,
+            0x1234,
+            0x8000_0009,
+            0x0100_0006,
+            u32::MAX,
+        ] {
             assert!(arm_subtype_priority(subtype as cpu_subtype_t).is_none());
         }
-        let priorities: Vec<_> = [0, 6, 10, 11, 9].into_iter()
-            .map(|s| arm_subtype_priority(s).unwrap()).collect();
+        let priorities: Vec<_> = [0, 6, 10, 11, 9]
+            .into_iter()
+            .map(|s| arm_subtype_priority(s).unwrap())
+            .collect();
         assert!(priorities.windows(2).all(|p| p[0] < p[1]));
     }
 
@@ -1334,7 +1372,20 @@ mod segment_validation_tests {
     fn fat_pair(first_type: u32, first: &[u8], second_type: u32, second: &[u8]) -> Vec<u8> {
         assert_eq!((first.len(), second.len()), (84, 84));
         let mut bytes = Vec::new();
-        for word in [0xcafebabeu32, 2, 12, first_type, 48, 84, 0, 12, second_type, 132, 84, 0] {
+        for word in [
+            0xcafebabeu32,
+            2,
+            12,
+            first_type,
+            48,
+            84,
+            0,
+            12,
+            second_type,
+            132,
+            84,
+            0,
+        ] {
             bytes.extend_from_slice(&word.to_be_bytes());
         }
         bytes.extend_from_slice(first);
@@ -1345,8 +1396,12 @@ mod segment_validation_tests {
     #[test]
     fn fat_loader_skips_unsupported_and_mismatched_subtypes() {
         for (table_subtype, header_subtype) in [(12, 12), (9, 6), (9, 13)] {
-            let bytes = fat_pair(table_subtype, &thin(header_subtype, 0x1000, 84),
-                6, &thin(6, 0x9000, 84));
+            let bytes = fat_pair(
+                table_subtype,
+                &thin(header_subtype, 0x1000, 84),
+                6,
+                &thin(6, 0x9000, 84),
+            );
             let mut mem = Mem::new();
             let image = MachO::load_from_bytes(&bytes, &mut mem, "subtypes".into(), 0).unwrap();
             assert_eq!(image.text_base, 0x9000);
@@ -1358,7 +1413,11 @@ mod segment_validation_tests {
         for reverse in [false, true] {
             let v6 = thin(6, 0x1000, 84);
             let v7 = thin(9, 0x9000, 84);
-            let bytes = if reverse { fat_pair(9, &v7, 6, &v6) } else { fat_pair(6, &v6, 9, &v7) };
+            let bytes = if reverse {
+                fat_pair(9, &v7, 6, &v6)
+            } else {
+                fat_pair(6, &v6, 9, &v7)
+            };
             let mut mem = Mem::new();
             let image = MachO::load_from_bytes(&bytes, &mut mem, "preference".into(), 0).unwrap();
             assert_eq!(image.text_base, 0x9000);
@@ -1372,7 +1431,6 @@ mod segment_validation_tests {
         assert!(MachO::load_from_bytes(&bytes, &mut mem, "unsupported-fat".into(), 0).is_err());
     }
 
-
     #[test]
     fn thin_loader_accepts_supported_cpu_subtypes() {
         for subtype in [0, 6, 9, 10, 11] {
@@ -1382,5 +1440,4 @@ mod segment_validation_tests {
             assert_eq!(image.text_base, 0x9000);
         }
     }
-
 }

@@ -432,6 +432,7 @@ impl std::io::Seek for IpaFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fs::FileLocation;
     use std::io::{Read, Write};
 
     /// Regression test: IPAs with entries whose local file header is corrupt
@@ -493,8 +494,8 @@ mod tests {
 
         let file = std::fs::File::create(&ipa_path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
-        let options = zip::write::FileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
+        let options =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
         zip.start_file("Payload/TestApp.app/Info.plist", options)
             .unwrap();
         zip.write_all(b"plist").unwrap();
@@ -508,7 +509,8 @@ mod tests {
         // its CRC and reports an error.
         let data_start = {
             let mut zip = ZipArchive::new(std::fs::File::open(&ipa_path).unwrap()).unwrap();
-            zip.by_index(1).unwrap().data_start()
+            let data_start = zip.by_index(1).unwrap().data_start();
+            data_start
         };
         let mut bytes = std::fs::read(&ipa_path).unwrap();
         bytes[data_start as usize] ^= 0xff;
