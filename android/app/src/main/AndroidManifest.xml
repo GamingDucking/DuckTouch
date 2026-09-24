@@ -86,9 +86,9 @@
         <!--
           Note: the platform's `com.android.graphics.driver.prefer_angle`
           opt-in is deliberately NOT declared. HyperHLE bundles its own ANGLE
-          and decides per app whether to load it (apps that may use the buggy
-          vendor OpenGL ES 1.1 paths) or the vendor's faster native driver
-          (OpenGL ES 2.0-only apps); see `select_android_gl_driver` in
+          and decides per app whether to load it (ES 1.1-capable apps on
+          devices exposing an Adreno KGSL GPU) or the system driver (ES 2.0-only
+          apps and other or unrecognized GPUs); see `select_android_gl_driver` in
           `src/window.rs` and the `- -gl-driver=` option. Declaring the opt-in
           would make the platform substitute its ANGLE for the vendor driver
           on Android 15+ behind our back, defeating the second choice.

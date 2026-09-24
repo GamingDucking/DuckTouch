@@ -14,8 +14,8 @@
 
 use crate::gles::present::present_frame;
 use crate::gles::{
-    create_gles1_ctx_no_parent_stack, create_gles2_ctx_no_parent_stack, GLESContext, GLES,
-    LoggingGLESContext,
+    create_gles1_ctx_no_parent_stack, create_gles2_ctx_no_parent_stack, GLESContext,
+    LoggingGLESContext, GLES,
 };
 use crate::image::Image;
 use crate::matrix::Matrix;
@@ -607,10 +607,10 @@ pub fn host_screen_size() -> Option<(u32, u32)> {
 /// vendors' OpenGL ES **2.0/3.x** drivers, on the other hand, are the path
 /// every Android game runs on, and they are faster than ANGLE's ES-on-Vulkan
 /// translation (no shader re-translation, no staging copies for client-side
-/// vertex arrays, cheaper draw submission). So `--gl-driver=auto` keeps ANGLE
-/// for apps that may use ES 1.1 (and for the app picker, whose UI is ES 1.1)
-/// but uses the native driver for apps whose executable only imports ES 2.0
-/// shader entry points.
+/// vertex arrays, cheaper draw submission). `--gl-driver=auto` uses the native driver
+/// for ES 2.0-only apps and for non-Adreno or unrecognized GPUs. It selects
+/// ANGLE for apps that may use ES 1.1 (and for the app picker) only when an
+/// Adreno KGSL device is detected; `--gl-driver=angle` can force it otherwise.
 ///
 /// The app picker's window and the app's window are separate SDL windows, and
 /// SDL unloads the EGL/GLES libraries when the last GL window is destroyed, so
@@ -624,6 +624,59 @@ pub fn host_screen_size() -> Option<(u32, u32)> {
 ///   a build that doesn't bundle ANGLE is completely unaffected (SDL falls back
 ///   to the system driver, which itself may already be ANGLE on Android 15+ or
 ///   when the user enabled ANGLE Preferences).
+#[cfg(any(target_os = "android", test))]
+fn gpu_model_is_adreno(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("adreno")
+}
+
+#[cfg(target_os = "android")]
+fn android_has_adreno_gpu() -> bool {
+    std::fs::read_to_string("/sys/class/kgsl/kgsl-3d0/gpu_model")
+        .as_deref()
+        .is_ok_and(gpu_model_is_adreno)
+        || std::path::Path::new("/dev/kgsl-3d0").exists()
+}
+
+#[cfg(any(target_os = "android", test))]
+fn auto_uses_bundled_angle(
+    app_gles_usage: Option<crate::mach_o::GlesApiUsage>,
+    adreno_detected: bool,
+) -> bool {
+    adreno_detected && !app_gles_usage.is_some_and(|usage| usage.is_es2_only())
+}
+
+#[cfg(test)]
+mod android_gl_driver_tests {
+    use super::{auto_uses_bundled_angle, gpu_model_is_adreno};
+    use crate::mach_o::GlesApiUsage;
+
+    #[test]
+    fn gpu_detection_matches_adreno_not_mali() {
+        assert!(gpu_model_is_adreno("Qualcomm Adreno (TM) 530"));
+        assert!(gpu_model_is_adreno("adreno 506"));
+        assert!(!gpu_model_is_adreno("Mali-T830 MP2"));
+        assert!(!gpu_model_is_adreno(""));
+    }
+
+    #[test]
+    fn automatic_angle_is_limited_to_detected_adreno_es1() {
+        let es1 = Some(GlesApiUsage {
+            uses_es1: true,
+            uses_es2: false,
+        });
+        let es2 = Some(GlesApiUsage {
+            uses_es1: false,
+            uses_es2: true,
+        });
+
+        assert!(auto_uses_bundled_angle(None, true));
+        assert!(auto_uses_bundled_angle(es1, true));
+        assert!(!auto_uses_bundled_angle(None, false));
+        assert!(!auto_uses_bundled_angle(es1, false));
+        assert!(!auto_uses_bundled_angle(es2, true));
+    }
+}
+
 #[cfg(target_os = "android")]
 fn select_android_gl_driver(
     preference: crate::options::GlDriverPreference,
@@ -719,9 +772,14 @@ fn select_android_gl_driver(
                 );
                 return;
             }
-            // App picker, or an app that (also) uses the ES 1.1 fixed-function
-            // pipeline: the vendor's native ES 1.1 path is the risky one, so
-            // ANGLE stays preferred.
+            if !auto_uses_bundled_angle(app_gles_usage, android_has_adreno_gpu()) {
+                use_system_driver(concat!(
+                    "Android did not expose a detectable Adreno KGSL GPU; using the system ",
+                    "driver instead of assuming the bundled ANGLE/Vulkan backend is supported ",
+                    "(use --gl-driver=angle to override)",
+                ));
+                return;
+            }
         }
     }
 
@@ -746,7 +804,7 @@ fn select_android_gl_driver(
         ANGLE_ENV_SET_BY_US.store(true, Ordering::Relaxed);
         log!(
             "Bundled ANGLE detected ({} / {} / {}); preferring it over the \
-             system OpenGL ES driver to avoid Adreno ES 1.1 black-screen issues.",
+             system OpenGL ES driver for ES 1.1 compatibility.",
             egl,
             gles1,
             gles2
@@ -1170,9 +1228,10 @@ impl Window {
         // shader entry points requested through an ES 1.1 context, both of
         // which manifest as a black screen for many early iPhone OS games.
         // Google's ANGLE (OpenGL ES over Vulkan) is far more lenient and is the
-        // recommended driver on modern Adreno devices — the manifest opt-in and
-        // the SDL_VIDEO_GL_DRIVER hook let ANGLE be selected transparently, and
-        // when it is, `driver_description()` reports an "ANGLE" renderer here.
+        // recommended driver on Adreno devices. Auto-selection is limited to
+        // devices exposing the Adreno KGSL node; --gl-driver=angle or
+        // SDL_VIDEO_GL_DRIVER can select ANGLE when auto chooses the system
+        // driver, and `driver_description()` reports an "ANGLE" renderer here.
         window.log_gpu_backend_hints();
 
         if window.splash_image.is_some() {

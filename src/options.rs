@@ -91,10 +91,9 @@ impl PresentMode {
 /// effect on other platforms.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum GlDriverPreference {
-    /// Use the bundled ANGLE driver for apps that may use OpenGL ES 1.1 (the
-    /// vendors' native ES 1.1 drivers are the buggy ones), and the vendor's
-    /// native driver for apps whose executable only imports OpenGL ES 2.0
-    /// shader entry points.
+    /// On Android, use bundled ANGLE for apps that may use OpenGL ES 1.1 only
+    /// on detected Adreno devices; use the system driver for ES 2.0-only apps
+    /// and other or unrecognized GPUs.
     Auto,
     /// Always use the bundled ANGLE driver (when it is available).
     Angle,
