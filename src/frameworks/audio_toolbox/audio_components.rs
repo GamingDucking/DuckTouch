@@ -137,6 +137,10 @@ pub struct AudioComponentInstanceHostObject {
     /// гостем через `AudioUnitSetProperty`, ключ — (scope, element).
     /// Возвращаются обратно через `AudioUnitGetProperty`.
     pub audio_channel_layouts: HashMap<(u32, u32), Vec<u8>>,
+
+    /// Флаги `kAudioUnitProperty_ShouldAllocateBuffer` (property 51),
+    /// ключ — (scope, element); GET без SET отвечает 1 (как раньше).
+    pub should_allocate_buffers: HashMap<(u32, u32), u32>,
 }
 
 impl Default for AudioComponentInstanceHostObject {

@@ -533,6 +533,17 @@ fn AudioUnitSetProperty(
                         .remove(&(in_scope, in_element));
                 }
             }
+            kAudioUnitProperty_ShouldAllocateBuffer => {
+                // kAudioUnitProperty_ShouldAllocateBuffer (51): UInt32-флаг
+                // на (scope, element) — хост просит/не просит, чтобы юнит
+                // сам выделял буферы. Запоминаем, чтобы GET вернул то же.
+                if !in_data.is_null() && in_data_size >= guest_size_of::<u32>() {
+                    let flag: u32 = env.mem.read::<u32, false>(in_data.cast());
+                    host_object
+                        .should_allocate_buffers
+                        .insert((in_scope, in_element), flag);
+                }
+            }
             _ => {
                 log!(
                     "AudioUnitSetProperty: UNHANDLED property {} \
@@ -714,8 +725,16 @@ fn AudioUnitGetProperty(
             write_if_nonnull(env, out_data.cast(), 0u32);
             write_if_nonnull(env, io_data_size, guest_size_of::<u32>());
         }
-        kAudioUnitProperty_ShouldAllocateBuffer
-        | kAudioUnitProperty_InPlaceProcessing
+        kAudioUnitProperty_ShouldAllocateBuffer => {
+            let flag = host_object
+                .should_allocate_buffers
+                .get(&(in_scope, in_element))
+                .copied()
+                .unwrap_or(1);
+            write_if_nonnull(env, out_data.cast(), flag);
+            write_if_nonnull(env, io_data_size, guest_size_of::<u32>());
+        }
+        kAudioUnitProperty_InPlaceProcessing
         | kAudioUnitProperty_BypassEffect => {
             // Булевые свойства — возвращаем 1 (да/включено) как заглушку.
             write_if_nonnull(env, out_data.cast(), 1u32);
