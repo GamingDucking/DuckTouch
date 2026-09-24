@@ -280,10 +280,13 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         std::env::remove_var("TOUCHHLE_FORCE_LANDSCAPE_VIEW_BOUNDS");
         std::env::remove_var("TOUCHHLE_TOUCH_LOCATION_PORTRAIT_TO_LANDSCAPE");
         std::env::remove_var("TOUCHHLE_TOUCH_MODE");
-        if app_id == "com.robtop.geometryjump" {
-            std::env::set_var("TOUCHHLE_TOUCH_LOCATION_PORTRAIT_TO_LANDSCAPE", "1");
-            std::env::set_var("TOUCHHLE_TOUCH_MODE", "right");
-        }
+        // NOTE: do not force a portrait->landscape touch remap on
+        // com.robtop.geometryjump (Geometry Dash) anymore. Its cocos2d-x view
+        // is mounted as a UIViewController's view, so UIWindow's landscape
+        // autorotation already makes locationInView: return coordinates in the
+        // game's own landscape space; the extra "right" remap rotated those
+        // already-correct coordinates a second time and taps activated the
+        // wrong buttons (press high -> settings, press low -> level menu).
         std::env::remove_var("TOUCHHLE_TOUCH_LOCATION_X_OFFSET");
         std::env::remove_var("TOUCHHLE_TOUCH_LOCATION_Y_OFFSET");
         std::env::remove_var("TOUCHHLE_PRESENT_STRETCH_TO_VIEWPORT");
