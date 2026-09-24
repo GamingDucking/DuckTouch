@@ -11,12 +11,48 @@
 
 use crate::window::{GLContext, Window};
 
+use super::gles11_raw as gles11;
 use super::gles11_raw::types::*;
 
 /// `GLchar` from the ES 2.0 type set. Not defined by the ES 1.1 registry, so
 /// we provide our own alias here for use in the [GLES] trait's ES 2.0 entry
 /// points.
 pub type GLchar = std::os::raw::c_char;
+
+fn tex_storage_2d_parameters(internalformat: GLenum) -> Option<(GLint, GLenum, GLenum)> {
+    let (format, type_) = match internalformat {
+        0x803C => (gles11::ALPHA, gles11::UNSIGNED_BYTE),
+        0x8040 => (gles11::LUMINANCE, gles11::UNSIGNED_BYTE),
+        0x8045 => (gles11::LUMINANCE_ALPHA, gles11::UNSIGNED_BYTE),
+        0x8051 => (gles11::RGB, gles11::UNSIGNED_BYTE),
+        0x8052 => (gles11::RGB, 0x8368),
+        0x8058 => (gles11::RGBA, gles11::UNSIGNED_BYTE),
+        0x8059 => (gles11::RGBA, 0x8368),
+        0x8D62 => (gles11::RGB, gles11::UNSIGNED_SHORT_5_6_5),
+        0x8056 => (gles11::RGBA, gles11::UNSIGNED_SHORT_4_4_4_4),
+        0x8057 => (gles11::RGBA, gles11::UNSIGNED_SHORT_5_5_5_1),
+        0x8814 => (gles11::RGBA, gles11::FLOAT),
+        0x8815 => (gles11::RGB, gles11::FLOAT),
+        0x8816 => (gles11::ALPHA, gles11::FLOAT),
+        0x8818 => (gles11::LUMINANCE, gles11::FLOAT),
+        0x8819 => (gles11::LUMINANCE_ALPHA, gles11::FLOAT),
+        0x881A => (gles11::RGBA, 0x8D61),
+        0x881B => (gles11::RGB, 0x8D61),
+        0x881C => (gles11::ALPHA, 0x8D61),
+        0x881E => (gles11::LUMINANCE, 0x8D61),
+        0x881F => (gles11::LUMINANCE_ALPHA, 0x8D61),
+        0x8229 => (0x1903, gles11::UNSIGNED_BYTE),
+        0x822B => (0x8227, gles11::UNSIGNED_BYTE),
+        0x822D => (0x1903, 0x8D61),
+        0x822E => (0x1903, gles11::FLOAT),
+        0x822F => (0x8227, 0x8D61),
+        0x8230 => (0x8227, gles11::FLOAT),
+        0x8A51 => (0x8A1F, 0x85BA),
+        0x93A1 => (0x80E1, gles11::UNSIGNED_BYTE),
+        _ => return None,
+    };
+    Some((format as GLint, format, type_))
+}
 
 /// Trait representing an OpenGL ES implementation and context.
 ///
@@ -630,17 +666,19 @@ pub trait GLES {
     }
     unsafe fn CompressedTexSubImage2D(
         &mut self,
-        _target: GLenum,
-        _level: GLint,
-        _xoffset: GLint,
-        _yoffset: GLint,
-        _width: GLsizei,
-        _height: GLsizei,
-        _format: GLenum,
-        _image_size: GLsizei,
-        _data: *const GLvoid,
+        target: GLenum,
+        level: GLint,
+        xoffset: GLint,
+        yoffset: GLint,
+        width: GLsizei,
+        height: GLsizei,
+        format: GLenum,
+        image_size: GLsizei,
+        data: *const GLvoid,
     ) {
-        unimplemented!("CompressedTexSubImage2D not implemented by this backend")
+        gles11::CompressedTexSubImage2D(
+            target, level, xoffset, yoffset, width, height, format, image_size, data,
+        )
     }
     unsafe fn CopyTexImage2D(
         &mut self,
@@ -1722,13 +1760,74 @@ pub trait GLES {
     }
     unsafe fn TexStorage2D(
         &mut self,
-        _target: GLenum,
-        _levels: GLsizei,
-        _internalformat: GLenum,
-        _width: GLsizei,
-        _height: GLsizei,
+        target: GLenum,
+        levels: GLsizei,
+        internalformat: GLenum,
+        width: GLsizei,
+        height: GLsizei,
     ) {
-        log_once!("TexStorage2D (OpenGL ES 3.0) not supported by this backend [stubbed]");
+        let (image_internalformat, format, type_) = tex_storage_2d_parameters(internalformat)
+            .unwrap_or((
+                internalformat as GLint,
+                internalformat,
+                gles11::UNSIGNED_BYTE,
+            ));
+        let targets = if target == 0x8513 {
+            [0x8515, 0x8516, 0x8517, 0x8518, 0x8519, 0x851A]
+        } else {
+            [target; 6]
+        };
+        let target_count = if target == 0x8513 { 6 } else { 1 };
+        if levels <= 0 || width <= 0 || height <= 0 {
+            let invalid_width = if levels <= 0 || width <= 0 { -1 } else { width };
+            let invalid_height = if height <= 0 { -1 } else { height };
+            self.TexImage2D(
+                targets[0],
+                0,
+                image_internalformat,
+                invalid_width,
+                invalid_height,
+                0,
+                format,
+                type_,
+                std::ptr::null(),
+            );
+            return;
+        }
+        let max_levels = 32 - (width.max(height) as u32).leading_zeros() as i32;
+        if levels > max_levels {
+            self.TexImage2D(
+                targets[0],
+                0,
+                image_internalformat,
+                -1,
+                height,
+                0,
+                format,
+                type_,
+                std::ptr::null(),
+            );
+            return;
+        }
+        for image_target in targets.iter().take(target_count) {
+            let mut level_width = width;
+            let mut level_height = height;
+            for level in 0..levels {
+                self.TexImage2D(
+                    *image_target,
+                    level,
+                    image_internalformat,
+                    level_width,
+                    level_height,
+                    0,
+                    format,
+                    type_,
+                    std::ptr::null(),
+                );
+                level_width = (level_width / 2).max(1);
+                level_height = (level_height / 2).max(1);
+            }
+        }
     }
     unsafe fn TexStorage3D(
         &mut self,

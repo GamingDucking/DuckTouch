@@ -711,6 +711,22 @@ impl GLES for GLES3OnGL3<'_> {
             data,
         )
     }
+    unsafe fn CompressedTexSubImage2D(
+        &mut self,
+        target: GLenum,
+        level: GLint,
+        xoffset: GLint,
+        yoffset: GLint,
+        width: GLsizei,
+        height: GLsizei,
+        format: GLenum,
+        image_size: GLsizei,
+        data: *const GLvoid,
+    ) {
+        gl33::CompressedTexSubImage2D(
+            target, level, xoffset, yoffset, width, height, format, image_size, data,
+        )
+    }
     unsafe fn CopyTexImage2D(
         &mut self,
         target: GLenum,

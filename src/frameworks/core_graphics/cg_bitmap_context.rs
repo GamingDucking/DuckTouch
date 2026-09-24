@@ -8,7 +8,9 @@
 
 use super::cg_affine_transform::{CGAffineTransform, CGAffineTransformIdentity};
 use super::cg_color_space::{
-    kCGColorSpaceGenericGray, kCGColorSpaceGenericRGB, CGColorSpaceHostObject, CGColorSpaceRef,
+    kCGColorSpaceGenericCMYK, kCGColorSpaceGenericGray, kCGColorSpaceGenericRGB,
+    kCGColorSpaceModelCMYK, kCGColorSpaceModelMonochrome, kCGColorSpaceModelRGB,
+    CGColorSpaceHostObject, CGColorSpaceRef,
 };
 use super::cg_context::{CGContextHostObject, CGContextRef, CGContextSubclass};
 use super::cg_image::{
@@ -93,6 +95,11 @@ pub fn CGBitmapContextCreate(
         transform: CGAffineTransformIdentity,
         text_transform: None,
         rgb_fill_color: (0.0, 0.0, 0.0, 1.0),
+        fill_color_space_model: match color_space_name {
+            kCGColorSpaceGenericGray => kCGColorSpaceModelMonochrome,
+            kCGColorSpaceGenericCMYK => kCGColorSpaceModelCMYK,
+            _ => kCGColorSpaceModelRGB,
+        },
         rgb_stroke_color: (0.0, 0.0, 0.0, 1.0),
         alpha: 1.0,
         line_width: 1.0,

@@ -11,7 +11,8 @@ use super::cg_bitmap_context::{
 };
 use super::cg_color::CGColorRef;
 use super::cg_color_space::{
-    kCGColorSpaceModelMonochrome, kCGColorSpaceModelRGB, CGColorSpaceGetModel, CGColorSpaceRef,
+    kCGColorSpaceModelCMYK, kCGColorSpaceModelMonochrome, kCGColorSpaceModelRGB,
+    CGColorSpaceGetModel, CGColorSpaceModel,
 };
 use super::cg_font::{CGFontHostObject, CGFontRef, CGFontRelease, CGFontRetain, CGGlyph};
 use super::cg_geometry::CGPointZero;
@@ -55,6 +56,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 pub(super) struct CGContextHostObject {
     pub(super) subclass: CGContextSubclass,
     pub(super) rgb_fill_color: (CGFloat, CGFloat, CGFloat, CGFloat),
+    pub(super) fill_color_space_model: CGColorSpaceModel,
     pub(super) rgb_stroke_color: (CGFloat, CGFloat, CGFloat, CGFloat),
     pub(super) alpha: CGFloat,
     pub(super) line_width: CGFloat,
@@ -115,6 +117,7 @@ impl HostObject for CGContextHostObject {}
 #[derive(Clone)]
 pub(super) struct CGContextState {
     pub fill_color: (CGFloat, CGFloat, CGFloat, CGFloat),
+    pub fill_color_space_model: CGColorSpaceModel,
     pub stroke_color: (CGFloat, CGFloat, CGFloat, CGFloat),
     pub alpha: CGFloat,
     pub line_width: CGFloat,
@@ -160,6 +163,49 @@ pub fn CGContextRetain(env: &mut Environment, c: CGContextRef) -> CGContextRef {
 fn CGContextSetFillColorWithColor(env: &mut Environment, context: CGContextRef, color: CGColorRef) {
     let (r, g, b, a) = cg_color::to_rgba(&env.objc, color);
     CGContextSetRGBFillColor(env, context, r, g, b, a)
+}
+
+fn CGContextSetFillColor(
+    env: &mut Environment,
+    context: CGContextRef,
+    components: ConstPtr<CGFloat>,
+) {
+    if context.is_null() || components.is_null() {
+        return;
+    }
+    let model = env
+        .objc
+        .borrow::<CGContextHostObject>(context)
+        .fill_color_space_model;
+    let color = match model {
+        kCGColorSpaceModelMonochrome => {
+            let gray = env.mem.read(components);
+            let alpha = env.mem.read(components + 1);
+            (gray, gray, gray, alpha)
+        }
+        kCGColorSpaceModelCMYK => {
+            let cyan = env.mem.read(components);
+            let magenta = env.mem.read(components + 1);
+            let yellow = env.mem.read(components + 2);
+            let black = env.mem.read(components + 3);
+            let alpha = env.mem.read(components + 4);
+            (
+                (1.0 - cyan) * (1.0 - black),
+                (1.0 - magenta) * (1.0 - black),
+                (1.0 - yellow) * (1.0 - black),
+                alpha,
+            )
+        }
+        _ => (
+            env.mem.read(components),
+            env.mem.read(components + 1),
+            env.mem.read(components + 2),
+            env.mem.read(components + 3),
+        ),
+    };
+    env.objc
+        .borrow_mut::<CGContextHostObject>(context)
+        .rgb_fill_color = color;
 }
 
 pub fn CGContextSetRGBFillColor(
@@ -374,26 +420,18 @@ fn CGContextSetFillColorSpace(
     if context.is_null() {
         return;
     }
-    // Per Apple's CGContextSetFillColorSpace documentation:
-    // "When you call this function, two things happen:
-    //   1. Core Graphics assigns the specified color space to the current
-    //      fill color space in the graphics state.
-    //   2. Core Graphics sets the fill color to a default value that's
-    //      appropriate for the color space."
-    // https://developer.apple.com/documentation/coregraphics/1455380-cgcontextsetfillcolorspace
-    //
-    // touchHLE always works in device RGB internally — switching color
-    // spaces would require reimplementing Quartz's CIE colour pipeline,
-    // which is out of scope. Instead, reset the fill colour to the
-    // device-RGB default (opaque black), matching what real Quartz does
-    // when you switch to any RGB-family color space. This preserves the
-    // visible behaviour for the most common cases (kCGColorSpaceGenericRGB,
-    // kCGColorSpaceDeviceRGB) and degrades to the same default for
-    // others.
-    let _ = color_space; // retained by the caller; we don't track ownership
-    env.objc
-        .borrow_mut::<CGContextHostObject>(context)
-        .rgb_fill_color = (0.0, 0.0, 0.0, 1.0);
+    let model = if color_space.is_null() {
+        kCGColorSpaceModelRGB
+    } else {
+        CGColorSpaceGetModel(env, color_space)
+    };
+    let model = match model {
+        kCGColorSpaceModelMonochrome | kCGColorSpaceModelRGB | kCGColorSpaceModelCMYK => model,
+        _ => kCGColorSpaceModelRGB,
+    };
+    let host = env.objc.borrow_mut::<CGContextHostObject>(context);
+    host.fill_color_space_model = model;
+    host.rgb_fill_color = (0.0, 0.0, 0.0, 1.0);
 }
 
 fn CGContextSetStrokeColorSpace(
@@ -1031,6 +1069,7 @@ pub fn CGContextSaveGState(env: &mut Environment, context: CGContextRef) {
     let h = env.objc.borrow::<CGContextHostObject>(context);
     let state = CGContextState {
         fill_color: h.rgb_fill_color,
+        fill_color_space_model: h.fill_color_space_model,
         stroke_color: h.rgb_stroke_color,
         alpha: h.alpha,
         line_width: h.line_width,
@@ -1071,6 +1110,7 @@ pub fn CGContextRestoreGState(env: &mut Environment, context: CGContextRef) {
     let host = env.objc.borrow_mut::<CGContextHostObject>(context);
     if let Some(state) = host.state_stack.pop() {
         host.rgb_fill_color = state.fill_color;
+        host.fill_color_space_model = state.fill_color_space_model;
         host.rgb_stroke_color = state.stroke_color;
         host.alpha = state.alpha;
         host.line_width = state.line_width;
@@ -1439,6 +1479,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGContextRetain(_)),
     export_c_func!(CGContextRelease(_)),
     export_c_func!(CGContextSetFillColorWithColor(_, _)),
+    export_c_func!(CGContextSetFillColor(_, _)),
     export_c_func!(CGContextSetRGBFillColor(_, _, _, _, _)),
     export_c_func!(CGContextSetRGBStrokeColor(_, _, _, _, _)),
     export_c_func!(CGContextSetGrayFillColor(_, _, _)),

@@ -214,7 +214,7 @@ fn fstat(env: &mut Environment, fd: FileDescriptor, buf: MutPtr<stat>) -> i32 {
     result
 }
 
-fn stat(env: &mut Environment, path: ConstPtr<u8>, buf: MutPtr<stat>) -> i32 {
+pub(crate) fn stat(env: &mut Environment, path: ConstPtr<u8>, buf: MutPtr<stat>) -> i32 {
     set_errno(env, 0);
     if path.is_null() {
         set_errno(env, ENOENT);

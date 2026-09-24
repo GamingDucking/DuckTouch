@@ -4924,6 +4924,17 @@ fn glTexStorage2D(
     });
 }
 
+fn glTexStorage2DEXT(
+    env: &mut Environment,
+    target: GLenum,
+    levels: GLsizei,
+    internalformat: GLenum,
+    width: GLsizei,
+    height: GLsizei,
+) {
+    glTexStorage2D(env, target, levels, internalformat, width, height);
+}
+
 fn glTexStorage3D(
     env: &mut Environment,
     target: GLenum,
@@ -6191,6 +6202,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(glTexSubImage3D(_, _, _, _, _, _, _, _, _, _, _)),
     export_c_func!(glCopyTexSubImage3D(_, _, _, _, _, _, _, _, _)),
     export_c_func!(glTexStorage2D(_, _, _, _, _)),
+    export_c_func!(glTexStorage2DEXT(_, _, _, _, _)),
     export_c_func!(glTexStorage3D(_, _, _, _, _, _)),
     export_c_func!(glGenQueries(_, _)),
     export_c_func!(glDeleteQueries(_, _)),

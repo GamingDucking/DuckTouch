@@ -551,6 +551,8 @@ fn fchmod(_env: &mut Environment, _fd: i32, _mode: u32) -> i32 {
 // Darwin/XNU `<sys/syscall.h>` selector numbers used by the few syscalls
 // touchHLE knows how to implement directly. The full list is enormous; we
 // only enumerate the ones we resolve here.
+const SYS_FORK: i32 = 2;
+const SYS_STAT: i32 = 188;
 const SYS_THREAD_SELFID: i32 = 372;
 const SYS_GETPID: i32 = 20;
 const SYS_GETPPID: i32 = 39;
@@ -576,9 +578,16 @@ const SYS_GETEGID: i32 = 43;
 /// `syscall(SYS_thread_selfid)` etc, and return `-1` with `errno = ENOSYS`
 /// for every other selector, which is exactly the contract Apple's
 /// kernel uses for selectors the host doesn't implement.
-fn syscall(env: &mut Environment, number: i32, _args: DotDotDot) -> i32 {
+fn syscall(env: &mut Environment, number: i32, args: DotDotDot) -> i32 {
     log_dbg!("syscall({}) called", number);
     match number {
+        SYS_FORK => self::fork(env),
+        SYS_STAT => {
+            let mut args = args.start();
+            let path: ConstPtr<u8> = args.next(env);
+            let buffer: MutPtr<crate::libc::posix_io::stat::stat> = args.next(env);
+            crate::libc::posix_io::stat::stat(env, path, buffer)
+        }
         SYS_GETPID => self::getpid(env),
         SYS_GETPPID => self::getppid(env),
         SYS_GETUID => self::getuid(env) as i32,
