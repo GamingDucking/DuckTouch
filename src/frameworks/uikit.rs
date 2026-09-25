@@ -12,9 +12,18 @@
 use crate::{msg, Environment};
 use std::time::Instant;
 
-use crate::dyld::HostConstant;
+use crate::dyld::{export_c_func, FunctionExports, HostConstant};
 use crate::frameworks::core_graphics::cg_geometry::CGSize;
 use crate::mem::{ConstVoidPtr, MutPtr};
+
+/// HyperHLE does not emulate an active iOS Guided Access session.
+fn UIAccessibilityIsGuidedAccessEnabled(_env: &mut Environment) -> bool {
+    false
+}
+
+const FUNCTIONS: FunctionExports = &[
+    export_c_func!(UIAccessibilityIsGuidedAccessEnabled()),
+];
 
 pub mod ui_accelerometer;
 pub mod ui_action_sheet;
@@ -27,6 +36,7 @@ pub mod ui_custom_object;
 pub mod ui_device;
 pub mod ui_document;
 pub mod ui_event;
+pub mod ui_bezier_path;
 pub mod ui_font;
 pub mod ui_geometry;
 pub mod ui_gesture_recognizer;
@@ -917,6 +927,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ui_alert_controller::CLASSES,
         ui_application::CLASSES,
         ui_color::CLASSES,
+        ui_bezier_path::CLASSES,
         ui_custom_object::CLASSES,
         ui_device::CLASSES,
         ui_document::CLASSES,
@@ -982,6 +993,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         CONSTANTS,
     ],
     function_exports: &[
+        FUNCTIONS,
         ui_application::FUNCTIONS,
         ui_geometry::FUNCTIONS,
         ui_graphics::FUNCTIONS,
@@ -1081,20 +1093,35 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
             }
             Event::TextInput(text_event) => {
                 let responder = env.framework_state.uikit.ui_responder.first_responder;
-                let class = msg![env; responder class];
-                let ui_text_field_class = env.objc.get_known_class("UITextField", &mut env.mem);
-
-                if !responder.is_null() && env.objc.class_is_subclass_of(class, ui_text_field_class)
-                {
-                    match text_event {
-                        TextInputEvent::Text(text) => {
-                            ui_view::ui_control::ui_text_field::handle_text(env, responder, text)
+                if !responder.is_null() {
+                    let class = msg![env; responder class];
+                    let ui_text_field_class = env.objc.get_known_class("UITextField", &mut env.mem);
+                    if env.objc.class_is_subclass_of(class, ui_text_field_class) {
+                        match text_event {
+                            TextInputEvent::Text(text) => {
+                                ui_view::ui_control::ui_text_field::handle_text(env, responder, text)
+                            }
+                            TextInputEvent::Backspace => {
+                                ui_view::ui_control::ui_text_field::handle_backspace(env, responder)
+                            }
+                            TextInputEvent::Return => {
+                                ui_view::ui_control::ui_text_field::handle_return(env, responder)
+                            }
                         }
-                        TextInputEvent::Backspace => {
-                            ui_view::ui_control::ui_text_field::handle_backspace(env, responder)
-                        }
-                        TextInputEvent::Return => {
-                            ui_view::ui_control::ui_text_field::handle_return(env, responder)
+                    } else {
+                        let ui_text_view_class = env.objc.get_known_class("UITextView", &mut env.mem);
+                        if env.objc.class_is_subclass_of(class, ui_text_view_class) {
+                            match text_event {
+                                TextInputEvent::Text(text) => {
+                                    ui_view::ui_scroll_view::ui_text_view::handle_text(env, responder, text)
+                                }
+                                TextInputEvent::Backspace => {
+                                    ui_view::ui_scroll_view::ui_text_view::handle_backspace(env, responder)
+                                }
+                                TextInputEvent::Return => {
+                                    ui_view::ui_scroll_view::ui_text_view::handle_return(env, responder)
+                                }
+                            }
                         }
                     }
                 }
@@ -1103,4 +1130,16 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
     }
 
     ui_accelerometer::handle_accelerometer(env)
+}
+
+#[cfg(test)]
+mod accessibility_export_tests {
+    #[test]
+    fn guided_access_query_is_exported_as_a_function() {
+        let exports: Vec<_> = super::DYLIB.function_exports.iter()
+            .flat_map(|table| table.iter())
+            .filter(|(name, _)| *name == "_UIAccessibilityIsGuidedAccessEnabled")
+            .collect();
+        assert_eq!(exports.len(), 1);
+    }
 }

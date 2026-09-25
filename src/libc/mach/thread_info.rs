@@ -22,6 +22,7 @@ pub const KERN_SUCCESS: kern_return_t = 0;
 /// Specified address is not currently valid.
 pub const KERN_INVALID_ADDRESS: kern_return_t = 1;
 pub const KERN_INVALID_ARGUMENT: kern_return_t = 4;
+pub const KERN_INVALID_TASK: kern_return_t = 5;
 
 pub type thread_inspect_t = mach_port_t;
 type thread_flavor_t = natural_t;

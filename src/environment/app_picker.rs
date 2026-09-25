@@ -1,7 +1,4 @@
 //! App picker GUI.
-//!
-//! This also includes a license text viewer. The license text viewer is needed
-//! on Android, where the command-line way to view license text doesn't exist.
 
 use crate::bundle::Bundle;
 use crate::frameworks::core_graphics::cg_bitmap_context::{
@@ -160,11 +157,9 @@ const IPA_COPY_SETTLE_TIME: Duration = Duration::from_millis(500);
 #[derive(Default)]
 struct AppPickerDelegateHostObject {
     icon_tapped: id,
+    // Set by the add-app tile; kept separately from icon_tapped because the
+    // picker needs to wait for a newly copied IPA to settle before reloading.
     add_ipa: bool,
-    copyright_show: bool,
-    copyright_hide: bool,
-    copyright_prev: bool,
-    copyright_next: bool,
     quick_options_show: bool,
     quick_options_hide: bool,
     scale_hack_default: bool,
@@ -178,8 +173,8 @@ struct AppPickerDelegateHostObject {
     orientation_portrait_upside_down: bool,
     analog_stick_tilt_controls: Option<bool>,
     network: Option<bool>,
-    gles1_on_gles2: Option<bool>,
     show_fps: Option<bool>,
+    cheat_engine: Option<bool>,
     trace_gl_errors: Option<bool>,
     verbose_gles: Option<bool>,
     fullscreen: Option<bool>,
@@ -220,18 +215,6 @@ const CLASSES: ClassExports = objc_classes! {
 - (())addIpa {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).add_ipa = true;
 }
-- (())copyrightInfoShow {
-    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).copyright_show = true;
-}
-- (())copyrightInfoHide {
-    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).copyright_hide = true;
-}
-- (())copyrightInfoPrevPage {
-    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).copyright_prev = true;
-}
-- (())copyrightInfoNextPage {
-    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).copyright_next = true;
-}
 
 - (())quickOptionsShow {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).quick_options_show = true;
@@ -270,10 +253,6 @@ const CLASSES: ClassExports = objc_classes! {
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).analog_stick_tilt_controls = Some(switch_state);
 }
-- (())gles1OnGLES2:(id)switch { // UISwitch*
-    let switch_state: bool = msg![env; switch isOn];
-    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).gles1_on_gles2 = Some(switch_state);
-}
 - (())network:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).network = Some(switch_state);
@@ -299,6 +278,10 @@ const CLASSES: ClassExports = objc_classes! {
         std::env::remove_var("TOUCHHLE_ONSCREEN_FPS");
         crate::gles::present::set_onscreen_fps_enabled(false);
     }
+}
+- (())cheatEngine:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).cheat_engine = Some(switch_state);
 }
 - (())fullscreen:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
@@ -334,16 +317,6 @@ const CLASSES: ClassExports = objc_classes! {
         },
         Err(e) => echo!("Couldn't open file manager: {}", e),
     }
-}
-
-- (())visitWebsite {
-    // Assert (see above).
-    let _ = env.objc.borrow_mut::<AppPickerDelegateHostObject>(this);
-
-    let url = ns_string::get_static_str(env, "https://touchhle.org/");
-    let url: id = msg_class![env; NSURL URLWithString:url];
-    let ui_application: id = msg_class![env; UIApplication sharedApplication];
-    assert!(msg![env; ui_application openURL:url]);
 }
 
 @end
@@ -463,32 +436,23 @@ fn app_picker_inner(
         );
     }
 
-    // Version label
+    // Build label
     {
         let label_frame = CGRect {
             origin: CGPoint {
                 x: 0.0,
-                y: app_frame.size.height - 20.0,
+                y: app_picker_version_label_top(app_frame.size.height),
             },
             size: CGSize {
                 width: app_frame.size.width - 5.0,
-                height: 15.0,
+                height: APP_PICKER_VERSION_LABEL_HEIGHT,
             },
         };
         let label: id = msg_class![env; UILabel alloc];
         let label: id = msg![env; label initWithFrame:label_frame];
         let text = ns_string::from_rust_string(
             env,
-            format!(
-                "touchHLE {}{}{}",
-                crate::branding(),
-                if crate::branding().is_empty() {
-                    ""
-                } else {
-                    " "
-                },
-                crate::VERSION
-            ),
+            format!("{HYPERHLE_FORK_NAME} ({})", crate::COMMIT_HASH),
         );
         () = msg![env; label setText:text];
         () = msg![env; label setTextAlignment:UITextAlignmentRight];
@@ -521,7 +485,7 @@ fn app_picker_inner(
     };
     let title: id = msg_class![env; UILabel alloc];
     let title: id = msg![env; title initWithFrame:title_frame];
-    let text = ns_string::from_rust_string(env, "HyperHLE-Fork".to_string());
+    let text = ns_string::from_rust_string(env, HYPERHLE_FORK_NAME.to_string());
     () = msg![env; title setText:text];
     () = msg![env; title setTextAlignment:UITextAlignmentCenter];
     let font_size: CGFloat = 28.0;
@@ -532,7 +496,7 @@ fn app_picker_inner(
     () = msg![env; title setBackgroundColor:bg_color];
     () = msg![env; main_view addSubview:title];
 
-    let divider = app_frame.size.height - 124.0;
+    let quick_options_button_top = app_picker_quick_options_button_top(app_frame.size.height);
 
     let mut icon_grid_stuff = match &mut apps {
         Ok(ref mut apps) => {
@@ -552,7 +516,7 @@ fn app_picker_inner(
                 origin: CGPoint { x: 10.0, y: 10.0 },
                 size: CGSize {
                     width: app_frame.size.width - 20.0,
-                    height: divider - 20.0,
+                    height: quick_options_button_top - 20.0,
                 },
             };
             let label: id = msg_class![env; UILabel alloc];
@@ -570,8 +534,9 @@ fn app_picker_inner(
         }
     };
 
-    let buttons_row_center = divider + (app_frame.size.height - divider) / 3.0;
-    let buttons_row2_center = divider + (app_frame.size.height - divider) / 1.45;
+    // Keep the sole footer action directly above the build label, leaving the
+    // space above it available for a fourth row of app icons.
+    let buttons_row_center = app_picker_quick_options_button_center(app_frame.size.height);
     make_button_row(
         env,
         delegate,
@@ -581,30 +546,20 @@ fn app_picker_inner(
         &[("Quick options", "quickOptionsShow")],
         None,
     );
-    make_button_row(
+
+    let mut quick_options_cheat_engine = quick_options_trainer_enabled(&env.options);
+    let quick_options_stuff = setup_quick_options(
         env,
         delegate,
         main_view,
-        app_frame.size,
-        buttons_row2_center,
-        &[
-            ("Copyright info", "copyrightInfoShow"),
-            ("touchHLE.org", "visitWebsite"),
-        ],
-        None,
+        app_frame,
+        quick_options_cheat_engine,
     );
-
-    let copyright_info_text = crate::licenses::get_text();
-    let mut copyright_info_stuff = setup_copyright_info(env, delegate, main_view, app_frame);
-    let mut copyright_info_page_idx = 0;
-
-    let quick_options_stuff = setup_quick_options(env, delegate, main_view, app_frame);
     let mut quick_options_scale_hack: Option<NonZeroU32> = None;
     let mut quick_options_fullscreen: Option<()> = None;
     let mut quick_options_orientation: Option<DeviceOrientation> = None;
     let mut quick_options_analog_stick_tilt_controls = true;
     let mut quick_options_network = false;
-    let mut quick_options_gles1_on_gles2 = false;
     let mut quick_options_show_fps = false;
     let mut quick_options_trace_gl_errors = false;
     let mut quick_options_verbose_gles = false;
@@ -728,35 +683,6 @@ fn app_picker_inner(
             if let Err(e) = crate::window::launch_ipa_picker(env) {
                 echo!("Couldn't open IPA picker: {}", e);
             }
-        } else if std::mem::take(&mut host_obj.copyright_show) {
-            copyright_info_page_idx = 0;
-            change_copyright_page(
-                env,
-                &mut copyright_info_stuff,
-                &copyright_info_text,
-                copyright_info_page_idx,
-            );
-            () = msg![env; (copyright_info_stuff.main_view) setHidden:false];
-        } else if std::mem::take(&mut host_obj.copyright_hide) {
-            () = msg![env; (copyright_info_stuff.main_view) setHidden:true];
-        } else if std::mem::take(&mut host_obj.copyright_prev) && copyright_info_page_idx != 0 {
-            copyright_info_page_idx -= 1;
-            change_copyright_page(
-                env,
-                &mut copyright_info_stuff,
-                &copyright_info_text,
-                copyright_info_page_idx,
-            );
-        } else if std::mem::take(&mut host_obj.copyright_next)
-            && Some(copyright_info_page_idx) != copyright_info_stuff.last_page_idx
-        {
-            copyright_info_page_idx += 1;
-            change_copyright_page(
-                env,
-                &mut copyright_info_stuff,
-                &copyright_info_text,
-                copyright_info_page_idx,
-            );
         } else if std::mem::take(&mut host_obj.quick_options_show) {
             () = msg![env; (quick_options_stuff.main_view) setHidden:false];
         } else if std::mem::take(&mut host_obj.quick_options_hide) {
@@ -886,8 +812,8 @@ fn app_picker_inner(
             quick_options_analog_stick_tilt_controls = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.network) {
             quick_options_network = enabled;
-        } else if let Some(enabled) = std::mem::take(&mut host_obj.gles1_on_gles2) {
-            quick_options_gles1_on_gles2 = enabled;
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.cheat_engine) {
+            quick_options_cheat_engine = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.show_fps) {
             quick_options_show_fps = enabled;
         } else if let Some(trace_gl_errors) = std::mem::take(&mut host_obj.trace_gl_errors) {
@@ -953,12 +879,10 @@ fn app_picker_inner(
     if !quick_options_analog_stick_tilt_controls {
         option_args.push("--disable-analog-stick-tilt-controls".to_string());
     }
-    if quick_options_gles1_on_gles2 {
-        option_args.push("--gles1=gles1_on_gles2".to_string());
-    }
     if quick_options_network {
         option_args.push("--allow-network-access".to_string());
     }
+    option_args.push(quick_options_trainer_argument(quick_options_cheat_engine).to_string());
 
     if quick_options_show_fps {
         // Reuse existing CLI flag to enable FPS logging/counter behaviour.
@@ -991,11 +915,57 @@ fn app_picker_inner(
     (app_path, option_args)
 }
 
+const HYPERHLE_FORK_NAME: &str = "HyperHLE-Fork";
+
+const APP_PICKER_VERSION_LABEL_HEIGHT: CGFloat = 15.0;
+const APP_PICKER_VERSION_LABEL_BOTTOM_INSET: CGFloat = 5.0;
+const APP_PICKER_FOOTER_GAP: CGFloat = 10.0;
+const APP_PICKER_BUTTON_ROW_HEIGHT: CGFloat = 30.0;
+const APP_PICKER_GRID_TOP: CGFloat = 44.0;
+const APP_PICKER_GRID_TO_BUTTON_GAP: CGFloat = 6.0;
+const APP_PICKER_ICON_ROWS: usize = 4;
+
 const ICON_SIZE: CGSize = CGSize {
-    width: 76.0,
-    height: 76.0,
+    width: 72.0,
+    height: 72.0,
 };
-const ICON_IMAGE_INSET: CGFloat = 10.0;
+const ICON_IMAGE_INSET: CGFloat = 9.0;
+const ICON_LABEL_TOP_GAP: CGFloat = 2.0;
+const ICON_ROW_GAP: CGFloat = 2.0;
+
+fn app_picker_version_label_top(app_height: CGFloat) -> CGFloat {
+    app_height - APP_PICKER_VERSION_LABEL_HEIGHT - APP_PICKER_VERSION_LABEL_BOTTOM_INSET
+}
+
+fn app_picker_quick_options_button_center(app_height: CGFloat) -> CGFloat {
+    app_picker_version_label_top(app_height)
+        - APP_PICKER_FOOTER_GAP
+        - APP_PICKER_BUTTON_ROW_HEIGHT / 2.0
+}
+
+fn app_picker_quick_options_button_top(app_height: CGFloat) -> CGFloat {
+    app_picker_quick_options_button_center(app_height) - APP_PICKER_BUTTON_ROW_HEIGHT / 2.0
+}
+
+fn app_picker_icon_grid_num_rows(app_height: CGFloat, label_height: CGFloat) -> usize {
+    let grid_bottom = app_picker_quick_options_button_top(app_height)
+        - APP_PICKER_GRID_TO_BUTTON_GAP;
+    let cell_content_height = ICON_SIZE.height + ICON_LABEL_TOP_GAP + label_height;
+    let cell_step_y = cell_content_height + ICON_ROW_GAP;
+    let available_height = (grid_bottom - APP_PICKER_GRID_TOP - cell_content_height).max(0.0);
+    ((available_height / cell_step_y).floor() as usize + 1).clamp(1, APP_PICKER_ICON_ROWS)
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn classic_phone_picker_has_four_icon_rows() {
+        // A visible status bar leaves `UIScreen.applicationFrame` at 320x460.
+        assert_eq!(app_picker_icon_grid_num_rows(460.0, 12.0), APP_PICKER_ICON_ROWS);
+    }
+}
 
 enum TappedIcon {
     App(usize),
@@ -1031,14 +1001,12 @@ fn make_icon_grid(
     let num_cols_f = num_cols as CGFloat;
     let label_size = CGSize {
         width: 74.0,
-        height: 13.0,
+        height: 12.0,
     };
     let icon_gap_x: CGFloat = 19.0;
-    let icon_gap_y: CGFloat = 4.0 + label_size.height + 14.0;
-    let grid_top = 40.0;
-    let footer_top = app_frame.size.height - 124.0;
-    let cell_step_y = ICON_SIZE.height + icon_gap_y;
-    let num_rows = (((footer_top - grid_top - 8.0) / cell_step_y).floor() as usize + 1).clamp(1, 4);
+    let icon_gap_y = ICON_LABEL_TOP_GAP + label_size.height + ICON_ROW_GAP;
+    let grid_top = APP_PICKER_GRID_TOP;
+    let num_rows = app_picker_icon_grid_num_rows(app_frame.size.height, label_size.height);
     let icon_grid_width = (ICON_SIZE.width * num_cols_f) + icon_gap_x * (num_cols_f - 1.0);
     let icon_grid_origin = CGPoint {
         x: (app_frame.size.width - icon_grid_width) / 2.0,
@@ -1086,7 +1054,7 @@ fn make_icon_grid(
         let label_frame = CGRect {
             origin: CGPoint {
                 x: (icon_frame.origin.x - (label_size.width - ICON_SIZE.width) / 2.0).round(),
-                y: (icon_frame.origin.y + ICON_SIZE.height + 4.0).round(),
+                y: (icon_frame.origin.y + ICON_SIZE.height + ICON_LABEL_TOP_GAP).round(),
             },
             size: label_size,
         };
@@ -1332,7 +1300,7 @@ fn make_button_row(
 
     let button_size = CGSize {
         width: (super_view_size.width - margin) / (buttons.len() as CGFloat) - margin,
-        height: 30.0,
+        height: APP_PICKER_BUTTON_ROW_HEIGHT,
     };
     let mut button_frame = CGRect {
         origin: CGPoint {
@@ -1367,202 +1335,6 @@ fn make_button_row(
         ui_buttons.push(button);
     }
     ui_buttons
-}
-
-struct CopyrightInfoStuff {
-    main_view: id,
-    text_frame: CGRect,
-    text_label: id,
-    font: id,
-    pages: Vec<(std::ops::Range<usize>, CGFloat)>,
-    last_page_idx: Option<usize>,
-    prev_page_button: id,
-    next_page_button: id,
-}
-
-fn setup_copyright_info(
-    env: &mut Environment,
-    delegate: id,
-    super_view: id,
-    app_frame: CGRect,
-) -> CopyrightInfoStuff {
-    let main_frame = CGRect {
-        origin: CGPoint { x: 0.0, y: 0.0 },
-        size: app_frame.size,
-    };
-
-    let divider = main_frame.size.height - 40.0;
-
-    // Container for all the other stuff
-
-    let main_view: id = msg_class![env; UIView alloc];
-    let main_view: id = msg![env; main_view initWithFrame:main_frame];
-    // TODO: Isn't white the default?
-    let bg_color: id = msg_class![env; UIColor whiteColor];
-    () = msg![env; main_view setBackgroundColor:bg_color];
-    // This main_view is hidden until the copyright info button is tapped.
-    () = msg![env; main_view setHidden:true];
-    () = msg![env; super_view addSubview:main_view];
-
-    // UILabel that will display part of the copyright text
-
-    let padding = 10.0;
-    let text_frame = CGRect {
-        origin: CGPoint {
-            x: padding,
-            y: padding,
-        },
-        size: CGSize {
-            width: app_frame.size.width - padding * 2.0,
-            height: divider - padding * 2.0,
-        },
-    };
-
-    let text_label: id = msg_class![env; UILabel alloc];
-    let text_label: id = msg![env; text_label initWithFrame:text_frame];
-    () = msg![env; text_label setNumberOfLines:0]; // unlimited
-    let text_color: id = msg_class![env; UIColor blackColor];
-    () = msg![env; text_label setTextColor:text_color];
-    let bg_color: id = msg_class![env; UIColor clearColor];
-    () = msg![env; text_label setBackgroundColor:bg_color];
-    let font_size: CGFloat = 16.0;
-    let font: id = msg_class![env; UIFont systemFontOfSize:font_size];
-    () = msg![env; text_label setFont:font];
-    () = msg![env; main_view addSubview:text_label];
-
-    // Navigation
-
-    let buttons_row_center = (main_frame.size.height + divider) / 2.0;
-    let buttons = make_button_row(
-        env,
-        delegate,
-        main_view,
-        main_frame.size,
-        buttons_row_center,
-        &[
-            ("↑", "copyrightInfoPrevPage"),
-            ("↓", "copyrightInfoNextPage"),
-            ("×", "copyrightInfoHide"),
-        ],
-        Some(30.0),
-    );
-
-    CopyrightInfoStuff {
-        main_view,
-        text_frame,
-        text_label,
-        font,
-        pages: Vec::new(),
-        last_page_idx: None,
-        prev_page_button: buttons[0],
-        next_page_button: buttons[1],
-    }
-}
-
-fn change_copyright_page(
-    env: &mut Environment,
-    copyright_info_stuff: &mut CopyrightInfoStuff,
-    copyright_info_text: &str,
-    page_idx: usize,
-) {
-    // TODO: Eventually this should be ripped out and replaced with a scrolling
-    // UITextView, once that's implemented.
-
-    let &mut CopyrightInfoStuff {
-        text_frame,
-        text_label,
-        font,
-        ref mut pages,
-        ref mut last_page_idx,
-        prev_page_button,
-        next_page_button,
-        ..
-    } = copyright_info_stuff;
-
-    // Lazily lay out pages of text as needed.
-
-    if page_idx == pages.len() {
-        let mut page_start = pages.last().map_or(0, |page| page.0.end);
-        while copyright_info_text[page_start..].starts_with([' ', '\n', '\r']) {
-            page_start += 1;
-        }
-        let mut page_height = 0.0;
-        let page_end = loop {
-            let mut line_start = page_start;
-            while line_start < copyright_info_text.len() {
-                let is_first_line = line_start == page_start;
-
-                let line_end = if let Some(i) = copyright_info_text[line_start..].find('\n') {
-                    line_start + i + 1
-                } else {
-                    copyright_info_text.len()
-                };
-
-                let line = &copyright_info_text[line_start..line_end];
-
-                // Force pagination before headings (in Dynarmic's license text)
-                if !is_first_line && line.starts_with("###") {
-                    break;
-                }
-
-                let line_temp = ns_string::from_rust_string(env, line.to_string());
-                let line_size: CGSize = msg![env; line_temp sizeWithFont:font
-                                                       constrainedToSize:(text_frame.size)];
-                // Avoid accumulation of old line strings.
-                release(env, line_temp);
-
-                if page_height + line_size.height > text_frame.size.height {
-                    break;
-                }
-
-                page_height += line_size.height;
-                line_start = line_end;
-
-                // Force pagination after dividers
-                if !is_first_line && line.starts_with("---") {
-                    break;
-                }
-            }
-            let page_end = line_start;
-            assert!(page_start != page_end);
-
-            // Avoid entirely blank pages
-            if copyright_info_text[page_start..page_end].trim() == "" {
-                page_start = page_end;
-            } else {
-                break page_end;
-            }
-        };
-        assert!(page_start != page_end);
-        pages.push((page_start..page_end, page_height));
-        if page_end == copyright_info_text.len() {
-            *last_page_idx = Some(page_idx);
-        }
-    }
-
-    // Actually display the page
-
-    let (page, page_height) = pages[page_idx].clone();
-    let page = &copyright_info_text[page];
-
-    let page: id = ns_string::from_rust_string(env, page.to_string());
-    () = msg![env; text_label setText:page];
-    // Avoid accumulation of old page strings.
-    release(env, page);
-
-    // UILabel always vertically centers text. Work around that by resizing it.
-    let label_frame = CGRect {
-        origin: text_frame.origin,
-        size: CGSize {
-            width: text_frame.size.width,
-            // The page height is slightly off, a little padding is needed.
-            height: page_height + 10.0,
-        },
-    };
-    () = msg![env; text_label setFrame:label_frame];
-
-    () = msg![env; prev_page_button setHidden:(page_idx == 0)];
-    () = msg![env; next_page_button setHidden:(Some(page_idx) == *last_page_idx)];
 }
 
 struct QuickOptionsStuff {
@@ -1630,6 +1402,7 @@ fn setup_quick_options(
     delegate: id,
     super_view: id,
     app_frame: CGRect,
+    cheat_engine_enabled: bool,
 ) -> QuickOptionsStuff {
     // UIView*
     let main_frame = CGRect {
@@ -1644,7 +1417,7 @@ fn setup_quick_options(
     // TODO: Isn't white the default?
     let bg_color: id = msg_class![env; UIColor whiteColor];
     () = msg![env; main_view setBackgroundColor:bg_color];
-    // This main_view is hidden until the copyright info button is tapped.
+    // This main_view is hidden until the quick options button is tapped.
     () = msg![env; main_view setHidden:true];
     () = msg![env; super_view addSubview:main_view];
 
@@ -1722,17 +1495,18 @@ fn setup_quick_options(
         ]),
         RowKind::Label("Device model"),
         RowKind::DeviceDropdown,
+        RowKind::Label("Cheat Engine"),
+        RowKind::Switch("cheatEngine:", cheat_engine_enabled),
         RowKind::Label("Network access"),
         RowKind::Switch("network:", false),
         RowKind::Label("Show FPS"),
         RowKind::Switch("showFPS:", false),
         RowKind::Label("Trace GL errors"),
         RowKind::Switch("traceGLErrors:", false),
+        RowKind::Label("Verbose GLES"),
         RowKind::Switch("verboseGLES:", false),
         RowKind::Label("Use analog sticks for tilt controls"),
         RowKind::Switch("analogStickTiltControls:", true),
-        RowKind::Label("Use GLES1 → GLES2 translator"),
-        RowKind::Switch("gles1OnGLES2:", false),
         // ---- (divider for stuff skipped below)
         RowKind::Label("Fullscreen (override)"),
         RowKind::Switch("fullscreen:", false),
@@ -2083,4 +1857,40 @@ fn make_device_model_dropdown(
     () = msg![env; menu_view addSubview:down_btn];
 
     (button, menu_view, items, thumb_view)
+}
+
+fn quick_options_trainer_enabled(options: &Options) -> bool {
+    !options.trainer_disabled
+}
+
+fn quick_options_trainer_argument(enabled: bool) -> &'static str {
+    if enabled {
+        "--trainer"
+    } else {
+        "--no-trainer"
+    }
+}
+
+#[cfg(test)]
+mod quick_options_trainer_tests {
+    use super::*;
+
+    #[test]
+    fn trainer_toggle_defaults_off_and_emits_explicit_launch_option() {
+        let mut options = Options::default();
+
+        let mut enabled = quick_options_trainer_enabled(&options);
+        assert!(!enabled);
+        assert_eq!(quick_options_trainer_argument(enabled), "--no-trainer");
+
+        options.parse_argument("--trainer").unwrap();
+        enabled = quick_options_trainer_enabled(&options);
+        assert!(enabled);
+        assert_eq!(quick_options_trainer_argument(enabled), "--trainer");
+
+        options.parse_argument("--no-trainer").unwrap();
+        enabled = quick_options_trainer_enabled(&options);
+        assert!(!enabled);
+        assert_eq!(quick_options_trainer_argument(enabled), "--no-trainer");
+    }
 }

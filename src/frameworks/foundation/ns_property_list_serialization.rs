@@ -217,6 +217,25 @@ pub(super) fn deserialize_plist_from_file(
     deserialize_plist(env, &root, NSPropertyListImmutable)
 }
 
+/// CF-level entry point for `CFPropertyListCreateFromXMLData`.
+///
+/// Parses XML plist `data` and returns the deserialized object, or `nil` on
+/// failure. Used by Chrome's CFURLAccess glue.
+pub(crate) fn deserialize_plist_from_xml_data(
+    env: &mut Environment,
+    data: id,
+    options: NSPropertyListMutabilityOptions,
+) -> id {
+    let slice = ns_data::to_rust_slice(env, data);
+    let Ok(root) = Value::from_reader_xml(Cursor::new(slice)) else {
+        return nil;
+    };
+    if root.as_array().is_none() && root.as_dictionary().is_none() {
+        return nil;
+    }
+    deserialize_plist(env, &root, options)
+}
+
 fn deserialize_plist(
     env: &mut Environment,
     value: &Value,
@@ -496,5 +515,30 @@ fn warn_unsupported_serialize_class_once(class_name: &str) {
              further occurrences of this class will be silenced)",
             class_name
         );
+    }
+}
+
+/// CF-level entry point for `CFPropertyListCreateFromXMLData`.
+///
+/// Parses `xml_data` (an `NSData` holding XML plist bytes) and returns the
+/// deserialized property list as an `id` (an NSArray/NSDictionary/etc.), or
+/// `nil` when parsing fails. `options` uses the same numeric values as
+/// `NSPropertyListMutabilityOptions` (0 = immutable, 1 = mutable containers,
+/// 2 = mutable containers and leaves), per Apple's documentation.
+pub(crate) fn cf_property_list_create_from_xml_data(
+    env: &mut Environment,
+    xml_data: id,
+    options: NSPropertyListMutabilityOptions,
+) -> id {
+    if xml_data.is_null() {
+        return nil;
+    }
+    let slice = ns_data::to_rust_slice(env, xml_data);
+    match Value::from_reader_xml(Cursor::new(slice)) {
+        Ok(root) => deserialize_plist(env, &root, options),
+        Err(err) => {
+            log_dbg!("CFPropertyListCreateFromXMLData: parse failed: {}", err);
+            nil
+        }
     }
 }

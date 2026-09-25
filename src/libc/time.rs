@@ -12,7 +12,7 @@ use crate::libc::stdio::printf::{isspace, isspace_inner};
 use crate::mem::{guest_size_of, ConstPtr, GuestUSize, MutPtr, Ptr, SafeRead};
 use crate::Environment;
 use std::ops::Range;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 #[derive(Default)]
 pub struct State {
@@ -56,13 +56,13 @@ fn clock(env: &mut Environment) -> clock_t {
     // времени.
     // Иначе delta time = 0.0, что ведет к делению на ноль -> NaN ->
     // отрицательный sleep -> Crash.
-    Instant::now().duration_since(env.startup_time).as_micros() as clock_t
+    env.guest_clock.now().duration_since(env.startup_time).as_micros() as clock_t
 }
 
 fn time(env: &mut Environment, out: MutPtr<time_t>) -> time_t {
     // TODO: handle errno properly
     set_errno(env, 0);
-    let time64 = SystemTime::now()
+    let time64 = env.guest_clock.system_time()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_secs();
@@ -553,7 +553,7 @@ fn mktime(env: &mut Environment, tm: MutPtr<tm>) -> time_t {
 type suseconds_t = i32;
 
 #[allow(non_camel_case_types)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 #[repr(C, packed)]
 pub(super) struct timeval {
     pub(super) tv_sec: time_t,
@@ -599,7 +599,7 @@ fn gettimeofday(
         return 0;
     }
 
-    let time = SystemTime::now()
+    let time = env.guest_clock.system_time()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap();
 
@@ -629,7 +629,7 @@ fn nanosleep(env: &mut Environment, rqtp: ConstPtr<timespec>, _rmtp: MutPtr<time
     log_dbg!("nanosleep {} {}", tv_sec, tv_nsec);
 
     let total_sleep = Duration::from_secs(tv_sec) + Duration::from_nanos(tv_nsec);
-    env.sleep(total_sleep);
+    env.sleep_guest(total_sleep);
 
     0
 }
@@ -840,6 +840,16 @@ fn strftime(
                 let formatted_wday = format!("{}", wday);
                 res.extend_from_slice(formatted_wday.as_bytes());
             }
+            b'z' => {
+                // RFC 822 numeric zone: ±HHMM (e.g. +0300). Uses the guest
+                // tm_gmtoff like the %Z handler above; with the epoch-relative
+                // clock this is +0000 (UTC).
+                let gmtoff: i32 = time_val.tm_gmtoff;
+                let (sign, abs) = if gmtoff < 0 { ('-', -gmtoff) } else { ('+', gmtoff) };
+                let hh = abs / 3600;
+                let mm = (abs % 3600) / 60;
+                res.extend_from_slice(format!("{}{:02}{:02}", sign, hh, mm).as_bytes());
+            }
             b'd' => {
                 let day = time_val.tm_mday.clamp(1, 31);
                 let formatted_day = format!("{:02}", day);
@@ -879,6 +889,18 @@ fn strftime(
                 let formatted_year = format!("{:02}", year);
                 res.extend_from_slice(formatted_year.as_bytes());
             }
+            b'z' => {
+                // RFC 822 / ISO 8601 numeric offset: "+hhmm" / "-hhmm".
+                // Derived from tm_gmtoff exactly like glibc's implementation
+                // (tm_gmtoff is seconds east of UTC).
+                let offset_seconds = time_val.tm_gmtoff;
+                let sign = if offset_seconds < 0 { '-' } else { '+' };
+                let abs_offset = offset_seconds.abs();
+                let hh = abs_offset / 3600;
+                let mm = (abs_offset % 3600) / 60;
+                res.push(sign as u8);
+                res.extend_from_slice(format!("{:02}{:02}", hh, mm).as_bytes());
+            }
             b'Z' => {
                 let tz_ptr = time_val.tm_zone;
                 if tz_ptr.is_null() {
@@ -897,6 +919,17 @@ fn strftime(
                 let second = time_val.tm_sec.clamp(0, 60);
                 let formatted_second = format!("{:02}", second);
                 res.extend_from_slice(formatted_second.as_bytes());
+            }
+            b'z' => {
+                // Numeric UTC offset, e.g. "+0300". Derived from tm_gmtoff
+                // (seconds east of UTC); zones west produce a '-'.
+                let offset_seconds = time_val.tm_gmtoff as i64;
+                let sign = if offset_seconds < 0 { '-' } else { '+' };
+                let abs_offset = offset_seconds.abs();
+                let hours = abs_offset / 3600;
+                let minutes = (abs_offset % 3600) / 60;
+                let formatted_offset = format!("{}{:02}{:02}", sign, hours, minutes);
+                res.extend_from_slice(formatted_offset.as_bytes());
             }
             other => {
                 // Unsupported format specifier in strftime(). Emit it
@@ -1030,7 +1063,101 @@ fn strftime_l(
     strftime(env, s, max_size, format, time_ptr)
 }
 
+#[allow(non_camel_case_types)]
+#[repr(C, packed)]
+pub(super) struct rusage {
+    ru_utime: timeval,
+    ru_stime: timeval,
+    // The remaining fields are long counters; zero-filled is fine.
+    ru_maxrss: i32,
+    ru_ixrss: i32,
+    ru_idrss: i32,
+    ru_isrss: i32,
+    ru_minflt: i32,
+    ru_majflt: i32,
+    ru_nswap: i32,
+    ru_inblock: i32,
+    ru_oublock: i32,
+    ru_msgsnd: i32,
+    ru_msgrcv: i32,
+    ru_nsignals: i32,
+    ru_nvcsw: i32,
+    ru_nivcsw: i32,
+}
+unsafe impl SafeRead for rusage {}
+
+const RUSAGE_SELF: i32 = 0;
+
+/// `int getrusage(int who, struct rusage *usage)` (Darwin)
+///
+/// Reports the host process CPU time as the guest's user/system time. Apps
+/// like Chrome call this for performance counters and tolerate zeros, but
+/// returning real elapsed CPU time is more faithful.
+fn getrusage(env: &mut Environment, who: i32, usage_ptr: MutPtr<rusage>) -> i32 {
+    if who != RUSAGE_SELF {
+        log!("Warning: getrusage(who: {}) for non-self usage is unimplemented; returning zeros", who);
+        grusage_zero(env, usage_ptr);
+        return 0;
+    }
+    if usage_ptr.is_null() {
+        set_errno(env, 14); // EFAULT
+        return -1;
+    }
+    let elapsed = env.startup_time.elapsed();
+    let mut usage = rusage {
+        ru_utime: timeval {
+            tv_sec: elapsed.as_secs() as crate::libc::time::time_t,
+            tv_usec: (elapsed.subsec_micros()) as suseconds_t,
+        },
+        ru_stime: timeval { tv_sec: 0, tv_usec: 0 },
+        ru_maxrss: 0,
+        ru_ixrss: 0,
+        ru_idrss: 0,
+        ru_isrss: 0,
+        ru_minflt: 0,
+        ru_majflt: 0,
+        ru_nswap: 0,
+        ru_inblock: 0,
+        ru_oublock: 0,
+        ru_msgsnd: 0,
+        ru_msgrcv: 0,
+        ru_nsignals: 0,
+        ru_nvcsw: 0,
+        ru_nivcsw: 0,
+    };
+    // time_t is i64 on Darwin; our packed struct above uses the right widths
+    // via the timeval fields. Write it out.
+    env.mem.write(usage_ptr, usage);
+    0
+}
+
+fn grusage_zero(env: &mut Environment, usage_ptr: MutPtr<rusage>) {
+    if usage_ptr.is_null() {
+        return;
+    }
+    let zero = rusage {
+        ru_utime: timeval { tv_sec: 0, tv_usec: 0 },
+        ru_stime: timeval { tv_sec: 0, tv_usec: 0 },
+        ru_maxrss: 0,
+        ru_ixrss: 0,
+        ru_idrss: 0,
+        ru_isrss: 0,
+        ru_minflt: 0,
+        ru_majflt: 0,
+        ru_nswap: 0,
+        ru_inblock: 0,
+        ru_oublock: 0,
+        ru_msgsnd: 0,
+        ru_msgrcv: 0,
+        ru_nsignals: 0,
+        ru_nvcsw: 0,
+        ru_nivcsw: 0,
+    };
+    env.mem.write(usage_ptr, zero);
+}
+
 pub const FUNCTIONS: FunctionExports = &[
+    export_c_func!(getrusage(_, _)),
     export_c_func!(clock()),
     export_c_func!(time(_)),
     export_c_func!(tzset()),

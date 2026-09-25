@@ -19,11 +19,13 @@ pub mod gk_challenge_event_handler;
 mod gk_leaderboard;
 pub mod gk_leaderboard_view_controller;
 pub mod gk_local_player;
+pub mod gk_matchmaker;
 mod gk_score;
 mod gk_session;
 mod gk_turn_based_event_handler;
 
 use crate::dyld::{ConstantExports, HostConstant};
+use crate::mem::ConstVoidPtr;
 
 /// Apple GameKit framework — `GKError.h`. `GKErrorDomain` is the
 /// `NSError.domain` value used for every error reported by GameKit
@@ -31,13 +33,21 @@ use crate::dyld::{ConstantExports, HostConstant};
 /// matchmaking). Apps compare against it with
 /// `[error.domain isEqualToString:GKErrorDomain]` to filter
 /// GameKit-specific failures, so the literal must match Apple's.
-pub const CONSTANTS: ConstantExports =
-    &[("_GKErrorDomain", HostConstant::NSString("GKErrorDomain"))];
+pub const CONSTANTS: ConstantExports = &[
+    ("_GKErrorDomain", HostConstant::NSString("GKErrorDomain")),
+    // GKTurnTimeoutNone is a documented sentinel NSTimeInterval meaning
+    // "this turn never times out"; the SDK exports it as -1.
+    (
+        "_GKTurnTimeoutNone",
+        HostConstant::Custom(|env| env.mem.alloc_and_write(-1.0f64).cast().cast_const()),
+    ),
+];
 
 /// Per-process state for the GameKit framework.
 #[derive(Default)]
 pub struct State {
     pub local_player: gk_local_player::State,
+    pub matchmaker: gk_matchmaker::State,
     pub challenge_event_handler: gk_challenge_event_handler::State,
     pub turn_based_event_handler: gk_turn_based_event_handler::State,
 }
@@ -54,6 +64,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         gk_leaderboard::CLASSES,
         gk_leaderboard_view_controller::CLASSES,
         gk_local_player::CLASSES,
+        gk_matchmaker::CLASSES,
         gk_score::CLASSES,
         gk_session::CLASSES,
     ],

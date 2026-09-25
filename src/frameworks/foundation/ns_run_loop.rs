@@ -21,7 +21,7 @@ use crate::frameworks::core_foundation::cf_run_loop::{
 use crate::frameworks::{core_animation, media_player, uikit};
 use crate::objc::{id, msg, nil, objc_classes, release, retain, Class, ClassExports, HostObject};
 use crate::Environment;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// `NSString*`
 pub type NSRunLoopMode = id;
@@ -360,6 +360,14 @@ pub fn run_run_loop(
 
     let is_main_run_loop = env.current_thread == 0;
 
+    if is_main_run_loop && !single_iteration {
+        // Diagnostic: everything the app's UI does — event delivery,
+        // composition, timers — is dispatched from this loop. If this line
+        // never appears in the log, the app hung before its run loop ever
+        // started (e.g. somewhere inside applicationDidFinishLaunching).
+        log_once!("Main run loop: now dispatching events, timers and composition");
+    }
+
     loop {
         let mut sleep_until = None;
 
@@ -389,7 +397,9 @@ pub fn run_run_loop(
 
         for timer in timers_tmp.drain(..) {
             let next_due = ns_timer::handle_timer(env, timer);
-            limit_sleep_time(&mut sleep_until, next_due);
+            // Timer deadlines are virtual; audio/UI deadlines remain real.
+            let host_due = next_due.map(|due| env.guest_clock.host_deadline(due));
+            limit_sleep_time(&mut sleep_until, host_due);
             release(env, timer);
         }
 
@@ -462,7 +472,7 @@ pub fn run_run_loop(
             // and not worthy to convert back and forth)
             // The host clock could be set before the Unix epoch (or skew
             // backwards); never panic on that, just treat it as "not yet".
-            let now_secs = SystemTime::now()
+            let now_secs = env.guest_clock.system_time()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs_f64();
@@ -474,7 +484,7 @@ pub fn run_run_loop(
 }
 
 /// Helper method for `mainRunLoop` and `currentRunLoop` NSThread class methods
-fn run_loop_for_thread(env: &mut Environment, this: Class, thread_id: ThreadId) -> id {
+pub(crate) fn run_loop_for_thread(env: &mut Environment, this: Class, thread_id: ThreadId) -> id {
     if env.threads[thread_id]
         .thread_local_framework_state
         .foundation

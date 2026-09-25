@@ -21,7 +21,9 @@ use crate::export_c_func;
 use crate::frameworks::audio_toolbox::audio_components::{
     self, AURenderCallbackStruct, AudioComponentInstance,
 };
-use crate::frameworks::audio_toolbox::audio_unit::{setup_audio_unit_for_render, AudioUnit};
+use crate::frameworks::audio_toolbox::audio_unit::{
+    notify_audio_unit_is_running, setup_audio_unit_for_render, AudioUnit,
+};
 use crate::frameworks::carbon_core::{paramErr, OSStatus};
 use crate::frameworks::core_foundation::cf_run_loop::CFRunLoopGetMain;
 use crate::frameworks::foundation::ns_run_loop;
@@ -248,8 +250,22 @@ fn AUGraphOpen(env: &mut Environment, graph: AUGraph) -> OSStatus {
     log_dbg!("AUGraphOpen({:?}) {} node(s)", graph, node_ids.len());
 
     for node_id in node_ids {
+        // Прокидываем описание узла (type, subtype, manufacturer) в
+        // создаваемый инстанс — для ответов на kAudioUnitProperty_ClassInfo.
+        let component_desc = State::get(&mut env.framework_state)
+            .graphs
+            .get(&graph)
+            .and_then(|s| s.nodes.get(&node_id))
+            .map(|n| {
+                let d = n.desc;
+                (
+                    d.component_type,
+                    d.component_sub_type,
+                    d.component_manufacturer,
+                )
+            });
         let guest_instance: AudioComponentInstance =
-            audio_components::create_audio_unit_instance(env);
+            audio_components::create_audio_unit_instance(env, component_desc);
         if let Some(state) = State::get(&mut env.framework_state).graphs.get_mut(&graph) {
             if let Some(graph_node) = state.nodes.get_mut(&node_id) {
                 graph_node.audio_unit = Some(guest_instance);
@@ -318,11 +334,21 @@ fn AUGraphStop(env: &mut Environment, graph: AUGraph) -> OSStatus {
     };
 
     for unit in units {
+        let was_started = audio_components::State::get(&mut env.framework_state)
+            .audio_component_instances
+            .get(&unit)
+            .map(|obj| obj.started)
+            .unwrap_or(false);
+
         if let Some(obj) = audio_components::State::get(&mut env.framework_state)
             .audio_component_instances
             .get_mut(&unit)
         {
             obj.started = false;
+        }
+
+        if was_started {
+            notify_audio_unit_is_running(env, unit);
         }
     }
 

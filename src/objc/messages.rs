@@ -463,6 +463,17 @@ fn objc_msgSend_inner(
                 )
             };
 
+            // `+[Class self]` must return the class itself. The real objc
+            // runtime resolves `self` via the metaclass root NSObject chain,
+            // but a bare metaclass registered for an unimplemented class
+            // falls through here and previously returned 0 — breaking e.g.
+            // the Burstly ad SDK which calls `+[BurstlyCurrency... self]`.
+            if selector.as_str(&env.mem) == "self" {
+                env.cpu.regs_mut()[0] = receiver.to_bits();
+                env.cpu.regs_mut()[1] = 0;
+                return;
+            }
+
             let missing_selector_name = selector.as_str(&env.mem).to_owned();
 
             if try_cocos_missing_selector_compat(
@@ -1375,15 +1386,18 @@ fn try_nsarray_indexed_subscript_interpose(
     selector: SEL,
     orig_class: Class,
 ) -> bool {
-    let sel_name = selector.as_str(&env.mem).to_string();
-    if sel_name != "objectAtIndexedSubscript:" {
+    // PERF: this probe runs on *every* guest message send, before the real
+    // method lookup. Compare in place instead of allocating selector and
+    // class-name Strings each time.
+    if selector.as_str(&env.mem) != "objectAtIndexedSubscript:" {
         return false;
     }
 
-    let class_name = env.objc.get_class_name(orig_class).to_owned();
+    let class_name = env.objc.get_class_name(orig_class);
     if !class_name.contains("NSArray") && !class_name.contains("NSMutableArray") {
         return false;
     }
+    let class_name = class_name.to_owned();
 
     let index = env.cpu.regs()[2];
 
@@ -1775,14 +1789,31 @@ fn try_gdataxml_interpose(
     selector: SEL,
     orig_class: Class,
 ) -> bool {
-    let sel = selector.as_str(&env.mem).to_string();
-    let Some(class_name) = gdata_class_name(env, orig_class) else {
-        return false;
-    };
-
-    if !gdata_is_class(&class_name) {
-        return false;
+    // PERF: this probe runs on *every* guest message send. Reject non-GData
+    // classes with a zero-allocation borrowed-name check first; only actual
+    // GDataXML classes fall through to the name clones below (the clones
+    // exist so the borrow of `env.objc` ends before handler arms use
+    // `&mut env`).
+    {
+        let class_ref = env.objc.get_host_object(orig_class).and_then(|ho| {
+            if let Some(co) = ho.as_any().downcast_ref::<super::ClassHostObject>() {
+                Some(co.name.as_str())
+            } else if let Some(co) = ho.as_any().downcast_ref::<super::UnimplementedClass>() {
+                Some(co.name.as_str())
+            } else if let Some(co) = ho.as_any().downcast_ref::<super::FakeClass>() {
+                Some(co.name.as_str())
+            } else {
+                None
+            }
+        });
+        let is_gdata = class_ref.is_some_and(gdata_is_class);
+        if !is_gdata {
+            return false;
+        }
     }
+
+    let sel = selector.as_str(&env.mem).to_string();
+    let class_name = gdata_class_name(env, orig_class).unwrap_or_default();
 
     // Pull raw objc_msgSend argument registers before any nested host call can
     // clobber them.

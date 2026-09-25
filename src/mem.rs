@@ -587,6 +587,7 @@ impl Mem {
     /// 0. This may be inconvenient in some cases, but it makes the behavior
     /// when deriving a pointer from the slice consistent (though you should use
     /// [Self::ptr_at] for that).
+    #[inline]
     pub fn bytes_at<const MUT: bool>(&self, ptr: Ptr<u8, MUT>, count: GuestUSize) -> &[u8] {
         // ХАК: Вместо паники логируем и возвращаем данные из stub-страницы
         if ptr.to_bits() < self.null_segment_size {
@@ -652,6 +653,7 @@ impl Mem {
     /// 0. This may be inconvenient in some cases, but it makes the behavior
     /// when deriving a pointer from the slice consistent (though you should use
     /// [Self::ptr_at_mut] for that).
+    #[inline]
     pub fn bytes_at_mut(&mut self, ptr: MutPtr<u8>, count: GuestUSize) -> &mut [u8] {
         // ХАК: Вместо паники логируем и возвращаем данные из stub-страницы
         if ptr.to_bits() < self.null_segment_size {
@@ -696,6 +698,7 @@ impl Mem {
     /// Rust strictly requires pointers to be
     /// well-aligned when dereferencing them, or when constructing references or
     /// slices from them, so **be very careful**.
+    #[inline]
     pub fn ptr_at<T, const MUT: bool>(&self, ptr: Ptr<T, MUT>, count: GuestUSize) -> *const T
     where
         T: SafeRead,
@@ -732,6 +735,7 @@ impl Mem {
     /// Rust strictly requires pointers to be
     /// well-aligned when dereferencing them, or when constructing references or
     /// slices from them, so **be very careful**.
+    #[inline]
     pub fn ptr_at_mut<T>(&mut self, ptr: MutPtr<T>, count: GuestUSize) -> *mut T
     where
         T: SafeRead + SafeWrite,
@@ -769,6 +773,7 @@ impl Mem {
     /// Read a value for memory.
     /// This is the preferred way to read memory in
     /// most cases.
+    #[inline]
     pub fn read<T, const MUT: bool>(&self, ptr: Ptr<T, MUT>) -> T
     where
         T: SafeRead,
@@ -781,6 +786,7 @@ impl Mem {
     /// Write a value to memory.
     /// This is the preferred way to write memory in
     /// most cases.
+    #[inline]
     pub fn write<T>(&mut self, ptr: MutPtr<T>, value: T)
     where
         T: SafeWrite,
@@ -909,6 +915,31 @@ impl Mem {
     /// defensively reject garbage pointers at the libc free() wrapper.
     pub fn is_known_allocation(&self, addr: VAddr) -> bool {
         self.allocator.is_known_allocation(addr)
+    }
+
+    /// Returns a snapshot of all currently-live heap allocations as
+    /// `(base_address, size_in_bytes)` pairs.
+    ///
+    /// This is used by the RTCV-style memory corruption engine
+    /// ([crate::corrupt]) so it can target only memory the guest has actually
+    /// allocated, which keeps corruption "interesting" (it mangles live game
+    /// state) while avoiding writes to unmapped address space that would just
+    /// crash the emulator immediately.
+    pub fn live_allocations(&self) -> Vec<(GuestUSize, GuestUSize)> {
+        self.allocator.live_allocations()
+    }
+
+    /// Corrupt a single byte of guest memory at `addr` by replacing it with
+    /// `value`, RTCV "Blast"-style. Returns the previous byte value.
+    ///
+    /// SAFETY/CORRECTNESS: `addr` must lie within a live allocation (see
+    /// [Self::live_allocations]). The corruption engine guarantees this.
+    pub fn corrupt_byte(&mut self, addr: GuestUSize, value: u8) -> u8 {
+        let ptr: MutPtr<u8> = Ptr::from_bits(addr);
+        let slice = self.bytes_at_mut(ptr, 1);
+        let old = slice[0];
+        slice[0] = value;
+        old
     }
 
     pub fn realloc(&mut self, old_ptr: MutVoidPtr, size: GuestUSize) -> MutVoidPtr {

@@ -17,21 +17,26 @@ Changes are categorised as follows:
 
 Compatibility:
 
+- `realpath()` no longer aborts the guest when the app passes `NULL` as the resolved-path buffer (a valid POSIX usage that mallocs the result); it now allocates the buffer instead. It also sets `errno`/returns `NULL` on unreadable paths instead of failing the whole call. `dirname(3)` is now implemented, along with `getpwuid_r(3)` (a single stub `root`/`mobile` user with the app-container home directory) and `sysconf(_SC_GETPW_R_SIZE_MAX)`. Together these fix Unity's startup path (`rvmStartup` → `getenv("HOME")` fallback chain) for Unity games such as Deep Town. (@KlugKlugTG)
+
 - New working apps:
-  - [Devil May Cry 4 Refrain](https://appdb.touchhle.org/apps/999) (@hikari-no-yume)
-  - [Amerzone Pt1](https://appdb.touchhle.org/apps/1091) (@ciciplusplus)
-  - [Eternal Legacy](https://appdb.touchhle.org/apps/1107) (@ciciplusplus)
-  - [Dungeon Hunter 2](https://appdb.touchhle.org/apps/460) (@ciciplusplus)
-  - [N.O.V.A. 2: The Hero Rises Again](https://appdb.touchhle.org/apps/444) (@ciciplusplus)
-  - [Star Battalion](https://appdb.touchhle.org/apps/421) (@ciciplusplus)
-  - [Ice Age: Dawn of the Dinosaurs](https://appdb.touchhle.org/apps/60) (@ciciplusplus)
-  - [Zombieville](https://appdb.touchhle.org/apps/1183) (@ciciplusplus)
-  - [Doom Resurrection](https://appdb.touchhle.org/apps/278) (@ciciplusplus)
-  - [Ace Combat Xi](https://appdb.touchhle.org/apps/195) (@alborrajo)
-  - [Fruit Ninja](https://appdb.touchhle.org/apps/261) (@acieslewicz, @ciciplusplus)
-  - [Asphalt 6](https://appdb.touchhle.org/apps/1217) (@ciciplusplus)
-  - [World of Goo](https://appdb.touchhle.org/apps/1210) (@ciciplusplus)
+  - Devil May Cry 4 Refrain (@hikari-no-yume)
+  - Amerzone Pt1 (@ciciplusplus)
+  - Eternal Legacy (@ciciplusplus)
+  - Dungeon Hunter 2 (@ciciplusplus)
+  - N.O.V.A. 2: The Hero Rises Again (@ciciplusplus)
+  - Star Battalion (@ciciplusplus)
+  - Ice Age: Dawn of the Dinosaurs (@ciciplusplus)
+  - Zombieville (@ciciplusplus)
+  - Doom Resurrection (@ciciplusplus)
+  - Ace Combat Xi (@alborrajo)
+  - Fruit Ninja (@acieslewicz, @ciciplusplus)
+  - Asphalt 6 (@ciciplusplus)
+  - World of Goo (@ciciplusplus)
 - API support improvements:
+  - `-[NSObject performSelectorOnMainThread:withObject:waitUntilDone:]` now queues `waitUntilDone:NO` calls made on the main thread for the next run-loop pass instead of invoking them inline. This prevents asynchronous startup callbacks from observing partially initialized state and fixes Battleship FREE's age/terms flow stalling before its first rendered frame.
+  - `NSBundle` now retains cached bundle instances, and `UINib` honors the bundle argument instead of asserting that every nib comes from the main app bundle. This allows Battleship FREE to load its nested age-verification nib and localized strings.
+  - Bundled Mach-O dependencies are loaded transitively, and the guest ARM SJLJ unwinder is preferred when present instead of being replaced by host stubs; this lets C++ exceptions unwind normally during game startup.
   - `CFURLCreateStringByReplacingPercentEscapesUsingEncoding()` is now implemented per Apple's documentation instead of returning the input string unchanged: every `%XX` escape is decoded using the specified encoding, characters named in `charactersToLeaveEscaped` keep their escape sequences, invalid or incomplete escape sequences return `NULL`, and passing an empty string removes all escapes. Previously apps that used it to unescape URLs got escaped strings back.
   - `AudioFileGetGlobalInfoSize()` and `AudioFileGetGlobalInfo()` now answer the documented global info properties `kAudioFileGlobalInfo_ReadableTypes`, `kAudioFileGlobalInfo_WritableTypes` and `kAudioFileGlobalInfo_AvailableFormatIDs` (with the documented file-type specifier) instead of returning `kAudioFileUnsupportedPropertyError`, and follow the documented buffer-size protocol (`kAudioFileBadPropertySizeError` for undersized buffers) otherwise.
   - `-[UIViewController dismissMoviePlayerViewControllerAnimated]` now dismisses the presented movie player view controller with the standard transition (previously a no-op stub), so apps that show a full-screen movie on launch can be closed again.
@@ -57,53 +62,90 @@ Compatibility:
   - `dictionaryWithObjectsAndKeys:`/`initWithObjectsAndKeys:` now match Apple's documented vararg contract: the list is `(object1, key1, ...)`, terminated by a `nil` *object*, so a `nil` first object returns an empty dictionary without reading further varargs, and a `nil` *key* now skips just that pair and keeps parsing the rest (previously the whole dictionary was abandoned, losing every valid pair after it). Combined with the existing `-[NSMutableDictionary setObject:forKey:]` nil-key guard, apps whose ad/SDK layers build metadata conditionally (e.g. skipping absent keys) no longer lose data or abort on startup.
   - The bundled dynamic libraries, libgcc and libstdc++, have been updated to their iOS 4.0.1 versions. (@ciciplusplus)
   - Support for NIBArchive NIB file format decoding. (@ciciplusplus)
+  - `raise()` and the signal dispositions installed with `signal()`/`sigaction()` are now honoured. `raise()` no longer hits the dynamic linker's return-0 stub: when a handler is installed it is called synchronously on the calling guest thread, `SIG_IGN` is ignored as documented, and a fatal default action ends the guest session through the same controlled recovery path as `abort()` (which now raises `SIGABRT` first, so crash reporters and Unity's unhandled-exception shim run). `pthread_kill()` delivers to the calling thread through the same machinery (previously a silent return-0 stub) and reports `ESRCH` for unknown thread handles, and the `sys_siglist` signal-name table is exported.
+  - New `WatchConnectivity.framework` implementation: `WCSession` (with `+isSupported`, `+defaultSession`, delegate/activation-state handling, `sendMessage:replyHandler:errorHandler:` and the transfer APIs), `WCSessionUserInfoTransfer`, `WCSessionFile` and `WCSessionFileTransfer` exist as real classes, and `WCErrorDomain` is exported. Since there is no paired Apple Watch, the session behaves like one on an iPhone without a watch: activation succeeds, `isPaired`/`isWatchAppInstalled`/`isReachable` are `NO`, and send/transfer APIs report the documented `WCErrorDomain` errors instead of silently pretending to succeed. Previously every app that probed `[WCSession isSupported]` was told the class was unimplemented.
+  - `-[NSBundle localizedInfoDictionary]` now returns the bundle's localized information-property-list, i.e. the `InfoPlist.strings` of the preferred localization (`en.lproj`, `English.lproj` or `Base.lproj` fallbacks as with other resources) layered over the plain `Info.plist` contents, instead of returning `infoDictionary` unchanged. Previously `CFBundleGetLocalInfoDictionary()` and apps that read keys such as `CFBundleDisplayName` from this dictionary saw untranslated values.
 - Switch to coroutine based threading system. This solved [some compatibility issues](https://github.com/touchHLE/touchHLE/issues/119) and improved performance in some games. (@abnormalmaps)
+
+Quality and performance:
+
+- Major GLES presentation and draw-call overhead optimisation pass, plus stability fixes for everything that puts the picture on screen:
+  - Frames rendered into a fullscreen `CAEAGLLayer` are now presented on the GPU on every backend (the renderbuffer is copied into a texture and drawn into the window). Previously, on every native OpenGL ES 1.1 backend — i.e. for every ES 1.1 game on Android, including the bundled ANGLE driver — each frame was instead pulled back to system RAM with `glReadPixels()` (a full GPU pipeline stall), re-uploaded as a texture and pushed through the Core Animation compositor. That round trip was by far the largest per-frame cost on Android. The readback route is still available as `--present-mode=readback` (or `TOUCHHLE_PRESENT_MODE=readback`) for broken vendor drivers, and the default `--present-mode=auto` verifies the GPU route during the first seconds of a session by sampling a few pixels of the source and of the window: if the window stays black while the app's frame has content, it switches to readback automatically and says so in the log.
+  - The presenters no longer issue a `glFinish()` on every frame before copying the renderbuffer; the copy is ordered after the app's draws by the driver anyway, and the forced pipeline drain prevented the GPU from working on one frame while the emulator prepared the next. `--present-finish` (or `TOUCHHLE_PRESENT_FINISH=1`) brings the old behaviour back for drivers that need it.
+  - The presented window always has an opaque alpha channel now (the ES 2.0 present shader writes alpha 1.0, the ES 1.1 path masks alpha writes), so an app that leaves alpha < 1 in its renderbuffer can no longer come out darkened or see-through on window surfaces whose alpha the OS compositor honours (Android).
+  - `gl*Pointer`, `glVertexAttribPointer`, `glDrawArrays` and `glDrawElements` no longer ask the host driver about the buffer bindings and the fog state on every call (each such query came with a `glGetError()` round-trip to swallow the errors strict drivers raise for it — up to nine extra driver calls per draw). That state is now mirrored per context as the guest sets it, and generic-vertex-attribute guards are skipped entirely for the fixed-function apps that never enable such attributes.
+  - The ES 1.1 present path probes which capability enums the driver rejects once per context instead of wrapping every capability save/restore of every frame in error-drain loops (~100 fewer GL calls per presented frame), and the ES 2.0 presenter only clears the colour buffer of the (depth/stencil-less) window.
+  - The compositor updates layer textures in place with `glTexSubImage2D` when their size hasn't changed (instead of reallocating them with `glTexImage2D`), no longer clones a `CAEAGLLayer`'s full frame of pixels when building its presentation layer, and the readback presenter recycles its pixel buffer instead of allocating a fresh one every frame.
+  - Stability: `renderbufferStorage:fromDrawable:` clamps absurd renderbuffer sizes instead of panicking on the `GLsizei` conversion, error-queue drains in the presenter are bounded so a sticky driver error can't hang the emulator, and the per-thread current-context lookup on every GL call is a single hash lookup instead of two.
+- Android frame-rate pass for OpenGL ES 2.0 games (e.g. N.O.V.A. 3, Asphalt), which typically ran at half the display refresh rate on this fork while the same games reach the full rate on forks that use the vendor's GL driver without vsync:
+  - Apps whose executable only imports OpenGL ES 2.0 shader entry points use the vendor's native driver instead of bundled ANGLE. For ES 1.1-capable apps and the app picker, `auto` selects ANGLE only when Android exposes an Adreno KGSL GPU; other or unrecognized GPUs stay on the system driver rather than assuming ANGLE's Vulkan backend is supported. `--gl-driver=angle|native` (or `TOUCHHLE_GL_DRIVER`) overrides the automatic choice.
+  - Vsync is now off by default on Android (`--vsync=auto`). HyperHLE paces frames itself and the Android compositor is synchronised to the display anyway, so a blocking `eglSwapBuffers` could not prevent tearing — it could only stall the emulator thread, and a frame that took slightly longer than one refresh then cost two (60 FPS → 30 FPS). `--vsync=on|off` (or `TOUCHHLE_VSYNC`) sets it explicitly on every platform; desktop defaults are unchanged.
+  - The emulator thread now runs at Android's "display" scheduling priority and reports its per-frame CPU time to the system performance hint manager (ADPF, Android 13+), so the CPU governor keeps the core clocked for the emulated workload rather than for the idle time between frames — the usual reason an emulated game that could run at 60 FPS settles at 30 after a few seconds. `--no-perf-hints` (or `TOUCHHLE_PERF_HINTS=0`) turns both off.
+- `CMDeviceMotion`/`CMAttitude` now expose the filter's continuous, full-3D quaternion (with pitch/roll/yaw decomposed from it) instead of a quaternion rebuilt from two gravity angles with a forced zero yaw. The two-angle construction had seams exactly in the poses people game in; near a seam a tiny physical twist produced an enormous frame-to-frame attitude delta and camera code consuming the attitude spun the view to maximum. `attitude`/`quaternion`/`rotationMatrix` are now always mutually consistent. (@KlugKlugTG)
+- The device-motion attitude filter now also learns the gyroscope's constant bias while the device is provably stationary (judging by accelerometer stability rather than by the gyro reading itself, so even a large constant offset converges), and its gravity input is low-passed first — together this removes both the bias-driven attitude wander and the resting-hand jitter seen in tilt-camera games. Diagnostic: setting `TOUCHHLE_NO_MOTION_GYRO` disables gyro integration entirely (for hosts with a genuinely unusable gyroscope signal).
+- `CMAttitude` now implements `rotationMatrix` and `multiplyByInverseOfAttitude:` — the standard way games calibrate a neutral pose for tilt-driven 3D cameras (store a reference attitude, then read camera-relative attitude). Previously these were unimplemented, so games fell back to the absolute world-frame attitude — which legitimately sits near its extremes in the upright gaming hold — and a small tilt could swing the camera through its whole range. (@KlugKlugTG)
+- `CMDeviceMotion` is now produced by a small gyroscope+accelerometer sensor-fusion filter (attitude tracked by integrating the real gyroscope and continuously corrected towards gravity), instead of deriving roll/pitch straight from the raw gravity vector. The old approach blew up in the typical upright, landscape gaming hold — where gravity's out-of-screen component is ~0 — so a small tilt could swing the estimated attitude straight to its extremes (games like Asphalt 7 would snap the camera to maximum on the slightest tilt). `userAcceleration` is now also reported (raw acceleration minus the fused gravity estimate). For smoothness the visible motion is dominated by the continuous gyroscope integration, with gravity only gently correcting long-term drift, and the gravity correction is automatically distrusted whenever the accelerometer magnitude deviates from 1g (device being shaken), so sensor noise and hand jitter no longer leak into the on-screen camera. (@KlugKlugTG)
+- Fixed `CMDeviceMotion.attitude` reporting pitch and roll about the wrong device axes (they were effectively swapped, with mismatched signs, and inconsistent with the returned quaternion). Games that tilt-steer or swing a 3D camera using Core Motion device motion (e.g. Asphalt 7's tilt camera) should now move the view in the correct direction for the actual device rotation. (@KlugKlugTG)
+- Added a per-game accelerometer escape hatch for games whose tilt controls come out mirrored or sideways on the host device: set the environment variable `TOUCHHLE_ACCELEROMETER_AXES` to a comma-separated list choosing any of `swap`, `flipx`, `flipy` (e.g. `TOUCHHLE_ACCELEROMETER_AXES=swap,flipy`). It applies to real hardware-sensor data only and is read once at startup.
+- The Objective-C runtime's hot lookup tables (object map, method tables, initialized-classes set and related bookkeeping) now use a fast integer-oriented hasher instead of the standard-library default SipHash, cutting a handful of hashes done for every guest message send and every retain/release/autorelease down to a multiply-rotate each.
+- Two compatibility probes that ran on every single guest message send (NSArray subscripting and the GDataXML layer) no longer allocate selector/class-name Strings per message; they now reject non-matching messages allocation-free.
+- The guest-memory read/write fast path (`read`, `write`, `bytes_at`, `bytes_at_mut`, `ptr_at`, `ptr_at_mut`) is now marked `#[inline]` so callers in hot framework code don't pay a call and re-derivation each access.
+- Implemented true frame pacing in the EAGL presentation path, making the picture noticeably smoother: the frame limiter now paces the guest to an exact frame deadline using a hybrid timer — a cooperative `env.sleep()` until shortly before the deadline (other guest threads still run) followed by a short spin-wait for the last ~2ms. Previously the pacing sleep was a plain timer sleep that could wake several ms late, starting the guest's next frame late and visibly wobbling the frame cadence (micro-stutter). The wake-up now lands within tens of microseconds of the deadline.
+- The CPU scheduler batch is now adaptive: 1,000,000 ticks during long busy stretches, automatically reduced to 100,000 whenever any guest thread has an imminent wake deadline (<10ms), so frame pacing, run-loop timers and audio callbacks stay millisecond-precise.
+- Major performance optimisation pass, focused on game FPS on Android devices:
+  - The dynarmic CPU JIT now enables its "unsafe" floating-point/codegen optimizations (`Unsafe_UnfuseFMA`, `Unsafe_ReducedErrorFP`, `Unsafe_InaccurateNaN`, `Unsafe_IgnoreStandardFPCRValue`; the accuracy differences are limited to FP edge cases that games don't depend on), so VFP/NEON-heavy guest code no longer pays for per-instruction NaN/rounding bookkeeping where the backend supports these switches (currently the x86-64 JIT backend; on AArch64 hosts the flags are accepted but don't change emitted code yet). `Unsafe_IgnoreGlobalMonitor` deliberately stays off so guest atomics remain correct on multithreaded apps.
+  - The CPU scheduler batch was raised from 100,000 to 1,000,000 ticks, amortising JIT exits, coroutine switches and scheduler passes ~10x better. Event polling keeps its independent 120 Hz throttle and guest thread wakeups are deadline-based, so input and timer responsiveness are unaffected.
+  - The release profile now uses fat (whole-program) LTO instead of thin LTO, letting LLVM inline across all crate boundaries in the hottest emulation paths.
+  - The global allocator is now mimalloc, which handles the emulator's small-allocation-heavy workload (autorelease pools, string and collection churn in the HLE frameworks) measurably faster than the platform allocator, especially on Android.
+  - On Android the emulator thread's scheduling priority is raised via SDL's `SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH)`, keeping the emulation loop on big CPU cores on big.LITTLE SoCs.
+  - The window framebuffer no longer requests depth/stencil buffers it never uses (everything host-drawn is a flat textured quad), saving a swap chain resolution's worth of bandwidth on tile-based mobile GPUs.
+  - Per-frame/per-touch `getenv`-style debug toggle checks (`TOUCHHLE_*` env vars on the present, viewport, draw-call, hit-test and touch-remap paths) are now read once and cached; previously several of them ran an environ scan with locking and allocation on every frame or touch event.
 
 ## v0.2.3 (2026-01-02)
 
 Compatibility:
 
 - New working apps:
-  - [Dungeon Hunter](https://appdb.touchhle.org/apps/313) (@ciciplusplus)
-  - [Crystal Defenders: Vanguard Storm](https://appdb.touchhle.org/apps/100) (@ciciplusplus)
-  - [Zombie Infection](https://appdb.touchhle.org/apps/347) (@ciciplusplus)
-  - [Gangstar: West Coast Hustle](https://appdb.touchhle.org/apps/351) (@ciciplusplus)
-  - [Asphalt 4: Elite Racing](https://appdb.touchhle.org/apps/96) (@ciciplusplus)
-  - [Prince of Persia: Warrior Within](https://appdb.touchhle.org/apps/127) (@ciciplusplus)
-  - [Resident Evil 4: Mobile Edition](https://appdb.touchhle.org/apps/91) (@alborrajo)
-  - [Command & Conquer: Red Alert](https://appdb.touchhle.org/apps/404) (@ciciplusplus)
-  - [SimCity](https://appdb.touchhle.org/apps/250) (@ciciplusplus)
-  - [Asphalt 5](https://appdb.touchhle.org/apps/411) (@ciciplusplus, @hikari-no-yume)
-  - [Cut the Rope](https://appdb.touchhle.org/apps/124) (@ciciplusplus)
-  - [Skater Nation](https://appdb.touchhle.org/apps/424) (@ciciplusplus)
-  - [Iron Man 2](https://appdb.touchhle.org/apps/451) (@ciciplusplus)
-  - [Shrek Forever After](https://appdb.touchhle.org/apps/427) (@ciciplusplus)
-  - [Spore Origins](https://appdb.touchhle.org/apps/302) (@ciciplusplus, @hikari-no-yume, @teromene)
-  - [Defender Chronicles](https://appdb.touchhle.org/apps/267) (@hujerhoe)
-  - [Real Racing](https://appdb.touchhle.org/apps/188) (@ciciplusplus)
-  - [Tom Clancy's Splinter Cell: Conviction](https://appdb.touchhle.org/apps/416) (@ciciplusplus)
-  - [Assassin's Creed](https://appdb.touchhle.org/apps/413) (@ciciplusplus)
-  - [N.O.V.A. Near Orbit Vanguard Alliance](https://appdb.touchhle.org/apps/443) (@ciciplusplus)
-  - [Brothers in Arms 2: Global Front](https://appdb.touchhle.org/apps/464) (@ciciplusplus)
-  - [Ferrari GT: Evolution](https://appdb.touchhle.org/apps/116) (@ciciplusplus)
-  - [Castle Frenzy](https://appdb.touchhle.org/apps/463) (@ciciplusplus)
-  - [Hero of Sparta 2](https://appdb.touchhle.org/apps/453) (@ciciplusplus)
-  - [Hero of Sparta](https://appdb.touchhle.org/apps/452) (@ciciplusplus)
-  - [Bridge Odyssey](https://appdb.touchhle.org/apps/465) (@ciciplusplus)
-  - [Terminator Salvation](https://appdb.touchhle.org/apps/344) (@ciciplusplus)
-  - [Brothers In Arms: Hour Of Heroes](https://appdb.touchhle.org/apps/369) (@ciciplusplus)
-  - [Crusade Of Destiny](https://appdb.touchhle.org/apps/792) (@ciciplusplus)
-  - [Arvale](https://appdb.touchhle.org/apps/671) (@ciciplusplus)
-  - [Battlefield: Bad Company 2](https://appdb.touchhle.org/apps/817) (@ciciplusplus)
-  - [Ms. PAC-MAN](https://appdb.touchhle.org/apps/63) (@acieslewicz)
-  - [Dark Nebula](https://appdb.touchhle.org/apps/910) (@ciciplusplus)
-  - [FIFA 10](https://appdb.touchhle.org/apps/496) (@ciciplusplus)
-  - [Crash Bandicoot Nitro Kart 2](https://appdb.touchhle.org/apps/670) (@ciciplusplus)
-  - [Driver](https://appdb.touchhle.org/apps/247) (@ciciplusplus)
-  - [Sacred Odyssey: Rise of Ayden](https://appdb.touchhle.org/apps/431) (@ciciplusplus)
-  - [Nanosaur 2](https://appdb.touchhle.org/apps/991) (@ciciplusplus)
-  - [Cro-Mag Rally](https://appdb.touchhle.org/apps/992) (@ciciplusplus)
-  - [Bugdom 2](https://appdb.touchhle.org/apps/995) (@ciciplusplus)
+  - Dungeon Hunter (@ciciplusplus)
+  - Crystal Defenders: Vanguard Storm (@ciciplusplus)
+  - Zombie Infection (@ciciplusplus)
+  - Gangstar: West Coast Hustle (@ciciplusplus)
+  - Asphalt 4: Elite Racing (@ciciplusplus)
+  - Prince of Persia: Warrior Within (@ciciplusplus)
+  - Resident Evil 4: Mobile Edition (@alborrajo)
+  - Command & Conquer: Red Alert (@ciciplusplus)
+  - SimCity (@ciciplusplus)
+  - Asphalt 5 (@ciciplusplus, @hikari-no-yume)
+  - Cut the Rope (@ciciplusplus)
+  - Skater Nation (@ciciplusplus)
+  - Iron Man 2 (@ciciplusplus)
+  - Shrek Forever After (@ciciplusplus)
+  - Spore Origins (@ciciplusplus, @hikari-no-yume, @teromene)
+  - Defender Chronicles (@hujerhoe)
+  - Real Racing (@ciciplusplus)
+  - Tom Clancy's Splinter Cell: Conviction (@ciciplusplus)
+  - Assassin's Creed (@ciciplusplus)
+  - N.O.V.A. Near Orbit Vanguard Alliance (@ciciplusplus)
+  - Brothers in Arms 2: Global Front (@ciciplusplus)
+  - Ferrari GT: Evolution (@ciciplusplus)
+  - Castle Frenzy (@ciciplusplus)
+  - Hero of Sparta 2 (@ciciplusplus)
+  - Hero of Sparta (@ciciplusplus)
+  - Bridge Odyssey (@ciciplusplus)
+  - Terminator Salvation (@ciciplusplus)
+  - Brothers In Arms: Hour Of Heroes (@ciciplusplus)
+  - Crusade Of Destiny (@ciciplusplus)
+  - Arvale (@ciciplusplus)
+  - Battlefield: Bad Company 2 (@ciciplusplus)
+  - Ms. PAC-MAN (@acieslewicz)
+  - Dark Nebula (@ciciplusplus)
+  - FIFA 10 (@ciciplusplus)
+  - Crash Bandicoot Nitro Kart 2 (@ciciplusplus)
+  - Driver (@ciciplusplus)
+  - Sacred Odyssey: Rise of Ayden (@ciciplusplus)
+  - Nanosaur 2 (@ciciplusplus)
+  - Cro-Mag Rally (@ciciplusplus)
+  - Bugdom 2 (@ciciplusplus)
 - API support improvements:
   - Various small contributions. (@hikari-no-yume, @alborrajo, @ciciplusplus, @atasro2, @abnormalmaps, @hujerhoe, @acieslewicz, @WhatAmISupposedToPutHere, @JaGoTu, @apexad, @chyyran, @mistydemeo, @bognarit80, @RMZeroFour)
   - UITextField now supports real text input with a keyboard. On Windows/macOS physical keyboard is used, on Android it's done via a system soft keyboard. (@ciciplusplus)
@@ -148,10 +190,10 @@ Other:
 Compatibility:
 
 - New working apps:
-  - [Rayman 2](https://appdb.touchhle.org/apps/279) (@ciciplusplus)
-  - [Tony Hawk's Pro Skater 2](https://appdb.touchhle.org/apps/75) (@ciciplusplus)
-  - [Earthworm Jim](https://appdb.touchhle.org/apps/280) (@ciciplusplus)
-  - [Castle of Magic](https://appdb.touchhle.org/apps/281) (@ciciplusplus)
+  - Rayman 2 (@ciciplusplus)
+  - Tony Hawk's Pro Skater 2 (@ciciplusplus)
+  - Earthworm Jim (@ciciplusplus)
+  - Castle of Magic (@ciciplusplus)
 - API support improvements:
   - Various small contributions. (@alborrajo, @WhatAmISupposedToPutHere, @ciciplusplus, @hikari-no-yume, @abnormalmaps, @Skryptonyte, @teromene)
   - AAC audio files (AAC-LC in a typical MPEG-4 container) are now supported in Audio Toolbox. This is done in a fairly hacky way so it might not work for some apps. (@hikari-no-yume)
@@ -167,17 +209,17 @@ Usability:
 
 ## v0.2.1 (2023-10-31)
 
-From this release onwards, the old list of supported apps is replaced by the crowdsourced [touchHLE app compatibility database](https://appdb.touchhle.org/).
+From this release onwards, the old list of supported apps is replaced by the crowdsourced touchHLE app compatibility database.
 
 Compatibility:
 
 - API support improvements:
   - Various small contributions. (@hikari-no-yume, @ciciplusplus, @alborrajo)
 - New working apps:
-  - [Doom](https://appdb.touchhle.org/apps/56) (@ciciplusplus)
-  - [Doom II RPG](https://appdb.touchhle.org/apps/57) (@alborrajo)
-  - [I Love Katamari](https://appdb.touchhle.org/apps/55) (@ciciplusplus)
-  - [Wolfenstein RPG](https://appdb.touchhle.org/apps/58) (@alborrajo)
+  - Doom (@ciciplusplus)
+  - Doom II RPG (@alborrajo)
+  - I Love Katamari (@ciciplusplus)
+  - Wolfenstein RPG (@alborrajo)
 
 Quality:
 

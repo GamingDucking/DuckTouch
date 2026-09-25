@@ -31,6 +31,16 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <uses-feature
+        android:name="android.hardware.camera"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.camera.front"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.microphone"
+        android:required="false" />
+
     <!-- External mouse input events -->
     <uses-feature
         android:name="android.hardware.type.pc"
@@ -53,8 +63,14 @@
     <!-- Allow access to the vibrator -->
     <uses-permission android:name="android.permission.VIBRATE" />
 
-    <!-- if you want to capture audio, uncomment this. -->
-    <!-- <uses-permission android:name="android.permission.RECORD_AUDIO" /> -->
+    <!-- Real camera + microphone passthrough (see HostMedia.java). The
+         camera feature is declared non-required so installs still work on
+         devices without cameras (they get the "no camera" fallback). -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.front" android:required="false" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
 
     <application
         android:allowBackup="true"
@@ -68,22 +84,15 @@
          -->
 
         <!--
-          Ask the platform to prefer ANGLE (OpenGL ES on top of Vulkan) as the
-          GLES driver for this app. ANGLE is a conformant, well-tested ES 1.1 /
-          2.0 / 3.0 implementation, whereas some vendor drivers (notably
-          Qualcomm Adreno's native ES 1.1 path) are strict/buggy in ways that
-          make old iPhone OS games render a black screen. Routing our GLES calls
-          through ANGLE avoids those driver quirks.
-
-          This is only a *signal* ("prefer"), honoured on Android 15+ where
-          ANGLE is bundled with the platform (respected as a manifest opt-in on
-          Android 17+). If ANGLE can't be used, the vendor's native GLES driver
-          is used instead, so this is safe on all versions and never a hard
-          dependency. On older Android the flag is simply ignored.
+          Note: the platform's `com.android.graphics.driver.prefer_angle`
+          opt-in is deliberately NOT declared. HyperHLE bundles its own ANGLE
+          and decides per app whether to load it (ES 1.1-capable apps on
+          devices exposing an Adreno KGSL GPU) or the system driver (ES 2.0-only
+          apps and other or unrecognized GPUs); see `select_android_gl_driver` in
+          `src/window.rs` and the `- -gl-driver=` option. Declaring the opt-in
+          would make the platform substitute its ANGLE for the vendor driver
+          on Android 15+ behind our back, defeating the second choice.
         -->
-        <meta-data
-            android:name="com.android.graphics.driver.prefer_angle"
-            android:value="true" />
 
         <activity
             android:name="org.touchhle.android.MainActivity"

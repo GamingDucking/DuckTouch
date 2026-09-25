@@ -302,12 +302,12 @@ fn clock_get_time(
     let (secs, nanos): (u64, u32) = match clock_serv {
         CLOCK_PORT_MONOTONIC | CLOCK_PORT_REALTIME => {
             // Monotonic: seconds and nanoseconds since process startup.
-            let d = std::time::Instant::now().duration_since(env.startup_time);
+            let d = env.guest_clock.now().duration_since(env.startup_time);
             (d.as_secs(), d.subsec_nanos())
         }
         CLOCK_PORT_CALENDAR => {
             // Calendar: seconds since Unix epoch via SystemTime.
-            match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            match env.guest_clock.system_time().duration_since(std::time::UNIX_EPOCH) {
                 Ok(d) => (d.as_secs(), d.subsec_nanos()),
                 Err(_) => (0, 0),
             }

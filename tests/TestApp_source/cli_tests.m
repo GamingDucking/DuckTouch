@@ -40,6 +40,103 @@
 
 #import "SyncTester.h"
 
+@interface NSBundle : NSObject
++ (instancetype)mainBundle;
++ (instancetype)bundleWithPath:(NSString *)path;
++ (instancetype)bundleWithIdentifier:(NSString *)identifier;
+- (NSString *)pathForResource:(NSString *)name ofType:(NSString *)extension;
+- (NSString *)bundleIdentifier;
+@end
+
+@interface NSObject (PerformSelectorOnMainThreadTest)
+- (void)performSelectorOnMainThread:(SEL)selector
+                         withObject:(id)object
+                      waitUntilDone:(BOOL)wait;
+@end
+
+@interface NSRunLoop : NSObject
++ (instancetype)mainRunLoop;
+- (BOOL)runMode:(id)mode beforeDate:(id)limitDate;
+@end
+
+@interface NSDate : NSObject
++ (instancetype)dateWithTimeIntervalSinceNow:(NSTimeInterval)seconds;
+@end
+
+extern NSString *const NSDefaultRunLoopMode;
+
+static int perform_selector_on_main_thread_calls;
+
+@interface PerformSelectorOnMainThreadProbe : NSObject
+- (void)signal:(id)object;
+@end
+
+@implementation PerformSelectorOnMainThreadProbe
+- (void)signal:(id)object {
+  (void)object;
+  perform_selector_on_main_thread_calls++;
+}
+@end
+
+int test_performSelectorOnMainThread_mainThreadDeferred(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  PerformSelectorOnMainThreadProbe *probe =
+      [[PerformSelectorOnMainThreadProbe alloc] init];
+  perform_selector_on_main_thread_calls = 0;
+
+  [probe performSelectorOnMainThread:@selector(signal:)
+                          withObject:nil
+                       waitUntilDone:YES];
+  if (perform_selector_on_main_thread_calls != 1) {
+    [probe release];
+    [pool drain];
+    return -1;
+  }
+
+  [probe performSelectorOnMainThread:@selector(signal:)
+                          withObject:nil
+                       waitUntilDone:NO];
+  if (perform_selector_on_main_thread_calls != 1) {
+    [probe release];
+    [pool drain];
+    return -2;
+  }
+
+  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:1.0];
+  [[NSRunLoop mainRunLoop] runMode:NSDefaultRunLoopMode beforeDate:deadline];
+  int result = perform_selector_on_main_thread_calls == 2 ? 0 : -3;
+
+  [probe release];
+  [pool drain];
+  return result;
+}
+
+int test_NSBundle_subbundleCacheRetainsAutoreleasedBundle(void) {
+  NSString *identifier = @"org.touchhle.TestResources";
+  NSAutoreleasePool *innerPool = [[NSAutoreleasePool alloc] init];
+  NSString *path = [[NSBundle mainBundle] pathForResource:@"TestResources"
+                                                   ofType:@"bundle"];
+  if (path == nil) {
+    [innerPool drain];
+    return -1;
+  }
+  NSBundle *created = [NSBundle bundleWithPath:path];
+  if (created == nil) {
+    [innerPool drain];
+    return -2;
+  }
+  [innerPool drain];
+
+  NSBundle *cached = [NSBundle bundleWithIdentifier:identifier];
+  if (cached == nil)
+    return -3;
+  if (![[cached bundleIdentifier] isEqualToString:identifier])
+    return -4;
+  if ([cached pathForResource:@"marker" ofType:@"txt"] == nil)
+    return -5;
+  return 0;
+}
+
 // TODO: include from <mach/thread_act.h> once available in the common-sdk
 extern kern_return_t thread_suspend(mach_port_t target_act);
 extern kern_return_t thread_resume(mach_port_t target_act);
@@ -57,6 +154,94 @@ int test_Initialize(void);         // Initialize.m
 #ifndef DEFINE_ME_WHEN_BUILDING_ON_MACOS
 int test_cpp_virtual_inheritance(void); // CppVirtualInheritance.cpp
 #endif
+
+// Exercise the 32-bit Blocks ABI directly, without requiring -fblocks or
+// newer SDK headers. In particular, overwriting the stack literal must not
+// destroy a callback retained for a later timer invocation.
+extern void *_Block_copy(const void *);
+extern void _Block_release(const void *);
+extern void _Block_object_assign(void *, const void *, int);
+extern void _Block_object_dispose(const void *, int);
+
+struct TestBlock;
+struct TestBlockDescriptor {
+  unsigned long reserved, size;
+  void (*copy)(struct TestBlock *, const struct TestBlock *);
+  void (*dispose)(const struct TestBlock *);
+};
+struct TestBlock {
+  void *isa;
+  unsigned int flags, reserved;
+  int (*invoke)(const struct TestBlock *);
+  const struct TestBlockDescriptor *descriptor;
+  int captured;
+};
+static int block_copies, block_disposals;
+static int test_block_invoke(const struct TestBlock *block) {
+  return block->captured;
+}
+static void test_block_copy_helper(struct TestBlock *dst,
+                                   const struct TestBlock *src) {
+  block_copies++;
+  dst->captured = src->captured;
+}
+static void test_block_dispose_helper(const struct TestBlock *block) {
+  (void)block;
+  block_disposals++;
+}
+int test_Block_lifetime(void) {
+  const struct TestBlockDescriptor descriptor = {
+      0, sizeof(struct TestBlock), test_block_copy_helper,
+      test_block_dispose_helper};
+  struct TestBlock stack = {
+      NULL, 1u << 25, 0, test_block_invoke, &descriptor, 42};
+  block_copies = block_disposals = 0;
+  struct TestBlock *heap = _Block_copy(&stack);
+  if (heap == &stack || block_copies != 1) return 1;
+  memset(&stack, 0, sizeof(stack));
+  if (heap->invoke(heap) != 42) return 2;
+  void *second = _Block_copy(heap);
+  if (second != heap || block_copies != 1) return 3;
+  void *captured_block = NULL;
+  _Block_object_assign(&captured_block, heap, 7);
+  if (captured_block != heap || block_copies != 1) return 8;
+  _Block_object_dispose(captured_block, 7);
+  _Block_release(heap);
+  if (block_disposals != 0) return 4;
+  _Block_release(second);
+  if (block_disposals != 1) return 5;
+  struct TestBlock global = {
+      NULL, 1u << 28, 0, test_block_invoke, &descriptor, 7};
+  if (_Block_copy(&global) != &global) return 6;
+  _Block_release(&global);
+  if (_Block_copy(NULL) != NULL) return 7;
+  _Block_release(NULL);
+  return 0;
+}
+
+int test_Block_byref_lifetime(void) {
+  struct TestByref {
+    void *isa;
+    struct TestByref *forwarding;
+    unsigned int flags, size;
+    int value;
+  } stack = {NULL, NULL, 0, sizeof(struct TestByref), 42};
+  stack.forwarding = &stack;
+  struct TestByref *first = NULL, *second = NULL;
+  _Block_object_assign(&first, &stack, 8);
+  if (first == &stack || first->forwarding != first ||
+      stack.forwarding != first || first->value != 42) return 1;
+  _Block_object_assign(&second, &stack, 8);
+  if (second != first) return 2;
+  stack.forwarding->value = 77;
+  _Block_object_dispose(&stack, 8); // leave the originating stack scope
+  memset(&stack, 0, sizeof(stack));
+  if (second->value != 77) return 3;
+  _Block_object_dispose(first, 8);
+  if (second->value != 77) return 4;
+  _Block_object_dispose(second, 8);
+  return 0;
+}
 
 // === Main code ===
 
@@ -6175,9 +6360,13 @@ struct {
     FUNC_DEF(test_NSInvocation_retainArguments),
     FUNC_DEF(test_NSInvocation_pointer),
     FUNC_DEF(test_Initialize),
+    FUNC_DEF(test_Block_lifetime),
+    FUNC_DEF(test_Block_byref_lifetime),
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName),
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName_withObject),
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName_removeObserver),
+    FUNC_DEF(test_performSelectorOnMainThread_mainThreadDeferred),
+    FUNC_DEF(test_NSBundle_subbundleCacheRetainsAutoreleasedBundle),
 };
 // clang-format on
 

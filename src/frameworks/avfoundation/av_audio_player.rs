@@ -8,20 +8,28 @@
 //!
 //! Implemented using Audio Queue Services based on [the PlayingAudio example](https://developer.apple.com/library/archive/documentation/MusicAudio/Conceptual/AudioQueueProgrammingGuide/AQPlayback/PlayingAudio.html)
 
+use std::time::Instant;
+
 use crate::dyld::HostFunction;
+use crate::frameworks::audio_toolbox::audio_converter::{
+    convert_pcm, pcm_shape_from_asbd, PcmShape,
+};
 use crate::frameworks::audio_toolbox::audio_file::{
-    self, kAudioFilePropertyDataFormat, kAudioFilePropertyPacketSizeUpperBound,
-    kAudioFileReadPermission, AudioFileClose, AudioFileGetProperty, AudioFileHostObject,
-    AudioFileID, AudioFileOpenURL, AudioFileReadPackets,
+    self, kAudioFileCAFType, kAudioFilePropertyDataFormat, kAudioFilePropertyPacketSizeUpperBound,
+    kAudioFileReadPermission, AudioFileClose, AudioFileCreateWithURL, AudioFileGetProperty,
+    AudioFileHostObject, AudioFileID, AudioFileOpenURL, AudioFileReadPackets, AudioFileWriteBytes,
 };
 use crate::frameworks::audio_toolbox::audio_queue::{
-    kAudioQueueParam_Pan, kAudioQueueParam_Volume, AudioQueueAllocateBuffer, AudioQueueBufferRef,
-    AudioQueueDispose, AudioQueueEnqueueBuffer, AudioQueueGetParameter, AudioQueueNewOutput,
-    AudioQueueOutputCallback, AudioQueuePause, AudioQueueRef, AudioQueueSetParameter,
-    AudioQueueStart, AudioQueueStop,
+    decode_buffer, kAudioQueueParam_Pan, kAudioQueueParam_Volume, AudioQueueAllocateBuffer,
+    AudioQueueBufferRef, AudioQueueDispose, AudioQueueEnqueueBuffer, AudioQueueGetParameter,
+    AudioQueueNewOutput, AudioQueueOutputCallback, AudioQueuePause, AudioQueueRef,
+    AudioQueueSetParameter, AudioQueueStart, AudioQueueStop,
 };
 use crate::frameworks::carbon_core::eofErr;
-use crate::frameworks::core_audio_types::AudioStreamBasicDescription;
+use crate::frameworks::core_audio_types::{
+    fourcc, kAudioFormatFlagIsBigEndian, kAudioFormatFlagIsFloat, kAudioFormatFlagIsPacked,
+    kAudioFormatFlagIsSignedInteger, kAudioFormatLinearPCM, AudioStreamBasicDescription,
+};
 use crate::frameworks::core_foundation::cf_run_loop::kCFRunLoopCommonModes;
 use crate::frameworks::foundation::ns_error::NSOSStatusErrorDomain;
 use crate::frameworks::foundation::{ns_string, NSInteger, NSTimeInterval, NSUInteger};
@@ -41,6 +49,16 @@ struct AVAudioRecorderHostObject {
     is_recording: bool,
     metering_enabled: bool,
     delegate: id,
+    /// Real microphone capture state (all None/zero when the host has no
+    /// mic — in that case the recorder degrades to its old silent stub).
+    audio_file_id: Option<AudioFileID>,
+    requested_format: Option<AudioStreamBasicDescription>,
+    format: Option<AudioStreamBasicDescription>,
+    write_offset: u64,
+    mic_started: bool,
+    last_pump: Option<Instant>,
+    average_power: f32,
+    peak_power: f32,
 }
 impl HostObject for AVAudioRecorderHostObject {}
 
@@ -63,8 +81,133 @@ struct AVAudioPlayerHostObject {
     num_of_loops: NSInteger,
     delegate: id,
     metering_enabled: bool,
+    average_power: Vec<f32>,
+    peak_power: Vec<f32>,
 }
 impl HostObject for AVAudioPlayerHostObject {}
+
+fn recorder_setting(env: &mut Environment, settings: id, key: &'static str) -> id {
+    if settings == nil {
+        return nil;
+    }
+    let key = ns_string::get_static_str(env, key);
+    msg![env; settings objectForKey:key]
+}
+
+fn recorder_format_from_settings(
+    env: &mut Environment,
+    settings: id,
+) -> Option<AudioStreamBasicDescription> {
+    let format_value = recorder_setting(env, settings, "AVFormatIDKey");
+    let format_id = if format_value == nil {
+        kAudioFormatLinearPCM
+    } else {
+        msg![env; format_value unsignedIntValue]
+    };
+    if format_id != kAudioFormatLinearPCM {
+        return None;
+    }
+
+    let sample_rate_value = recorder_setting(env, settings, "AVSampleRateKey");
+    let sample_rate: f64 = if sample_rate_value == nil {
+        44100.0
+    } else {
+        msg![env; sample_rate_value doubleValue]
+    };
+    let channel_value = recorder_setting(env, settings, "AVNumberOfChannelsKey");
+    let channels: u32 = if channel_value == nil {
+        1
+    } else {
+        msg![env; channel_value unsignedIntValue]
+    };
+    let bit_depth_value = recorder_setting(env, settings, "AVLinearPCMBitDepthKey");
+    let bits: u32 = if bit_depth_value == nil {
+        16
+    } else {
+        msg![env; bit_depth_value unsignedIntValue]
+    };
+    let float_value = recorder_setting(env, settings, "AVLinearPCMIsFloatKey");
+    let is_float = float_value != nil && msg![env; float_value boolValue];
+    let big_endian_value = recorder_setting(env, settings, "AVLinearPCMIsBigEndianKey");
+    let is_big_endian = big_endian_value != nil && msg![env; big_endian_value boolValue];
+
+    if !sample_rate.is_finite()
+        || sample_rate <= 0.0
+        || channels == 0
+        || channels > 8
+        || !matches!(bits, 16 | 24 | 32)
+        || (is_float && bits != 32)
+    {
+        return None;
+    }
+    let bytes_per_frame = channels.checked_mul(bits / 8)?;
+    let format_flags = kAudioFormatFlagIsPacked
+        | if is_float {
+            kAudioFormatFlagIsFloat
+        } else {
+            kAudioFormatFlagIsSignedInteger
+        }
+        | if is_big_endian {
+            kAudioFormatFlagIsBigEndian
+        } else {
+            0
+        };
+    Some(AudioStreamBasicDescription {
+        sample_rate,
+        format_id: kAudioFormatLinearPCM,
+        format_flags,
+        bytes_per_packet: bytes_per_frame,
+        frames_per_packet: 1,
+        bytes_per_frame,
+        channels_per_frame: channels,
+        bits_per_channel: bits,
+        _reserved: 0,
+    })
+}
+
+fn pcm_meter_levels(
+    pcm: &[u8],
+    channels: usize,
+    bits_per_sample: u32,
+) -> Option<(Vec<f32>, Vec<f32>)> {
+    if channels == 0 || !matches!(bits_per_sample, 8 | 16) {
+        return None;
+    }
+    let bytes_per_sample = (bits_per_sample / 8) as usize;
+    let frame_size = channels.checked_mul(bytes_per_sample)?;
+    let frames = pcm.len() / frame_size;
+    if frames == 0 {
+        return None;
+    }
+    let mut sums = vec![0.0f64; channels];
+    let mut peaks = vec![0.0f64; channels];
+    for frame in pcm.chunks_exact(frame_size) {
+        for channel in 0..channels {
+            let offset = channel * bytes_per_sample;
+            let sample = if bits_per_sample == 8 {
+                (frame[offset] as i32 - 128) * 256
+            } else {
+                i16::from_le_bytes([frame[offset], frame[offset + 1]]) as i32
+            };
+            let magnitude = sample.abs() as f64;
+            sums[channel] += magnitude * magnitude;
+            peaks[channel] = peaks[channel].max(magnitude);
+        }
+    }
+    let to_db = |magnitude: f64| {
+        if magnitude <= 0.0 {
+            -160.0
+        } else {
+            (20.0 * (magnitude / 32768.0).log10()).clamp(-160.0, 0.0) as f32
+        }
+    };
+    let average_power = sums
+        .into_iter()
+        .map(|sum| to_db((sum / frames as f64).sqrt()))
+        .collect();
+    let peak_power = peaks.into_iter().map(to_db).collect();
+    Some((average_power, peak_power))
+}
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -93,6 +236,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         num_of_loops: 0,
         delegate: nil,
         metering_enabled: false,
+        average_power: Vec::new(),
+        peak_power: Vec::new(),
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
@@ -169,8 +314,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())setMeteringEnabled:(bool)enabled {
-    log_dbg!("[(AVAudioPlayer*){:?} setMeteringEnabled:{}]", this, enabled);
-    env.objc.borrow_mut::<AVAudioPlayerHostObject>(this).metering_enabled = enabled;
+    let host = env.objc.borrow_mut::<AVAudioPlayerHostObject>(this);
+    host.metering_enabled = enabled;
+    if !enabled {
+        host.average_power.clear();
+        host.peak_power.clear();
+    }
 }
 
 - (bool)isMeteringEnabled {
@@ -375,8 +524,10 @@ pub const CLASSES: ClassExports = objc_classes! {
         volume: 1.0,
         pan: 0.0,
         is_playing: false,
-        delegate,         // Переносим в новый объект
+        delegate,
         metering_enabled,
+        average_power: Vec::new(),
+        peak_power: Vec::new(),
     };
 }
 
@@ -488,28 +639,33 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())updateMeters {
-    log_dbg!(
-        "[(AVAudioPlayer *){:?} updateMeters] — stub",
-        this
-    );
+    if !env.objc.borrow::<AVAudioPlayerHostObject>(this).metering_enabled {
+        return;
+    }
 }
 
 - (f32)averagePowerForChannel:(NSInteger)channel_number {
-    log_dbg!(
-        "[(AVAudioPlayer *){:?} averagePowerForChannel:{}] — stub",
-        this,
-        channel_number
-    );
-    -160.0
+    if channel_number < 0 {
+        return -160.0;
+    }
+    env.objc
+        .borrow::<AVAudioPlayerHostObject>(this)
+        .average_power
+        .get(channel_number as usize)
+        .copied()
+        .unwrap_or(-160.0)
 }
 
 - (f32)peakPowerForChannel:(NSInteger)channel_number {
-    log_dbg!(
-        "[(AVAudioPlayer *){:?} peakPowerForChannel:{}] — stub",
-        this,
-        channel_number
-    );
-    -160.0
+    if channel_number < 0 {
+        return -160.0;
+    }
+    env.objc
+        .borrow::<AVAudioPlayerHostObject>(this)
+        .peak_power
+        .get(channel_number as usize)
+        .copied()
+        .unwrap_or(-160.0)
 }
 
 @end
@@ -522,12 +678,20 @@ pub const CLASSES: ClassExports = objc_classes! {
         is_recording: false,
         metering_enabled: false,
         delegate: nil,
+        audio_file_id: None,
+        requested_format: None,
+        format: None,
+        write_offset: 0,
+        mic_started: false,
+        last_pump: None,
+        average_power: -160.0,
+        peak_power: -160.0,
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
 
 - (id)initWithURL:(id)url
-         settings:(id)_settings
+         settings:(id)settings
             error:(MutPtr<id>)out_error {
     if url == nil {
         if !out_error.is_null() {
@@ -535,26 +699,24 @@ pub const CLASSES: ClassExports = objc_classes! {
         }
         return nil;
     }
+    let Some(format) = recorder_format_from_settings(env, settings) else {
+        if !out_error.is_null() {
+            let domain = ns_string::get_static_str(env, NSOSStatusErrorDomain);
+            let error = msg_class![env; NSError alloc];
+            let code = fourcc(b"fmt?") as NSInteger;
+            let error = msg![env; error initWithDomain:domain code:code userInfo:nil];
+            env.mem.write(out_error, error);
+        }
+        return nil;
+    };
     retain(env, url);
-    env.objc
-        .borrow_mut::<AVAudioRecorderHostObject>(this)
-        .url = url;
+    let host = env.objc.borrow_mut::<AVAudioRecorderHostObject>(this);
+    host.url = url;
+    host.requested_format = Some(format);
     if !out_error.is_null() {
         env.mem.write(out_error, nil);
     }
     this
-}
-
-- (bool)record {
-    log!(
-        "[(AVAudioRecorder *){:?} record] — stub, recording not \
-         supported",
-        this
-    );
-    env.objc
-        .borrow_mut::<AVAudioRecorderHostObject>(this)
-        .is_recording = true;
-    true
 }
 
 - (bool)recordForDuration:(NSTimeInterval)_duration {
@@ -562,36 +724,30 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (bool)prepareToRecord {
-    log_dbg!(
-        "[(AVAudioRecorder *){:?} prepareToRecord] — stub",
-        this
-    );
+    // The real capture session (destination CAF file + host mic) is created
+    // lazily by `record`; games that call prepareToRecord first then record
+    // get the same behaviour either way.
+    log_dbg!("[(AVAudioRecorder *){:?} prepareToRecord]", this);
     true
 }
 
 - (())pause {
-    env.objc
-        .borrow_mut::<AVAudioRecorderHostObject>(this)
-        .is_recording = false;
+    recorder_stop_capture(env, this);
 }
 
 - (())stop {
-    env.objc
-        .borrow_mut::<AVAudioRecorderHostObject>(this)
-        .is_recording = false;
+    recorder_stop_capture(env, this);
 }
 
 - (bool)isRecording {
+    pump_recorder(env, this);
     env.objc
         .borrow::<AVAudioRecorderHostObject>(this)
         .is_recording
 }
 
 - (bool)deleteRecording {
-    log_dbg!(
-        "[(AVAudioRecorder *){:?} deleteRecording] — stub",
-        this
-    );
+    recorder_stop_capture(env, this);
     true
 }
 
@@ -600,11 +756,21 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (NSTimeInterval)currentTime {
-    0.0
+    pump_recorder(env, this);
+    let host = env.objc.borrow::<AVAudioRecorderHostObject>(this);
+    let bytes_per_frame = host
+        .format
+        .map(|f| (f.bytes_per_frame.max(1)) as u64)
+        .unwrap_or(2);
+    let sample_rate = host
+        .format
+        .map(|f| if f.sample_rate > 0.0 { f.sample_rate } else { 44100.0 })
+        .unwrap_or(44100.0);
+    (host.write_offset / bytes_per_frame) as f64 / sample_rate
 }
 
 - (NSTimeInterval)deviceCurrentTime {
-    0.0
+    msg![env; this currentTime]
 }
 
 - (())setMeteringEnabled:(bool)enabled {
@@ -620,18 +786,23 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())updateMeters {
-    log_dbg!(
-        "[(AVAudioRecorder *){:?} updateMeters] — stub",
-        this
-    );
+    pump_recorder(env, this);
 }
 
 - (f32)averagePowerForChannel:(NSInteger)_channel {
-    -160.0
+    pump_recorder(env, this);
+    let _ = _channel;
+    env.objc
+        .borrow::<AVAudioRecorderHostObject>(this)
+        .average_power
 }
 
 - (f32)peakPowerForChannel:(NSInteger)_channel {
-    -160.0
+    pump_recorder(env, this);
+    let _ = _channel;
+    env.objc
+        .borrow::<AVAudioRecorderHostObject>(this)
+        .peak_power
 }
 
 - (id)delegate {
@@ -655,9 +826,207 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.dealloc_object(this, &mut env.mem)
 }
 
+- (bool)record {
+    // Real microphone capture when the host provides one (Android: JNI ->
+    // AudioRecord; elsewhere: graceful degradation to the old silent stub).
+    let (url, already, requested_format) = {
+        let host = env.objc.borrow::<AVAudioRecorderHostObject>(this);
+        (host.url, host.is_recording, host.requested_format)
+    };
+    if already {
+        return true;
+    }
+    if url == nil {
+        return false;
+    }
+
+    if !crate::android_media::has_microphone() {
+        log!(
+            "[(AVAudioRecorder *){:?} record] no host microphone available; \
+             recording silence",
+            this
+        );
+
+    }
+
+    let Some(asbd) = requested_format else {
+        return false;
+    };
+    let tmp_afi_ptr: MutPtr<AudioFileID> = env.mem.alloc(guest_size_of::<AudioFileID>()).cast();
+    let asbd_ptr = env.mem.alloc_and_write(asbd);
+    let status = AudioFileCreateWithURL(
+        env,
+        url.cast(),
+        kAudioFileCAFType,
+        asbd_ptr.cast_const(),
+        0,
+        tmp_afi_ptr,
+    );
+    env.mem.free(asbd_ptr.cast());
+    let audio_file_id = env.mem.read(tmp_afi_ptr);
+    env.mem.free(tmp_afi_ptr.cast());
+    if status != 0 {
+        log!(
+            "[(AVAudioRecorder *){:?} record] AudioFileCreateWithURL failed: {}",
+            this,
+            status
+        );
+        return false;
+    }
+
+    let mic_started = crate::android_media::start_mic();
+    if !mic_started {
+        log!(
+            "[(AVAudioRecorder *){:?} record] mic unavailable, recording silence",
+            this
+        );
+    }
+
+    {
+        let host = env.objc.borrow_mut::<AVAudioRecorderHostObject>(this);
+        host.audio_file_id = Some(audio_file_id);
+        host.format = Some(asbd);
+        host.write_offset = 0;
+        host.mic_started = mic_started;
+        host.last_pump = Some(Instant::now());
+        host.is_recording = true;
+        host.average_power = -160.0;
+        host.peak_power = -160.0;
+    }
+    log!(
+        "[(AVAudioRecorder *){:?} record] real capture {}",
+        this,
+        if mic_started { "started" } else { "(silence)" }
+    );
+    true
+}
 @end
 
 };
+
+/// Stop capture: halt the host mic stream and close the audio file.
+fn recorder_stop_capture(env: &mut Environment, this: id) {
+    let (was_recording, mic_started, file_id) = {
+        let host = env.objc.borrow::<AVAudioRecorderHostObject>(this);
+        (host.is_recording, host.mic_started, host.audio_file_id)
+    };
+    if !was_recording {
+        return;
+    }
+    if mic_started {
+        crate::android_media::stop_mic();
+    }
+    if let Some(file_id) = file_id {
+        AudioFileClose(env, file_id);
+    }
+    let host = env.objc.borrow_mut::<AVAudioRecorderHostObject>(this);
+    host.is_recording = false;
+    host.mic_started = false;
+    host.audio_file_id = None;
+}
+
+/// Pump pending mic samples into the recorder's audio file. Called lazily
+/// from currentTime/updateMeters/isRecording so no background thread is
+/// needed. On platforms without a host mic this is a no-op.
+fn pump_recorder(env: &mut Environment, this: id) {
+    let (recording, file_id, format, mic_started, last_pump) = {
+        let host = env.objc.borrow::<AVAudioRecorderHostObject>(this);
+        (
+            host.is_recording,
+            host.audio_file_id,
+            host.format,
+            host.mic_started,
+            host.last_pump,
+        )
+    };
+    if !recording {
+        return;
+    }
+    let Some(file_id) = file_id else { return };
+    let Some(format) = format else { return };
+
+    let now = Instant::now();
+    let elapsed = last_pump
+        .map(|last| now.duration_since(last).as_secs_f64())
+        .unwrap_or_default();
+    env.objc
+        .borrow_mut::<AVAudioRecorderHostObject>(this)
+        .last_pump = Some(now);
+
+    let samples: Vec<i16> = if mic_started {
+        crate::android_media::read_mic_chunk()
+    } else {
+        let count = (elapsed * crate::android_media::MIC_SAMPLE_RATE as f64).round() as usize;
+        vec![0; count]
+    };
+    if samples.is_empty() {
+        return;
+    }
+
+    let peak = samples
+        .iter()
+        .map(|&sample| (sample as i32).abs() as f64)
+        .fold(0.0, f64::max);
+    let average = samples
+        .iter()
+        .map(|&sample| (sample as i32).abs() as f64)
+        .sum::<f64>()
+        / samples.len() as f64;
+    let to_db = |magnitude: f64| {
+        if magnitude <= 0.0 {
+            -160.0
+        } else {
+            (20.0 * (magnitude / 32768.0).log10()).clamp(-160.0, 0.0) as f32
+        }
+    };
+
+    let source_shape = PcmShape {
+        sample_rate: crate::android_media::MIC_SAMPLE_RATE as f64,
+        channels: 1,
+        bits: 16,
+        is_float: false,
+        is_big_endian: false,
+        bytes_per_frame: 2,
+    };
+    let Some(destination_shape) = pcm_shape_from_asbd(&format) else {
+        return;
+    };
+    let source_bytes = samples
+        .iter()
+        .flat_map(|sample| sample.to_le_bytes())
+        .collect::<Vec<_>>();
+    let bytes = convert_pcm(&source_bytes, &source_shape, &destination_shape);
+    if bytes.is_empty() {
+        return;
+    }
+
+    let bytes_ptr = env.mem.alloc(bytes.len() as u32);
+    env.mem
+        .bytes_at_mut(bytes_ptr.cast(), bytes.len() as u32)
+        .copy_from_slice(&bytes);
+    let io_ptr = env.mem.alloc_and_write(bytes.len() as u32);
+    let write_offset = env
+        .objc
+        .borrow::<AVAudioRecorderHostObject>(this)
+        .write_offset as i64;
+    let status = AudioFileWriteBytes(
+        env,
+        file_id,
+        false,
+        write_offset,
+        io_ptr,
+        bytes_ptr.cast_const(),
+    );
+    let bytes_written = env.mem.read(io_ptr);
+    env.mem.free(io_ptr.cast());
+    env.mem.free(bytes_ptr.cast_void());
+    if status == 0 {
+        let host = env.objc.borrow_mut::<AVAudioRecorderHostObject>(this);
+        host.write_offset += bytes_written as u64;
+        host.average_power = to_db(average);
+        host.peak_power = to_db(peak);
+    }
+}
 
 fn derive_buffer_size(
     audio_desc: AudioStreamBasicDescription,
@@ -764,7 +1133,9 @@ fn _touchHLE_AVAudioPlayerOutputBufferHelper(
     );
     let &AVAudioPlayerHostObject {
         audio_file_id,
+        audio_desc,
         audio_queue,
+        metering_enabled,
         num_packets_to_read,
         current_packet,
         is_playing,
@@ -830,6 +1201,36 @@ fn _touchHLE_AVAudioPlayerOutputBufferHelper(
                 "Warning: AVAudioPlayer read error (status {}), ignoring to prevent crash.",
                 status
             );
+        }
+        if metering_enabled {
+            if let Some(format) = audio_desc {
+                let (_, _, pcm) = decode_buffer(
+                    &env.mem,
+                    &format,
+                    audio_queue_buffer.audio_data.cast(),
+                    num_bytes as GuestUSize,
+                );
+                let channels = if format.channels_per_frame > 2 {
+                    1
+                } else {
+                    format.channels_per_frame as usize
+                };
+                let bits_per_sample =
+                    if format.format_id == kAudioFormatLinearPCM && format.bits_per_channel == 8 {
+                        8
+                    } else {
+                        16
+                    };
+                if let Some((average_power, peak_power)) =
+                    pcm_meter_levels(&pcm, channels, bits_per_sample)
+                {
+                    let mut host = env
+                        .objc
+                        .borrow_mut::<AVAudioPlayerHostObject>(av_audio_player);
+                    host.average_power = average_power;
+                    host.peak_power = peak_power;
+                }
+            }
         }
         audio_queue_buffer.audio_data_byte_size = num_bytes;
         env.mem.write(in_buf, audio_queue_buffer);
@@ -901,5 +1302,25 @@ fn _touchHLE_AVAudioPlayerOutputBufferHelper(
                 _touchHLE_AVAudioPlayerOutputBufferHelper(env, in_user_data, in_aq, in_buf);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod meter_tests {
+    use super::pcm_meter_levels;
+
+    #[test]
+    fn meter_normalizes_peak_and_rms_to_dbfs() {
+        let (average, peak) = pcm_meter_levels(&i16::MAX.to_le_bytes(), 1, 16).unwrap();
+        assert!(average[0].abs() < 0.01);
+        assert!(peak[0].abs() < 0.01);
+    }
+
+    #[test]
+    fn meter_handles_unsigned_eight_bit_stereo() {
+        let (average, peak) = pcm_meter_levels(&[255, 128], 2, 8).unwrap();
+        assert!(average[0] > -0.2 && average[0] <= 0.0);
+        assert_eq!(average[1], -160.0);
+        assert_eq!(peak[1], -160.0);
     }
 }

@@ -11,7 +11,9 @@ use crate::bundle::Bundle;
 use crate::frameworks::core_foundation::cf_bundle::{
     CFBundleCopyBundleLocalizations, CFBundleCopyPreferredLocalizationsFromArray,
 };
-use crate::frameworks::foundation::ns_string::{from_rust_string, NSUTF8StringEncoding};
+use crate::frameworks::foundation::ns_string::{
+    from_rust_string, NSUTF16StringEncoding, NSUTF8StringEncoding,
+};
 use crate::mem::{ConstVoidPtr, MutPtr, Ptr};
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
@@ -62,6 +64,10 @@ pub struct NSBundleHostObject {
     bundle_url: Option<id>,
     /// `NSDictionary*` for the `Info.plist` content. None if not created yet.
     info_dictionary: Option<id>,
+    /// `NSDictionary*` returned by `-localizedInfoDictionary` (the plain
+    /// `Info.plist` contents with the preferred localization's
+    /// `InfoPlist.strings` values layered on top). None if not created yet.
+    localized_info_dictionary: Option<id>,
 }
 
 impl HostObject for NSBundleHostObject {}
@@ -83,6 +89,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         bundle_identifier: nil,
         bundle_url: None,
         info_dictionary: None,
+        localized_info_dictionary: None,
     };
     env.objc.alloc_object(this, Box::new(host_object), &mut env.mem)
 }
@@ -335,14 +342,16 @@ pub const CLASSES: ClassExports = objc_classes! {
         bundle_identifier,
         bundle_url: None,
         info_dictionary: if dict != nil { Some(dict) } else { None },
+        localized_info_dictionary: None,
     };
 
     // 5. CACHE INSERTION
+    let bundle_for_cache = retain(env, this);
     env.framework_state
         .foundation
         .ns_bundle
         .bundle_cache
-        .insert(path_str, this);
+        .insert(path_str, bundle_for_cache);
     this
 }
 
@@ -368,10 +377,12 @@ pub const CLASSES: ClassExports = objc_classes! {
     let bundle_identifier = host.bundle_identifier;
     let bundle_url        = host.bundle_url;
     let info_dictionary   = host.info_dictionary;
+    let localized_info_dictionary = host.localized_info_dictionary;
     if bundle_path != nil { release(env, bundle_path); }
     if bundle_identifier != nil { release(env, bundle_identifier); }
     if let Some(url)  = bundle_url       { release(env, url); }
     if let Some(dict) = info_dictionary  { release(env, dict); }
+    if let Some(dict) = localized_info_dictionary { release(env, dict); }
     env.objc.dealloc_object(this, &mut env.mem)
 }
 
@@ -785,8 +796,26 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)localizedInfoDictionary {
-    log!("TODO: [NSBundle localizedInfoDictionary] — returning plain infoDictionary");
-    msg![env; this infoDictionary]
+    if let Some(dict) = env
+        .objc
+        .borrow::<NSBundleHostObject>(this)
+        .localized_info_dictionary
+    {
+        return dict;
+    }
+    // The localized dictionary is the plain `Info.plist` with the values
+    // of the preferred localization's `InfoPlist.strings` layered on top.
+    // A bundle that has no `InfoPlist.strings` keeps returning the plain
+    // `infoDictionary`, as this method always used to.
+    let localized = localized_info_dictionary(env, this);
+    if localized == nil {
+        return msg![env; this infoDictionary];
+    }
+    retain(env, localized);
+    env.objc
+        .borrow_mut::<NSBundleHostObject>(this)
+        .localized_info_dictionary = Some(localized);
+    localized
 }
 
 // =========================================================================
@@ -952,6 +981,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         bundle_identifier,
         bundle_url: None,
         info_dictionary: None,
+        localized_info_dictionary: None,
     };
     env.objc.alloc_object(this, Box::new(host_object), &mut env.mem)
 }
@@ -966,8 +996,66 @@ pub const CLASSES: ClassExports = objc_classes! {
 };
 
 // =========================================================================
-// MARK: - path_for_resource_helper
+// MARK: - Info dictionary localization
 // =========================================================================
+
+/// The bundle's `InfoPlist.strings` for the preferred localization, or
+/// nil if the bundle has no such file.
+///
+/// `InfoPlist.strings` is the localized counterpart of `Info.plist`
+/// (Apple's "Localizing the Information Property List"); Xcode puts it in
+/// `<language>.lproj/`. `URLForResource:withExtension:` searches the
+/// preferred localizations in order, so the file chosen here is the one
+/// iOS would use.
+fn localized_info_plist_strings(env: &mut Environment, bundle: id) -> id {
+    let name = ns_string::get_static_str(env, "InfoPlist");
+    let strings_ext = ns_string::get_static_str(env, "strings");
+    let url: id = msg![env; bundle URLForResource:name withExtension:strings_ext];
+    if url == nil {
+        log_dbg!("[NSBundle localizedInfoDictionary] no InfoPlist.strings");
+        return nil;
+    }
+    // Old bundles may ship the file in property-list format; the common
+    // format is the standard `"key" = "value";` one.
+    let dict: id = msg_class![env; NSDictionary dictionaryWithContentsOfURL:url];
+    if dict != nil {
+        return dict;
+    }
+    // `load_strings_as_standard_format` returns a +1 dictionary; hand it
+    // back as an autoreleased one so both callers here behave alike. (The
+    // value has to be bound to a local first: passing `env` to both calls in
+    // one expression would borrow it mutably twice, which E0499 rejects.)
+    let strings = load_strings_as_standard_format(env, url);
+    autorelease(env, strings)
+}
+
+/// Build the value of `-[NSBundle localizedInfoDictionary]` for a bundle.
+///
+/// Apple documents the result as "a dictionary with the keys from the
+/// bundle's localized property list", chosen using the preferred
+/// localization (falling back to the most appropriate localization in the
+/// bundle). touchHLE layers those localized values over the plain
+/// `Info.plist` contents instead of returning only the localized keys:
+/// apps routinely read keys such as `CFBundleVersion` from this
+/// dictionary, and dropping every non-localized key would turn those
+/// lookups into nils.
+///
+/// Returns nil when the bundle has no `InfoPlist.strings` at all, so the
+/// caller can fall back to the plain `infoDictionary`.
+fn localized_info_dictionary(env: &mut Environment, bundle: id) -> id {
+    let strings_dict = localized_info_plist_strings(env, bundle);
+    if strings_dict == nil {
+        return nil;
+    }
+    let info_dict: id = msg![env; bundle infoDictionary];
+    if info_dict == nil {
+        return strings_dict;
+    }
+    let merged: id = msg_class![env; NSMutableDictionary alloc];
+    let merged: id = msg![env; merged initWithDictionary:info_dict];
+    let _: () = msg![env; merged addEntriesFromDictionary:strings_dict];
+    autorelease(env, merged)
+}
 
 // =========================================================================
 // MARK: - path_for_resource_helper
@@ -1043,8 +1131,28 @@ fn path_for_resource_helper(
     // NSBundle's normal lookup remains first; this fallback only applies when
     // the requested resource is not found there.
     let data_component = ns_string::get_static_str(env, "Data");
-    let data_path: id = msg![env; path stringByAppendingPathComponent:data_component];
+    // `path` already includes the requested filename, so appending `Data` to
+    // it produces `<bundle>/file/Data/file` rather than Unity's
+    // `<bundle>/Data/file`.  Start again from the bundle resource root and
+    // apply the request components in their original order.
+    let data_path: id = msg![env; bundle resourcePath];
+    let data_path: id = msg![env; data_path stringByAppendingPathComponent:data_component];
+    let data_path: id = if directory != nil {
+        msg![env; data_path stringByAppendingPathComponent:directory]
+    } else {
+        data_path
+    };
     let data_path: id = msg![env; data_path stringByAppendingPathComponent:name];
+    let data_path: id = if extension != nil {
+        let ext_str = ns_string::to_rust_string(env, extension);
+        if ext_str.is_empty() {
+            data_path
+        } else {
+            msg![env; data_path stringByAppendingPathExtension:extension]
+        }
+    } else {
+        data_path
+    };
     let data_path_exists: bool = msg![env; file_manager fileExistsAtPath:data_path];
     // This fires hundreds of times per app launch for games that probe many
     // resource names; keep it out of the user-facing log.
@@ -1105,17 +1213,22 @@ fn load_strings_as_standard_format(env: &mut Environment, dict_url: id) -> id {
     }
     let bytes: ConstVoidPtr = msg![env; data bytes];
     let maybe_bom = env.mem.bytes_at(bytes.cast(), 2);
-    if maybe_bom == [0xFE, 0xFF] || maybe_bom == [0xFF, 0xFE] {
-        // TODO: UTF-16 .strings files are not supported yet. Return an empty
-        // table instead of asserting (and crashing) on guest data.
-        log!("load_strings_as_standard_format: UTF-16 .strings not supported");
-        return res;
-    }
+    // Xcode writes .strings files as UTF-16 with a BOM by default, so pick
+    // the encoding from the BOM. NSString's UTF-16 decoder honours the BOM
+    // (and strips it), so the BOM-bearing encoding is used for both orders.
+    let encoding = if maybe_bom == [0xFE, 0xFF] || maybe_bom == [0xFF, 0xFE] {
+        NSUTF16StringEncoding
+    } else {
+        NSUTF8StringEncoding
+    };
     let strings_str = msg_class![env; NSString alloc];
-    let strings_str: id = msg![env; strings_str initWithData:data encoding:NSUTF8StringEncoding];
+    let strings_str: id = msg![env; strings_str initWithData:data encoding:encoding];
     if strings_str == nil {
-        // Guest-reachable: the file is not valid UTF-8.
-        log_dbg!("load_strings_as_standard_format: file is not valid UTF-8");
+        // Guest-reachable: the file is not valid in the detected encoding.
+        log_dbg!(
+            "load_strings_as_standard_format: file is not valid (encoding {})",
+            encoding
+        );
         return res;
     }
 

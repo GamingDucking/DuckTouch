@@ -11,7 +11,8 @@ use super::cg_bitmap_context::{
 };
 use super::cg_color::CGColorRef;
 use super::cg_color_space::{
-    kCGColorSpaceModelMonochrome, kCGColorSpaceModelRGB, CGColorSpaceGetModel, CGColorSpaceRef,
+    kCGColorSpaceModelCMYK, kCGColorSpaceModelMonochrome, kCGColorSpaceModelRGB,
+    CGColorSpaceGetModel, CGColorSpaceModel,
 };
 use super::cg_font::{CGFontHostObject, CGFontRef, CGFontRelease, CGFontRetain, CGGlyph};
 use super::cg_geometry::CGPointZero;
@@ -55,6 +56,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 pub(super) struct CGContextHostObject {
     pub(super) subclass: CGContextSubclass,
     pub(super) rgb_fill_color: (CGFloat, CGFloat, CGFloat, CGFloat),
+    pub(super) fill_color_space_model: CGColorSpaceModel,
     pub(super) rgb_stroke_color: (CGFloat, CGFloat, CGFloat, CGFloat),
     pub(super) alpha: CGFloat,
     pub(super) line_width: CGFloat,
@@ -74,8 +76,8 @@ pub(super) struct CGContextHostObject {
     /// (fill, stroke, alpha, line_width, line_cap, line_join, miter_limit,
     ///  flatness, blend_mode, transform)
     pub(super) state_stack: Vec<CGContextState>,
-    // Path accumulator (points only — no real path rendering yet).
-    pub(super) path_points: Vec<CGPoint>,
+    // Path is not graphics state: geometry is transformed when appended.
+    pub(super) path_elements: Vec<super::cg_path::PathElement>,
     /// Current rendering intent for the fill color space. Set by
     /// `CGContextSetRenderingIntent`; defaults to `kCGRenderingIntentDefault`
     /// per Apple's "Core Graphics – Color Spaces" documentation.
@@ -115,6 +117,7 @@ impl HostObject for CGContextHostObject {}
 #[derive(Clone)]
 pub(super) struct CGContextState {
     pub fill_color: (CGFloat, CGFloat, CGFloat, CGFloat),
+    pub fill_color_space_model: CGColorSpaceModel,
     pub stroke_color: (CGFloat, CGFloat, CGFloat, CGFloat),
     pub alpha: CGFloat,
     pub line_width: CGFloat,
@@ -160,6 +163,49 @@ pub fn CGContextRetain(env: &mut Environment, c: CGContextRef) -> CGContextRef {
 fn CGContextSetFillColorWithColor(env: &mut Environment, context: CGContextRef, color: CGColorRef) {
     let (r, g, b, a) = cg_color::to_rgba(&env.objc, color);
     CGContextSetRGBFillColor(env, context, r, g, b, a)
+}
+
+fn CGContextSetFillColor(
+    env: &mut Environment,
+    context: CGContextRef,
+    components: ConstPtr<CGFloat>,
+) {
+    if context.is_null() || components.is_null() {
+        return;
+    }
+    let model = env
+        .objc
+        .borrow::<CGContextHostObject>(context)
+        .fill_color_space_model;
+    let color = match model {
+        kCGColorSpaceModelMonochrome => {
+            let gray = env.mem.read(components);
+            let alpha = env.mem.read(components + 1);
+            (gray, gray, gray, alpha)
+        }
+        kCGColorSpaceModelCMYK => {
+            let cyan = env.mem.read(components);
+            let magenta = env.mem.read(components + 1);
+            let yellow = env.mem.read(components + 2);
+            let black = env.mem.read(components + 3);
+            let alpha = env.mem.read(components + 4);
+            (
+                (1.0 - cyan) * (1.0 - black),
+                (1.0 - magenta) * (1.0 - black),
+                (1.0 - yellow) * (1.0 - black),
+                alpha,
+            )
+        }
+        _ => (
+            env.mem.read(components),
+            env.mem.read(components + 1),
+            env.mem.read(components + 2),
+            env.mem.read(components + 3),
+        ),
+    };
+    env.objc
+        .borrow_mut::<CGContextHostObject>(context)
+        .rgb_fill_color = color;
 }
 
 pub fn CGContextSetRGBFillColor(
@@ -214,6 +260,27 @@ fn CGContextSetGrayStrokeColor(
     alpha: CGFloat,
 ) {
     CGContextSetRGBStrokeColor(env, context, gray, gray, gray, alpha);
+}
+
+/// `void CGContextSetStrokeColor(CGContextRef c, const CGFloat components[])`
+///
+/// Colour-space-agnostic stroke colour setter. touchHLE contexts only track
+/// RGBA, so we interpret the components as RGBA (matching the most common
+/// device-RGB usage). `CGContextGetShouldColorSpace`-aware behaviour is not
+/// modelled.
+fn CGContextSetStrokeColor(
+    env: &mut Environment,
+    context: CGContextRef,
+    components: ConstPtr<CGFloat>,
+) {
+    if context.is_null() || components.is_null() {
+        return;
+    }
+    let r: CGFloat = env.mem.read(components + 0);
+    let g: CGFloat = env.mem.read(components + 1);
+    let b: CGFloat = env.mem.read(components + 2);
+    let a: CGFloat = env.mem.read(components + 3);
+    CGContextSetRGBStrokeColor(env, context, r, g, b, a);
 }
 
 // MARK: - Alpha
@@ -353,26 +420,18 @@ fn CGContextSetFillColorSpace(
     if context.is_null() {
         return;
     }
-    // Per Apple's CGContextSetFillColorSpace documentation:
-    // "When you call this function, two things happen:
-    //   1. Core Graphics assigns the specified color space to the current
-    //      fill color space in the graphics state.
-    //   2. Core Graphics sets the fill color to a default value that's
-    //      appropriate for the color space."
-    // https://developer.apple.com/documentation/coregraphics/1455380-cgcontextsetfillcolorspace
-    //
-    // touchHLE always works in device RGB internally — switching color
-    // spaces would require reimplementing Quartz's CIE colour pipeline,
-    // which is out of scope. Instead, reset the fill colour to the
-    // device-RGB default (opaque black), matching what real Quartz does
-    // when you switch to any RGB-family color space. This preserves the
-    // visible behaviour for the most common cases (kCGColorSpaceGenericRGB,
-    // kCGColorSpaceDeviceRGB) and degrades to the same default for
-    // others.
-    let _ = color_space; // retained by the caller; we don't track ownership
-    env.objc
-        .borrow_mut::<CGContextHostObject>(context)
-        .rgb_fill_color = (0.0, 0.0, 0.0, 1.0);
+    let model = if color_space.is_null() {
+        kCGColorSpaceModelRGB
+    } else {
+        CGColorSpaceGetModel(env, color_space)
+    };
+    let model = match model {
+        kCGColorSpaceModelMonochrome | kCGColorSpaceModelRGB | kCGColorSpaceModelCMYK => model,
+        _ => kCGColorSpaceModelRGB,
+    };
+    let host = env.objc.borrow_mut::<CGContextHostObject>(context);
+    host.fill_color_space_model = model;
+    host.rgb_fill_color = (0.0, 0.0, 0.0, 1.0);
 }
 
 fn CGContextSetStrokeColorSpace(
@@ -506,328 +565,191 @@ pub fn CGContextFillEllipseInRect(env: &mut Environment, context: CGContextRef, 
     cg_bitmap_context::fill_rect(env, context, rect, false);
 }
 
-// MARK: - Path construction (accumulator only — no real rasterisation)
+// MARK: - Path construction and rasterisation
 
+fn append_path_element(env: &mut Environment, context: CGContextRef, element: super::cg_path::PathElement) {
+    use super::cg_path::PathElement::*;
+    if context.is_null() { return; }
+    let host = env.objc.borrow_mut::<CGContextHostObject>(context);
+    let t = host.transform;
+    let element = match element {
+        MoveTo(p) => MoveTo(t.apply_to_point(p)),
+        LineTo(p) => LineTo(t.apply_to_point(p)),
+        QuadCurveTo { control, to } => QuadCurveTo { control: t.apply_to_point(control), to: t.apply_to_point(to) },
+        CurveTo { c1, c2, to } => CurveTo { c1: t.apply_to_point(c1), c2: t.apply_to_point(c2), to: t.apply_to_point(to) },
+        Close => Close,
+    };
+    let finite = |p: CGPoint| p.x.is_finite() && p.y.is_finite();
+    let valid = match &element {
+        MoveTo(p) | LineTo(p) => finite(*p),
+        QuadCurveTo { control, to } => finite(*control) && finite(*to),
+        CurveTo { c1, c2, to } => finite(*c1) && finite(*c2) && finite(*to),
+        Close => true,
+    };
+    if valid { host.path_elements.push(element); }
+}
+
+pub fn CGContextAddPath(env: &mut Environment, context: CGContextRef, path: super::cg_path::CGPathRef) {
+    if context.is_null() || path.is_null() { return; }
+    let elements = env.objc.borrow::<super::cg_path::CGPathHostObject>(path).elements.clone();
+    for element in elements { append_path_element(env, context, element); }
+}
 fn CGContextBeginPath(env: &mut Environment, context: CGContextRef) {
-    if context.is_null() {
-        return;
-    }
-    env.objc
-        .borrow_mut::<CGContextHostObject>(context)
-        .path_points
-        .clear();
+    if !context.is_null() { env.objc.borrow_mut::<CGContextHostObject>(context).path_elements.clear(); }
 }
-
 fn CGContextMoveToPoint(env: &mut Environment, context: CGContextRef, x: CGFloat, y: CGFloat) {
-    if context.is_null() {
-        return;
-    }
-    env.objc
-        .borrow_mut::<CGContextHostObject>(context)
-        .path_points
-        .push(CGPoint { x, y });
+    append_path_element(env, context, super::cg_path::PathElement::MoveTo(CGPoint { x, y }));
 }
-
 fn CGContextAddLineToPoint(env: &mut Environment, context: CGContextRef, x: CGFloat, y: CGFloat) {
-    if context.is_null() {
-        return;
-    }
-    env.objc
-        .borrow_mut::<CGContextHostObject>(context)
-        .path_points
-        .push(CGPoint { x, y });
+    append_path_element(env, context, super::cg_path::PathElement::LineTo(CGPoint { x, y }));
 }
-
-fn CGContextAddLines(
-    env: &mut Environment,
-    context: CGContextRef,
-    points: crate::mem::ConstPtr<CGPoint>,
-    count: usize,
-) {
-    if context.is_null() {
-        return;
-    }
+fn CGContextAddLines(env: &mut Environment, context: CGContextRef, points: ConstPtr<CGPoint>, count: usize) {
     for i in 0..count as u32 {
         let p = env.mem.read(points + i);
-        env.objc
-            .borrow_mut::<CGContextHostObject>(context)
-            .path_points
-            .push(p);
+        if i == 0 { CGContextMoveToPoint(env, context, p.x, p.y); }
+        else { CGContextAddLineToPoint(env, context, p.x, p.y); }
     }
 }
-
-fn CGContextAddRect(env: &mut Environment, context: CGContextRef, rect: CGRect) {
-    if context.is_null() {
-        return;
-    }
-    let o = rect.origin;
-    let s = rect.size;
-    let pts = [
-        CGPoint { x: o.x, y: o.y },
-        CGPoint {
-            x: o.x + s.width,
-            y: o.y,
-        },
-        CGPoint {
-            x: o.x + s.width,
-            y: o.y + s.height,
-        },
-        CGPoint {
-            x: o.x,
-            y: o.y + s.height,
-        },
-    ];
-    for p in pts {
-        env.objc
-            .borrow_mut::<CGContextHostObject>(context)
-            .path_points
-            .push(p);
-    }
-}
-
-fn CGContextAddRects(
-    env: &mut Environment,
-    context: CGContextRef,
-    rects: crate::mem::ConstPtr<CGRect>,
-    count: usize,
-) {
-    for i in 0..count as u32 {
-        let r = env.mem.read(rects + i);
-        CGContextAddRect(env, context, r);
-    }
-}
-
-fn CGContextAddEllipseInRect(env: &mut Environment, context: CGContextRef, rect: CGRect) {
-    // Approximate with 4 points on the ellipse boundary.
-    let cx = rect.origin.x + rect.size.width * 0.5;
-    let cy = rect.origin.y + rect.size.height * 0.5;
-    let rx = rect.size.width * 0.5;
-    let ry = rect.size.height * 0.5;
-    if context.is_null() {
-        return;
-    }
-    let pts = [
-        CGPoint { x: cx + rx, y: cy },
-        CGPoint { x: cx, y: cy + ry },
-        CGPoint { x: cx - rx, y: cy },
-        CGPoint { x: cx, y: cy - ry },
-    ];
-    for p in pts {
-        env.objc
-            .borrow_mut::<CGContextHostObject>(context)
-            .path_points
-            .push(p);
-    }
-}
-
-fn CGContextAddArc(
-    env: &mut Environment,
-    context: CGContextRef,
-    x: CGFloat,
-    y: CGFloat,
-    radius: CGFloat,
-    start_angle: CGFloat,
-    end_angle: CGFloat,
-    _clockwise: i32,
-) {
-    // Store start/end points only.
-    if context.is_null() {
-        return;
-    }
-    let p0 = CGPoint {
-        x: x + radius * start_angle.cos(),
-        y: y + radius * start_angle.sin(),
-    };
-    let p1 = CGPoint {
-        x: x + radius * end_angle.cos(),
-        y: y + radius * end_angle.sin(),
-    };
-    let host = env.objc.borrow_mut::<CGContextHostObject>(context);
-    host.path_points.push(p0);
-    host.path_points.push(p1);
-}
-
-fn CGContextAddArcToPoint(
-    env: &mut Environment,
-    context: CGContextRef,
-    x1: CGFloat,
-    y1: CGFloat,
-    x2: CGFloat,
-    y2: CGFloat,
-    _radius: CGFloat,
-) {
-    if context.is_null() {
-        return;
-    }
-    let host = env.objc.borrow_mut::<CGContextHostObject>(context);
-    host.path_points.push(CGPoint { x: x1, y: y1 });
-    host.path_points.push(CGPoint { x: x2, y: y2 });
-}
-
-fn CGContextAddCurveToPoint(
-    env: &mut Environment,
-    context: CGContextRef,
-    _cp1x: CGFloat,
-    _cp1y: CGFloat,
-    _cp2x: CGFloat,
-    _cp2y: CGFloat,
-    x: CGFloat,
-    y: CGFloat,
-) {
-    if context.is_null() {
-        return;
-    }
-    env.objc
-        .borrow_mut::<CGContextHostObject>(context)
-        .path_points
-        .push(CGPoint { x, y });
-}
-
-fn CGContextAddQuadCurveToPoint(
-    env: &mut Environment,
-    context: CGContextRef,
-    _cpx: CGFloat,
-    _cpy: CGFloat,
-    x: CGFloat,
-    y: CGFloat,
-) {
-    if context.is_null() {
-        return;
-    }
-    env.objc
-        .borrow_mut::<CGContextHostObject>(context)
-        .path_points
-        .push(CGPoint { x, y });
-}
-
 fn CGContextClosePath(env: &mut Environment, context: CGContextRef) {
-    if context.is_null() {
-        return;
-    }
-    // Close by adding the first point again.
-    let first = env
-        .objc
-        .borrow::<CGContextHostObject>(context)
-        .path_points
-        .first()
-        .copied();
-    if let Some(p) = first {
-        env.objc
-            .borrow_mut::<CGContextHostObject>(context)
-            .path_points
-            .push(p);
+    append_path_element(env, context, super::cg_path::PathElement::Close);
+}
+fn CGContextAddRect(env: &mut Environment, context: CGContextRef, rect: CGRect) {
+    let (x,y,w,h)=(rect.origin.x,rect.origin.y,rect.size.width,rect.size.height);
+    CGContextMoveToPoint(env,context,x,y);
+    CGContextAddLineToPoint(env,context,x+w,y);
+    CGContextAddLineToPoint(env,context,x+w,y+h);
+    CGContextAddLineToPoint(env,context,x,y+h);
+    CGContextClosePath(env,context);
+}
+fn CGContextAddRects(env: &mut Environment, context: CGContextRef, rects: ConstPtr<CGRect>, count: usize) {
+    for i in 0..count as u32 { let rect=env.mem.read(rects+i); CGContextAddRect(env,context,rect); }
+}
+fn CGContextAddCurveToPoint(env: &mut Environment, context: CGContextRef, cp1x: CGFloat, cp1y: CGFloat, cp2x: CGFloat, cp2y: CGFloat, x: CGFloat, y: CGFloat) {
+    append_path_element(env,context,super::cg_path::PathElement::CurveTo {
+        c1: CGPoint{x:cp1x,y:cp1y}, c2: CGPoint{x:cp2x,y:cp2y}, to: CGPoint{x,y}
+    });
+}
+fn CGContextAddQuadCurveToPoint(env: &mut Environment, context: CGContextRef, cpx: CGFloat, cpy: CGFloat, x: CGFloat, y: CGFloat) {
+    append_path_element(env,context,super::cg_path::PathElement::QuadCurveTo { control:CGPoint{x:cpx,y:cpy}, to:CGPoint{x,y} });
+}
+fn CGContextAddEllipseInRect(env: &mut Environment, context: CGContextRef, rect: CGRect) {
+    let (cx,cy)=(rect.origin.x+rect.size.width*0.5,rect.origin.y+rect.size.height*0.5);
+    let (rx,ry)=(rect.size.width*0.5,rect.size.height*0.5);
+    let k=0.5522848;
+    CGContextMoveToPoint(env,context,cx+rx,cy);
+    CGContextAddCurveToPoint(env,context,cx+rx,cy+k*ry,cx+k*rx,cy+ry,cx,cy+ry);
+    CGContextAddCurveToPoint(env,context,cx-k*rx,cy+ry,cx-rx,cy+k*ry,cx-rx,cy);
+    CGContextAddCurveToPoint(env,context,cx-rx,cy-k*ry,cx-k*rx,cy-ry,cx,cy-ry);
+    CGContextAddCurveToPoint(env,context,cx+k*rx,cy-ry,cx+rx,cy-k*ry,cx+rx,cy);
+    CGContextClosePath(env,context);
+}
+fn CGContextAddArc(env: &mut Environment, context: CGContextRef, x: CGFloat, y: CGFloat, radius: CGFloat, start_angle: CGFloat, end_angle: CGFloat, clockwise: i32) {
+    if context.is_null() || radius < 0.0 || ![x,y,radius,start_angle,end_angle].iter().all(|v|v.is_finite()) { return; }
+    let tau=std::f32::consts::TAU;
+    let raw=end_angle-start_angle;
+    let sweep=if raw.abs()>=tau { if clockwise!=0 {-tau} else {tau} }
+        else if clockwise!=0 { -(-raw).rem_euclid(tau) } else {raw.rem_euclid(tau)};
+    let p=CGPoint{x:x+radius*start_angle.cos(),y:y+radius*start_angle.sin()};
+    if env.objc.borrow::<CGContextHostObject>(context).path_elements.is_empty() { CGContextMoveToPoint(env,context,p.x,p.y); }
+    else { CGContextAddLineToPoint(env,context,p.x,p.y); }
+    let steps=(sweep.abs() / std::f32::consts::FRAC_PI_2).ceil().max(1.0) as u32;
+    for i in 0..steps {
+        let a=start_angle+sweep*i as f32/steps as f32;
+        let b=start_angle+sweep*(i+1) as f32/steps as f32;
+        let k=4.0/3.0*((b-a)/4.0).tan();
+        CGContextAddCurveToPoint(env,context,
+            x+radius*(a.cos()-k*a.sin()),y+radius*(a.sin()+k*a.cos()),
+            x+radius*(b.cos()+k*b.sin()),y+radius*(b.sin()-k*b.cos()),
+            x+radius*b.cos(),y+radius*b.sin());
     }
 }
-
-// MARK: - Path drawing
+fn CGContextAddArcToPoint(env: &mut Environment, context: CGContextRef, x1: CGFloat, y1: CGFloat, x2: CGFloat, y2: CGFloat, radius: CGFloat) {
+    if context.is_null() || radius < 0.0 { return; }
+    let h=env.objc.borrow::<CGContextHostObject>(context);
+    let contours=super::path_geometry::flatten(&h.path_elements);
+    let Some(contour)=contours.last() else { CGContextMoveToPoint(env,context,x1,y1); return; };
+    let p=if contour.closed {contour.points.first()} else {contour.points.last()};
+    let Some(&p)=p else {return;};
+    let p=h.transform.invert().apply_to_point(p);
+    let (ux,uy)=(p.x-x1,p.y-y1); let (vx,vy)=(x2-x1,y2-y1);
+    let (ul,vl)=((ux*ux+uy*uy).sqrt(),(vx*vx+vy*vy).sqrt());
+    if ul==0.0 || vl==0.0 || radius==0.0 { CGContextAddLineToPoint(env,context,x1,y1); return; }
+    let (ux,uy,vx,vy)=(ux/ul,uy/ul,vx/vl,vy/vl);
+    let cross=ux*vy-uy*vx;
+    let angle=(ux*vx+uy*vy).clamp(-1.0,1.0).acos();
+    if cross.abs()<1e-6 { CGContextAddLineToPoint(env,context,x1,y1); return; }
+    let d=radius/(angle*0.5).tan();
+    let t1=CGPoint{x:x1+ux*d,y:y1+uy*d};
+    let t2=CGPoint{x:x1+vx*d,y:y1+vy*d};
+    let sign=cross.signum();
+    let center=CGPoint{x:t1.x-uy*radius*sign,y:t1.y+ux*radius*sign};
+    CGContextAddArc(env,context,center.x,center.y,radius,
+        (t1.y-center.y).atan2(t1.x-center.x),(t2.y-center.y).atan2(t2.x-center.x),if cross>0.0 {1} else {0});
+}
 
 fn CGContextDrawPath(env: &mut Environment, context: CGContextRef, mode: i32) {
-    // mode: 0=fill, 1=eof-fill, 2=stroke, 3=fill+stroke, 4=eof-fill+stroke
-    let do_fill = matches!(mode, 0 | 1 | 3 | 4);
-    let do_stroke = matches!(mode, 2..=4);
-    if context.is_null() {
-        return;
-    }
-    if do_fill {
-        CGContextFillPath(env, context);
-    }
-    if do_stroke {
-        CGContextStrokePath(env, context);
-    }
-}
-
-fn CGContextFillPath(env: &mut Environment, context: CGContextRef) {
-    if context.is_null() {
-        return;
-    }
-    // Compute axis-aligned bounding box of path and fill it.
-    let points = env
-        .objc
-        .borrow::<CGContextHostObject>(context)
-        .path_points
-        .clone();
-    if points.is_empty() {
-        return;
-    }
-    let min_x = points.iter().map(|p| p.x).fold(f32::MAX, f32::min);
-    let min_y = points.iter().map(|p| p.y).fold(f32::MAX, f32::min);
-    let max_x = points.iter().map(|p| p.x).fold(f32::MIN, f32::max);
-    let max_y = points.iter().map(|p| p.y).fold(f32::MIN, f32::max);
-    let rect = CGRect {
-        origin: CGPoint { x: min_x, y: min_y },
-        size: super::CGSize {
-            width: max_x - min_x,
-            height: max_y - min_y,
-        },
-    };
-    cg_bitmap_context::fill_rect(env, context, rect, false);
-    env.objc
-        .borrow_mut::<CGContextHostObject>(context)
-        .path_points
-        .clear();
-}
-
-fn CGContextEOFillPath(env: &mut Environment, context: CGContextRef) {
-    // Even-odd fill — treat same as winding fill for now.
-    CGContextFillPath(env, context);
-}
-
-fn CGContextStrokePath(env: &mut Environment, context: CGContextRef) {
-    if context.is_null() {
-        return;
-    }
-    let lw = env.objc.borrow::<CGContextHostObject>(context).line_width;
-    let (r, g, b, a) = env
-        .objc
-        .borrow::<CGContextHostObject>(context)
-        .rgb_stroke_color;
-    let points = env
-        .objc
-        .borrow::<CGContextHostObject>(context)
-        .path_points
-        .clone();
-    let saved_fill = env
-        .objc
-        .borrow::<CGContextHostObject>(context)
-        .rgb_fill_color;
-    CGContextSetRGBFillColor(env, context, r, g, b, a);
-    // Draw a thin rect along each segment.
-    for pair in points.windows(2) {
-        let (p0, p1) = (pair[0], pair[1]);
-        let dx = p1.x - p0.x;
-        let dy = p1.y - p0.y;
-        let len = (dx * dx + dy * dy).sqrt();
-        if len < 0.001 {
-            continue;
+    if context.is_null() || !(0..=4).contains(&mode) { return; }
+    let h=env.objc.borrow_mut::<CGContextHostObject>(context);
+    let elements=std::mem::take(&mut h.path_elements);
+    let fill=h.rgb_fill_color; let stroke=h.rgb_stroke_color; let alpha=h.alpha;
+    let blend=h.blend_mode!=17; let cap=h.line_cap; let join=h.line_join; let miter=h.miter_limit;
+    // Frobenius norm bounds the largest CTM stretch, including shears.
+    let scale=(h.transform.a*h.transform.a+h.transform.b*h.transform.b
+        +h.transform.c*h.transform.c+h.transform.d*h.transform.d).sqrt();
+    let hairline = h.line_width == 0.0;
+    let pen_width = if hairline { 1.0 } else { h.line_width.abs() };
+    let width = if hairline { 1.0 } else { pen_width * scale };
+    let inverse = if hairline { CGAffineTransformIdentity } else { h.transform.invert() };
+    let contours=super::path_geometry::flatten(&elements);
+    let stroke_contours: Vec<_> = contours.iter().map(|c| super::path_geometry::Contour {
+        points: c.points.iter().map(|&p| inverse.apply_to_point(p)).collect(),
+        closed: c.closed,
+    }).collect();
+    let all:Vec<CGPoint>=contours.iter().flat_map(|c|c.points.iter().copied()).filter(|p|p.x.is_finite()&&p.y.is_finite()).collect();
+    if all.is_empty() {return;}
+    let do_fill=matches!(mode,0|1|3|4); let do_stroke=matches!(mode,2|3|4);
+    let pad=if do_stroke {width*0.5*miter.max(1.0)+1.0} else {1.0};
+    let minx=all.iter().map(|p|p.x).fold(f32::INFINITY,f32::min)-pad;
+    let miny=all.iter().map(|p|p.y).fold(f32::INFINITY,f32::min)-pad;
+    let maxx=all.iter().map(|p|p.x).fold(f32::NEG_INFINITY,f32::max)+pad;
+    let maxy=all.iter().map(|p|p.y).fold(f32::NEG_INFINITY,f32::max)+pad;
+    let mut drawer=CGBitmapContextDrawer::new(&env.objc,&mut env.mem,context);
+    for y in (miny.floor().max(0.0) as u32)..(maxy.ceil().min(drawer.height() as f32).max(0.0) as u32) {
+        for x in (minx.floor().max(0.0) as u32)..(maxx.ceil().min(drawer.width() as f32).max(0.0) as u32) {
+            let mut fc=0; let mut sc=0;
+            for (ox,oy) in [(0.25,0.25),(0.75,0.25),(0.25,0.75),(0.75,0.75)] {
+                let p=CGPoint{x:x as f32+ox,y:y as f32+oy};
+                if do_fill && super::path_geometry::contains(&contours,p,matches!(mode,1|4)) {fc+=1;}
+                if do_stroke && super::path_geometry::on_stroke(&stroke_contours,inverse.apply_to_point(p),pen_width,cap,join,miter) {sc+=1;}
+            }
+            if fc>0 {drawer.put_srgba_pixel((x as i32,y as i32),(fill.0,fill.1,fill.2,fill.3*alpha*fc as f32/4.0),blend);}
+            if sc>0 {drawer.put_srgba_pixel((x as i32,y as i32),(stroke.0,stroke.1,stroke.2,stroke.3*alpha*sc as f32/4.0),blend);}
         }
-        // Axis-aligned approximation — draw bounding box of the segment.
-        let min_x = p0.x.min(p1.x) - lw * 0.5;
-        let min_y = p0.y.min(p1.y) - lw * 0.5;
-        let w = (p0.x - p1.x).abs().max(lw);
-        let h = (p0.y - p1.y).abs().max(lw);
-        let seg_rect = CGRect {
-            origin: CGPoint { x: min_x, y: min_y },
-            size: super::CGSize {
-                width: w,
-                height: h,
-            },
-        };
-        cg_bitmap_context::fill_rect(env, context, seg_rect, false);
     }
-    env.objc
-        .borrow_mut::<CGContextHostObject>(context)
-        .rgb_fill_color = saved_fill;
-    env.objc
-        .borrow_mut::<CGContextHostObject>(context)
-        .path_points
-        .clear();
 }
+fn CGContextFillPath(env: &mut Environment, context: CGContextRef) { CGContextDrawPath(env,context,0); }
+fn CGContextEOFillPath(env: &mut Environment, context: CGContextRef) { CGContextDrawPath(env,context,1); }
+fn CGContextStrokePath(env: &mut Environment, context: CGContextRef) { CGContextDrawPath(env,context,2); }
 
 // MARK: - Antialiasing / quality hints
 
 fn CGContextSetShouldAntialias(_env: &mut Environment, _context: CGContextRef, _value: bool) {}
 fn CGContextSetAllowsAntialiasing(_env: &mut Environment, _context: CGContextRef, _value: bool) {}
 fn CGContextSetShouldSmoothFonts(_env: &mut Environment, _context: CGContextRef, _value: bool) {}
+
+fn CGContextSetAllowsFontSmoothing(_env: &mut Environment, _context: CGContextRef, _value: bool) {}
+fn CGContextSetShouldSubpixelPositionFonts(
+    _env: &mut Environment,
+    _context: CGContextRef,
+    _value: bool,
+) {
+}
+fn CGContextSetAllowsFontSubpixelQuantization(
+    _env: &mut Environment,
+    _context: CGContextRef,
+    _value: bool,
+) {
+}
 
 // MARK: - Flush / sync
 
@@ -1044,6 +966,82 @@ pub fn CGContextDrawTiledImage(
     }
 }
 
+/// Solve |p - (c0 + t*(c1-c0))| = r0 + t*(r1-r0). The largest
+/// admissible root is the last circle painted when the circles overlap.
+fn radial_gradient_parameter(
+    point: CGPoint,
+    start: CGPoint,
+    start_radius: CGFloat,
+    end: CGPoint,
+    end_radius: CGFloat,
+    options: u32,
+) -> Option<CGFloat> {
+    let px = f64::from(point.x) - f64::from(start.x);
+    let py = f64::from(point.y) - f64::from(start.y);
+    let dx = f64::from(end.x) - f64::from(start.x);
+    let dy = f64::from(end.y) - f64::from(start.y);
+    let r = f64::from(start_radius);
+    let dr = f64::from(end_radius) - r;
+    let a = dx * dx + dy * dy - dr * dr;
+    let b = -2.0 * (px * dx + py * dy + r * dr);
+    let c = px * px + py * py - r * r;
+    let roots = if a.abs() <= f64::EPSILON * (dx * dx + dy * dy + dr * dr).max(1.0) {
+        if b == 0.0 { return None; }
+        [-c / b, -c / b]
+    } else {
+        let discriminant = b * b - 4.0 * a * c;
+        if discriminant < 0.0 { return None; }
+        // Stable quadratic formula avoids cancellation near either circle.
+        let q = -0.5 * (b + discriminant.sqrt().copysign(b));
+        if q == 0.0 { [0.0, 0.0] } else { [q / a, c / q] }
+    };
+    roots.into_iter()
+        .filter(|t| t.is_finite() && r + t * dr >= 0.0)
+        .filter(|t| (*t >= 0.0 || options & 1 != 0) && (*t <= 1.0 || options & 2 != 0))
+        .max_by(|a, b| a.partial_cmp(b).unwrap())
+        .map(|t| t.clamp(0.0, 1.0) as CGFloat)
+}
+
+/// Software radial shading in user space. Uses the existing bitmap context
+/// blender; arbitrary path clipping and unsupported blend modes retain the
+/// same limitations as the other software CGContext drawing operations.
+#[allow(clippy::too_many_arguments)]
+pub fn CGContextDrawRadialGradient(
+    env: &mut Environment,
+    context: CGContextRef,
+    gradient: super::cg_gradient::CGGradientRef,
+    start_center: CGPoint,
+    start_radius: CGFloat,
+    end_center: CGPoint,
+    end_radius: CGFloat,
+    options: u32,
+) {
+    if context.is_null() || gradient.is_null() { return; }
+    if ![start_center.x, start_center.y, end_center.x, end_center.y,
+        start_radius, end_radius].iter().all(|v| v.is_finite())
+        || start_radius < 0.0 || end_radius < 0.0 {
+        return;
+    }
+    let host = env.objc.borrow::<CGContextHostObject>(context);
+    let transform = host.transform;
+    let alpha = host.alpha;
+    let blend = host.blend_mode != 17; // kCGBlendModeCopy
+    let determinant = transform.a * transform.d - transform.b * transform.c;
+    if !determinant.is_finite() || determinant == 0.0 { return; }
+    let inverse = transform.invert();
+    let sample = super::cg_gradient::color_sampler(env, gradient);
+    let mut drawer = CGBitmapContextDrawer::new(&env.objc, &mut env.mem, context);
+    for y in 0..drawer.height() {
+        for x in 0..drawer.width() {
+            let point = inverse.apply_to_point(CGPoint { x: x as f32 + 0.5, y: y as f32 + 0.5 });
+            if let Some(t) = radial_gradient_parameter(point, start_center, start_radius, end_center, end_radius, options) {
+                let (r, g, b, a) = sample(t);
+                drawer.put_srgba_pixel((x as i32, y as i32), (r, g, b, a * alpha), blend);
+            }
+        }
+    }
+}
+
 pub fn CGContextDrawLinearGradient(
     _env: &mut Environment,
     _context: CGContextRef,
@@ -1071,6 +1069,7 @@ pub fn CGContextSaveGState(env: &mut Environment, context: CGContextRef) {
     let h = env.objc.borrow::<CGContextHostObject>(context);
     let state = CGContextState {
         fill_color: h.rgb_fill_color,
+        fill_color_space_model: h.fill_color_space_model,
         stroke_color: h.rgb_stroke_color,
         alpha: h.alpha,
         line_width: h.line_width,
@@ -1111,6 +1110,7 @@ pub fn CGContextRestoreGState(env: &mut Environment, context: CGContextRef) {
     let host = env.objc.borrow_mut::<CGContextHostObject>(context);
     if let Some(state) = host.state_stack.pop() {
         host.rgb_fill_color = state.fill_color;
+        host.fill_color_space_model = state.fill_color_space_model;
         host.rgb_stroke_color = state.stroke_color;
         host.alpha = state.alpha;
         host.line_width = state.line_width;
@@ -1479,6 +1479,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGContextRetain(_)),
     export_c_func!(CGContextRelease(_)),
     export_c_func!(CGContextSetFillColorWithColor(_, _)),
+    export_c_func!(CGContextSetFillColor(_, _)),
     export_c_func!(CGContextSetRGBFillColor(_, _, _, _, _)),
     export_c_func!(CGContextSetRGBStrokeColor(_, _, _, _, _)),
     export_c_func!(CGContextSetGrayFillColor(_, _, _)),
@@ -1511,6 +1512,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGContextShowGlyphs(_, _, _)),
     // Add to FUNCTIONS:
     export_c_func!(CGContextSetStrokeColorWithColor(_, _)),
+    export_c_func!(CGContextSetStrokeColor(_, _)),
     export_c_func!(CGContextSetGrayStrokeColor(_, _, _)),
     export_c_func!(CGContextSetAlpha(_, _)),
     export_c_func!(CGContextSetLineWidth(_, _)),
@@ -1535,6 +1537,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGContextAddQuadCurveToPoint(_, _, _, _, _)),
     export_c_func!(CGContextClosePath(_)),
     export_c_func!(CGContextBeginPath(_)),
+    export_c_func!(CGContextAddPath(_, _)),
     export_c_func!(CGContextDrawPath(_, _)),
     export_c_func!(CGContextFillPath(_)),
     export_c_func!(CGContextEOFillPath(_)),
@@ -1542,6 +1545,9 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGContextSetShouldAntialias(_, _)),
     export_c_func!(CGContextSetAllowsAntialiasing(_, _)),
     export_c_func!(CGContextSetShouldSmoothFonts(_, _)),
+    export_c_func!(CGContextSetAllowsFontSmoothing(_, _)),
+    export_c_func!(CGContextSetShouldSubpixelPositionFonts(_, _)),
+    export_c_func!(CGContextSetAllowsFontSubpixelQuantization(_, _)),
     export_c_func!(CGContextFlush(_)),
     export_c_func!(CGContextSynchronize(_)),
     export_c_func!(CGContextGetClipBoundingBox(_)),
@@ -1554,6 +1560,40 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGContextSetStrokeColorSpace(_, _)),
     export_c_func!(CGContextSetRenderingIntent(_, _)),
     export_c_func!(CGContextDrawLinearGradient(_, _, _, _, _)),
+    export_c_func!(CGContextDrawRadialGradient(_, _, _, _, _, _, _)),
     export_c_func!(CGContextSetAllowsFontSubpixelPositioning(_, _)),
     export_c_func!(CGContextSetShouldSubpixelQuantizeFonts(_, _)),
 ];
+
+#[cfg(test)]
+mod radial_gradient_tests {
+    use super::*;
+
+    fn concentric(x: f32, r0: f32, r1: f32, options: u32) -> Option<f32> {
+        radial_gradient_parameter(CGPoint { x, y: 0.0 }, CGPointZero, r0, CGPointZero, r1, options)
+    }
+
+    #[test]
+    fn concentric_and_reversed_radii() {
+        assert_eq!(concentric(0.0, 0.0, 10.0, 0), Some(0.0));
+        assert_eq!(concentric(5.0, 0.0, 10.0, 0), Some(0.5));
+        assert_eq!(concentric(10.0, 0.0, 10.0, 0), Some(1.0));
+        assert_eq!(concentric(2.5, 10.0, 0.0, 0), Some(0.75));
+    }
+
+    #[test]
+    fn extension_flags_and_degenerate_circles() {
+        assert_eq!(concentric(2.0, 4.0, 10.0, 0), None);
+        assert_eq!(concentric(2.0, 4.0, 10.0, 1), Some(0.0));
+        assert_eq!(concentric(12.0, 4.0, 10.0, 0), None);
+        assert_eq!(concentric(12.0, 4.0, 10.0, 2), Some(1.0));
+        assert_eq!(concentric(5.0, 5.0, 5.0, 3), None);
+    }
+
+    #[test]
+    fn offset_centres_and_linear_case() {
+        let end = CGPoint { x: 10.0, y: 0.0 };
+        assert_eq!(radial_gradient_parameter(end, CGPointZero, 0.0, end, 10.0, 0), Some(0.5));
+        assert_eq!(radial_gradient_parameter(CGPoint { x: 5.0, y: 9.0 }, CGPointZero, 2.0, end, 2.0, 0), None);
+    }
+}

@@ -503,6 +503,10 @@ pub struct GLES1OnGL2State {
     pointer_is_fixed_point: [bool; ARRAYS.len()],
     fixed_point_texture_units: HashSet<GLenum>,
     fixed_point_translation_buffers: [Vec<GLfloat>; ARRAYS.len()],
+    /// `GL_ARRAY_BUFFER_BINDING` as it was before `translate_fixed_point_arrays`
+    /// started rebinding buffers, so `restore_fixed_point_arrays` can put it
+    /// back. `None` when no translation is in progress.
+    fixed_point_saved_array_buffer: Option<GLuint>,
     matrix_mode: MatrixModeState,
     matrix_palette_enabled: bool,
     current_palette_matrix: GLuint,
@@ -524,6 +528,7 @@ fn new_gles1_on_gl2_state() -> GLES1OnGL2State {
         pointer_is_fixed_point: [false; ARRAYS.len()],
         fixed_point_texture_units: HashSet::new(),
         fixed_point_translation_buffers: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+        fixed_point_saved_array_buffer: None,
         matrix_mode: MatrixModeState::ModelView,
         matrix_palette_enabled: false,
         current_palette_matrix: 0,
@@ -649,6 +654,18 @@ impl GLES1OnGL2<'_> {
             let mut buffer_binding = 0;
             gl21::GetIntegerv(array_info.buffer_binding, &mut buffer_binding);
 
+            // Remember the guest's GL_ARRAY_BUFFER binding the first time we
+            // are about to disturb it (the map/unbind below and the rebinds
+            // in restore_fixed_point_arrays), so it can be put back
+            // afterwards. Leaving it changed used to desynchronise the
+            // guest's idea of the binding from the driver's, which turns the
+            // next gl*Pointer offset into a bogus client pointer.
+            if self.state.fixed_point_saved_array_buffer.is_none() {
+                let mut current_array_buffer: GLint = 0;
+                gl21::GetIntegerv(gl21::ARRAY_BUFFER_BINDING, &mut current_array_buffer);
+                self.state.fixed_point_saved_array_buffer = Some(current_array_buffer as GLuint);
+            }
+
             // Get and back up data
 
             let size = array_info.size.map(|size_enum| {
@@ -676,6 +693,11 @@ impl GLES1OnGL2<'_> {
             });
 
             let pointer = if buffer_binding != 0 {
+                // Map the buffer *this* array sources from; it isn't
+                // necessarily the one currently bound to GL_ARRAY_BUFFER
+                // (a previous iteration may have unbound it, or the guest may
+                // have bound a different buffer since specifying the array).
+                gl21::BindBuffer(gl21::ARRAY_BUFFER, buffer_binding as GLuint);
                 let mapped_buffer = gl21::MapBuffer(gl21::ARRAY_BUFFER, gl21::READ_ONLY);
                 assert!(!mapped_buffer.is_null());
                 // in this case the old_pointer is actually an offest!
@@ -758,9 +780,12 @@ impl GLES1OnGL2<'_> {
                 continue;
             };
 
-            if buffer_binding != 0 {
-                gl21::BindBuffer(gl21::ARRAY_BUFFER, buffer_binding);
-            }
+            // The pointer is an offset into `buffer_binding` if that is
+            // non-zero, and a client pointer otherwise — in which case
+            // GL_ARRAY_BUFFER must be unbound, or the driver would treat the
+            // client pointer as an offset into whatever the previous
+            // iteration left bound.
+            gl21::BindBuffer(gl21::ARRAY_BUFFER, buffer_binding);
 
             match array_info.name {
                 gl21::COLOR_ARRAY => {
@@ -794,6 +819,11 @@ impl GLES1OnGL2<'_> {
                 }
                 _ => unreachable!(),
             }
+        }
+        // Put the guest's GL_ARRAY_BUFFER binding back (see
+        // translate_fixed_point_arrays).
+        if let Some(saved) = self.state.fixed_point_saved_array_buffer.take() {
+            gl21::BindBuffer(gl21::ARRAY_BUFFER, saved);
         }
     }
 
@@ -913,6 +943,10 @@ impl GLES1OnGL2<'_> {
         let mut vertex_pointer: *mut GLvoid = std::ptr::null_mut();
         #[allow(clippy::unnecessary_mut_passed)]
         gl21::GetPointerv(gl21::VERTEX_ARRAY_POINTER, &mut vertex_pointer);
+        // Mapping the source buffers below rebinds GL_ARRAY_BUFFER; the
+        // guest's binding must be intact again when we return.
+        let mut old_array_buffer: GLint = 0;
+        gl21::GetIntegerv(gl21::ARRAY_BUFFER_BINDING, &mut old_array_buffer);
 
         let vertex_size = vertex_size.clamp(2, 4) as usize;
         let weight = &self.state.palette_weight_state;
@@ -938,8 +972,8 @@ impl GLES1OnGL2<'_> {
             if vertex_mapped {
                 gl21::BindBuffer(gl21::ARRAY_BUFFER, vertex_buffer_binding as GLuint);
                 gl21::UnmapBuffer(gl21::ARRAY_BUFFER);
-                gl21::BindBuffer(gl21::ARRAY_BUFFER, 0);
             }
+            gl21::BindBuffer(gl21::ARRAY_BUFFER, old_array_buffer as GLuint);
             return None;
         }
 
@@ -1004,18 +1038,16 @@ impl GLES1OnGL2<'_> {
         if vertex_mapped {
             gl21::BindBuffer(gl21::ARRAY_BUFFER, vertex_buffer_binding as GLuint);
             gl21::UnmapBuffer(gl21::ARRAY_BUFFER);
-            gl21::BindBuffer(gl21::ARRAY_BUFFER, 0);
         }
         if weight_mapped {
             gl21::BindBuffer(gl21::ARRAY_BUFFER, weight.buffer_binding);
             gl21::UnmapBuffer(gl21::ARRAY_BUFFER);
-            gl21::BindBuffer(gl21::ARRAY_BUFFER, 0);
         }
         if index_mapped {
             gl21::BindBuffer(gl21::ARRAY_BUFFER, index.buffer_binding);
             gl21::UnmapBuffer(gl21::ARRAY_BUFFER);
-            gl21::BindBuffer(gl21::ARRAY_BUFFER, 0);
         }
+        gl21::BindBuffer(gl21::ARRAY_BUFFER, old_array_buffer as GLuint);
 
         Some(out)
     }
@@ -1104,6 +1136,10 @@ impl GLES1OnGL2<'_> {
         let mut old_pointer: *mut GLvoid = std::ptr::null_mut();
         #[allow(clippy::unnecessary_mut_passed)]
         gl21::GetPointerv(gl21::VERTEX_ARRAY_POINTER, &mut old_pointer);
+        // ... and the guest's GL_ARRAY_BUFFER binding, which is independent
+        // of the vertex array's buffer and must survive this detour too.
+        let mut old_array_buffer: GLint = 0;
+        gl21::GetIntegerv(gl21::ARRAY_BUFFER_BINDING, &mut old_array_buffer);
 
         // Skinned positions are client-side floats: unbind any array buffer.
         gl21::BindBuffer(gl21::ARRAY_BUFFER, 0);
@@ -1135,7 +1171,7 @@ impl GLES1OnGL2<'_> {
             old_stride,
             old_pointer.cast_const(),
         );
-        gl21::BindBuffer(gl21::ARRAY_BUFFER, 0);
+        gl21::BindBuffer(gl21::ARRAY_BUFFER, old_array_buffer as GLuint);
     }
 
     unsafe fn draw_arrays_skinned(
@@ -1177,6 +1213,10 @@ fn weight_stride_or(stride: GLint) -> usize {
 }
 
 impl GLES for GLES1OnGL2<'_> {
+    fn is_gles1_on_gl2(&self) -> bool {
+        true
+    }
+
     unsafe fn driver_description(&self) -> String {
         let version = CStr::from_ptr(gl21::GetString(gl21::VERSION) as *const _);
         let vendor = CStr::from_ptr(gl21::GetString(gl21::VENDOR) as *const _);
@@ -2155,8 +2195,10 @@ impl GLES for GLES1OnGL2<'_> {
             self.state.pointer_is_fixed_point[2] = true;
             gl21::TexCoordPointer(size, gl21::FLOAT, stride, pointer)
         } else {
-            // TODO: byte
-            assert!(type_ == gl21::SHORT || type_ == gl21::FLOAT);
+            // GL_BYTE is a valid ES 1.1 pointer type and GL 2.1 accepts it
+            // directly (e.g. Exploration Lite / Kiloblocks passes GL_BYTE
+            // texture coordinates), so forward it instead of asserting.
+            assert!(type_ == gl21::BYTE || type_ == gl21::SHORT || type_ == gl21::FLOAT);
             self.state.fixed_point_texture_units.remove(&active_texture);
             if self.state.fixed_point_texture_units.is_empty() {
                 self.state.pointer_is_fixed_point[2] = false;
@@ -2177,8 +2219,10 @@ impl GLES for GLES1OnGL2<'_> {
             self.state.pointer_is_fixed_point[3] = true;
             gl21::VertexPointer(size, gl21::FLOAT, stride, pointer)
         } else {
-            // TODO: byte
-            assert!(type_ == gl21::SHORT || type_ == gl21::FLOAT);
+            // GL_BYTE is a valid ES 1.1 pointer type and GL 2.1 accepts it
+            // directly (e.g. Exploration Lite / Kiloblocks passes GL_BYTE
+            // texture coordinates), so forward it instead of asserting.
+            assert!(type_ == gl21::BYTE || type_ == gl21::SHORT || type_ == gl21::FLOAT);
             self.state.pointer_is_fixed_point[3] = false;
             gl21::VertexPointer(size, type_, stride, pointer)
         }

@@ -16,7 +16,7 @@ pub const LIBRESOLV: super::HostDylib = super::HostDylib {
     aliases: &["/usr/lib/libresolv.dylib"],
     class_exports: &[],
     constant_exports: &[],
-    function_exports: &[crate::libc::resolv::FUNCTIONS],
+    function_exports: &[],
 };
 
 pub const CORE_AUDIO: super::HostDylib = super::HostDylib {
@@ -106,8 +106,11 @@ pub const TWITTER: super::HostDylib = super::HostDylib {
     function_exports: &[],
 };
 
-// libresolv — stub resolver-state entry points; the functions are shared
-// with the main libc table so lookups through either dylib resolve to the
+// libresolv — stub resolver-state entry points live in the main libc table
+// (src/libc.rs), which every app links against; listing them here too would
+// trip the no-duplicate-exports test. The dylib entry stays so the path
+// resolves and non-lazy relocations don't warn about a missing dylib.
+// CoreTelephony — touchHLE has no cellular radio, but we expose real
 // CoreTelephony — touchHLE has no cellular radio, but we expose real
 // `CTTelephonyNetworkInfo` / `CTCarrier` classes plus the
 // `CTRadioAccessTechnology*` string constants and the
@@ -162,7 +165,7 @@ pub const AD_SUPPORT: super::HostDylib = super::HostDylib {
 pub const CORE_IMAGE: super::HostDylib = super::HostDylib {
     path: "/System/Library/Frameworks/CoreImage.framework/CoreImage",
     aliases: &[],
-    class_exports: &[frameworks::core_image::CLASSES],
+    class_exports: &[frameworks::core_image::CLASSES, frameworks::core_image::pipeline::CLASSES],
     constant_exports: &[frameworks::core_image::CONSTANTS],
     function_exports: &[frameworks::core_image::FUNCTIONS],
 };
@@ -223,6 +226,9 @@ pub const DYLIB_LIST: &[&super::HostDylib] = &[
     &frameworks::openal::DYLIB,
     &frameworks::opengles::DYLIB,
     &frameworks::security::DYLIB,
+    &frameworks::contacts::DYLIB,
+    &frameworks::pass_kit::DYLIB,
+    &frameworks::safari_services::DYLIB,
     &frameworks::store_kit::DYLIB,
     &frameworks::system_configuration::DYLIB,
     &frameworks::uikit::DYLIB,
@@ -262,6 +268,7 @@ pub const DYLIB_LIST: &[&super::HostDylib] = &[
     &frameworks::image_io::DYLIB,
     &frameworks::photos::DYLIB,
     &frameworks::quick_look::DYLIB,
+    &frameworks::watch_connectivity::DYLIB,
     &frameworks::xsapitcui::DYLIB,
 ];
 

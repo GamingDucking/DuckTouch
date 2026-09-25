@@ -8,8 +8,12 @@
 
 use crate::audio;
 use crate::dyld::{export_c_func, FunctionExports};
+use crate::frameworks::audio_toolbox::audio_converter::{
+    convert_pcm, pcm_shape_from_asbd, pcm_shapes_equal,
+};
 use crate::frameworks::audio_toolbox::audio_file::{
-    AudioFileHostObject, AudioFileID, State as AudioFileState,
+    create_output_path, persist_writable_audio_file, AudioFileHostObject, AudioFileID,
+    State as AudioFileState,
 };
 use crate::frameworks::carbon_core::{eofErr, OSStatus};
 use crate::frameworks::core_audio_types::{
@@ -133,23 +137,28 @@ fn register_ext_audio_file(
 
 pub fn ExtAudioFileCreateWithURL(
     env: &mut Environment,
-    _in_url: CFURLRef,
-    _file_type: u32,
+    in_url: CFURLRef,
+    file_type: u32,
     in_format: crate::mem::ConstPtr<AudioStreamBasicDescription>,
     _in_channel_layout: crate::mem::ConstVoidPtr,
     _in_flags: u32,
     out_ext_audio_file: MutPtr<ExtAudioFileRef>,
 ) -> OSStatus {
-    if in_format.is_null() || out_ext_audio_file.is_null() {
+    if in_url.is_null() || in_format.is_null() || out_ext_audio_file.is_null() {
         return -50;
     }
     let format = env.mem.read(in_format);
+    let path = match create_output_path(env, in_url, file_type, &format) {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
     let audio_file = AudioFileHostObject::Writable {
+        file_type,
+        path: Some(path),
         format,
         data: Vec::new(),
         user_data: Vec::new(),
     };
-    log_dbg!("ExtAudioFileCreateWithURL(): creating virtual writable audio file");
     register_ext_audio_file(env, audio_file, None, out_ext_audio_file)
 }
 
@@ -216,10 +225,14 @@ pub fn ExtAudioFileWrapAudioFileID(
                 packet_count: *packet_count,
             },
             AudioFileHostObject::Writable {
+                file_type,
+                path,
                 format,
                 ref data,
                 ref user_data,
             } => AudioFileHostObject::Writable {
+                file_type: *file_type,
+                path: path.clone(),
                 format: *format,
                 data: data.clone(),
                 user_data: user_data.clone(),
@@ -247,18 +260,17 @@ pub fn ExtAudioFileDispose(env: &mut Environment, in_ext_audio_file: ExtAudioFil
         return kExtAudioFileError_InvalidOperationOrder;
     };
 
-    if host_object.wrapped_audio_file_id.is_some() {
-        log_dbg!(
-            "ExtAudioFileDispose {:?}: wrapped AudioFileID retained by caller",
-            in_ext_audio_file
-        );
-    }
+    let status = if host_object.wrapped_audio_file_id.is_none() {
+        persist_writable_audio_file(env, &host_object.audio_file)
+    } else {
+        0
+    };
     env.mem.free(in_ext_audio_file.cast());
     log_dbg!(
         "ExtAudioFileDispose() destroyed handle {:?}",
         in_ext_audio_file
     );
-    0 // success
+    status
 }
 
 pub fn ExtAudioFileGetPropertyInfo(
@@ -501,6 +513,94 @@ pub fn ExtAudioFileRead(
         env.mem.write(io_num_frames, 0);
         abl.first_buffer.data_byte_size = 0;
         env.mem.write(io_data, abl);
+        return 0;
+    }
+
+    // Client-format conversion: when the client requested a data format
+    // that differs from the file's native format (sample rate, channel
+    // count, bit depth, int/float), read native frames and convert them
+    // instead of returning raw file bytes.
+    let native_asbd = build_asbd(&host.audio_file);
+    let native_shape = pcm_shape_from_asbd(&native_asbd);
+    let client_shape = host.client_format.and_then(|f| pcm_shape_from_asbd(&f));
+    let needs_conversion = match (&native_shape, &client_shape) {
+        (Some(n), Some(c)) => !pcm_shapes_equal(n, c),
+        _ => false,
+    };
+
+    if needs_conversion {
+        let native = native_shape.unwrap();
+        let client = client_shape.unwrap();
+        let native_bpf = native.bytes_per_frame as u64;
+        let client_bpf = client.bytes_per_frame as u64;
+
+        // Native frames needed to produce the requested number of client
+        // frames (rate ratio), plus one frame of margin for interpolation.
+        let native_frames_needed = if native.sample_rate.max(1.0) == client.sample_rate.max(1.0) {
+            frames_requested
+        } else {
+            ((frames_requested as f64) * native.sample_rate / client.sample_rate).ceil() as u32 + 1
+        };
+        let native_bytes_needed = native_frames_needed as u64 * native_bpf;
+
+        // Read native PCM into a host-side staging buffer.
+        let starting_byte = host.frame_position * native_bpf;
+        let mut staging = vec![0u8; native_bytes_needed as usize];
+        let bytes_read = match &mut host.audio_file {
+            AudioFileHostObject::Real(af) => {
+                af.read_bytes(starting_byte, &mut staging).unwrap_or(0)
+            }
+            AudioFileHostObject::Dummy { byte_count, .. } => {
+                let max_read = byte_count.saturating_sub(starting_byte);
+                std::cmp::min(native_bytes_needed, max_read) as usize
+            }
+            AudioFileHostObject::Writable { ref data, .. } => {
+                let start = starting_byte as usize;
+                if start >= data.len() {
+                    0
+                } else {
+                    let available = data.len() - start;
+                    let to_copy = std::cmp::min(native_bytes_needed as usize, available);
+                    staging[..to_copy].copy_from_slice(&data[start..start + to_copy]);
+                    to_copy
+                }
+            }
+        };
+
+        // Trim to whole frames actually read.
+        let bytes_read = bytes_read - bytes_read % native_bpf as usize;
+        staging.truncate(bytes_read);
+
+        let native_frames_read = (bytes_read / native_bpf as usize) as u64;
+        host.frame_position += native_frames_read;
+
+        let converted = convert_pcm(&staging, &native, &client);
+
+        if out_buffer.is_null() {
+            env.mem.write(io_num_frames, 0);
+            abl.first_buffer.data_byte_size = 0;
+            env.mem.write(io_data, abl);
+            return 0;
+        }
+
+        let out_bytes = (converted.len() as u32).min(max_bytes) as usize;
+        if out_bytes > 0 {
+            let out_slice = env.mem.bytes_at_mut(out_buffer.cast(), out_bytes as u32);
+            out_slice.copy_from_slice(&converted[..out_bytes]);
+        }
+        let produced_client_frames = if client_bpf > 0 {
+            out_bytes as u64 / client_bpf
+        } else {
+            0
+        };
+
+        env.mem.write(io_num_frames, produced_client_frames as u32);
+        abl.first_buffer.data_byte_size = (produced_client_frames * client_bpf) as u32;
+        env.mem.write(io_data, abl);
+
+        if native_frames_read < native_frames_needed as u64 {
+            return eofErr;
+        }
         return 0;
     }
 

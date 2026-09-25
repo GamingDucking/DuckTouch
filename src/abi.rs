@@ -288,7 +288,7 @@ macro_rules! impl_CallFromHost {
                 // Create a new guest stack frame. This is redundant considering
                 // we are storing this data on the host stack, but this makes
                 // stack traces work nicely. :)
-                let (old_sp, old_fp) = {
+                let (old_sp, old_fp, host_to_guest_frame_pointer) = {
                     let regs = env.cpu.regs_mut();
                     let old_sp = regs[Cpu::SP];
                     let old_fp = regs[FRAME_POINTER];
@@ -298,7 +298,7 @@ macro_rules! impl_CallFromHost {
                     env.mem
                         .write(Ptr::from_bits(regs[Cpu::SP]), old_fp);
                     env.mem.write(Ptr::from_bits(regs[Cpu::SP] + 4), old_lr);
-                    (old_sp, old_fp)
+                    (old_sp, old_fp, regs[FRAME_POINTER])
                 };
 
                 assert!(R::SIZE_IN_MEM.is_none()); // pointer return TODO
@@ -316,7 +316,15 @@ macro_rules! impl_CallFromHost {
                 // [GuestFunction::call_without_pushing_stack_frame] here, but
                 // it would mess up debug logging, so duplicating the code
                 // is easier.
-                env.run_call();
+                let host_to_guest_stack_frame =
+                    env.push_host_to_guest_stack_frame(host_to_guest_frame_pointer);
+                let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    env.run_call();
+                }));
+                env.pop_host_to_guest_stack_frame(host_to_guest_stack_frame);
+                if let Err(error) = run_result {
+                    std::panic::resume_unwind(error);
+                }
 
                 env.cpu.branch(old_pc);
 

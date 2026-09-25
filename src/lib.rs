@@ -26,29 +26,37 @@
 
 #[macro_use]
 mod log;
+mod env_flags;
+mod fastmap;
 mod abi;
+mod android_media;
+mod android_web_view;
 mod audio;
 mod bundle;
+mod corrupt;
 mod cpu;
 mod crash_handler;
 mod debug;
 mod dyld;
 mod environment;
-mod font;
+pub mod font;
 mod frameworks;
 mod fs;
 mod gdb;
 mod gles;
 mod image;
 mod libc;
-mod licenses;
 mod mach_o;
 mod matrix;
 mod mem;
 mod objc;
 mod options;
 mod paths;
+mod perf_hints;
 mod stack;
+mod guest_clock;
+mod trainer;
+mod trainer_ui;
 mod window;
 
 // Environment is used very frequently used and used to be in this module, so
@@ -59,6 +67,15 @@ mod window;
 use environment::{Environment, MutexId, MutexType, ThreadId, PTHREAD_MUTEX_DEFAULT};
 
 use std::path::PathBuf;
+
+// PERF: use mimalloc as the global allocator. The emulator performs a large
+// number of small, short-lived allocations per frame (autorelease pools,
+// string handling and various collections in the Foundation/UIKit HLE
+// implementations), a workload that mimalloc handles measurably faster than
+// the platform malloc — in particular on Android, where every allocation
+// additionally goes through Scudo hardening.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub use touchHLE_version::*;
 /// This is the true entry point on Android (SDLActivity calls it after
@@ -105,9 +122,6 @@ Special options:
     --help
         Display this help text.
 
-    --copyright
-        Display copyright, authorship and license information.
-
     --info
         Print basic information about the app bundle without running the app.
 ";
@@ -115,8 +129,27 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
     crash_handler::install();
     crash_handler::install_panic_hook();
 
+    #[cfg(target_os = "android")]
+    {
+        // PERF: raise the scheduling priority of the thread that runs the
+        // emulation loop. Android aggressively deprioritises background-ish
+        // app threads, which on big.LITTLE SoCs tends to keep the emulator on
+        // a little (efficiency) core and costs a large chunk of FPS. SDL's
+        // implementation of SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH)
+        // on Android/Linux raises the niceness of the calling thread and
+        // degrades gracefully (returns -1) if the OS disallows it — this is
+        // deliberately routed through SDL rather than libc::setpriority
+        // because the latter is not exposed for Android by the libc crate.
+        let rc = unsafe {
+            sdl2_sys::SDL_SetThreadPriority(sdl2_sys::SDL_ThreadPriority::SDL_THREAD_PRIORITY_HIGH)
+        };
+        if rc != 0 {
+            log!("Warning: failed to raise emulator thread priority; continuing with default priority.");
+        }
+    }
+
     echo!(
-        "touchHLE {}{}{} — https://touchhle.org/",
+        "touchHLE {}{}{}",
         branding(),
         if branding().is_empty() { "" } else { " " },
         VERSION,
@@ -137,6 +170,7 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         let base_path = paths::user_data_base_path();
         log!("Base path for touchHLE files: {}", base_path.display());
         paths::prepopulate_user_data_dir();
+        paths::remove_legacy_pvrtc_disk_cache();
     }
 
     let _ = args.next().unwrap(); // skip argv[0]
@@ -154,9 +188,6 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         } else if arg == "--help" {
             echo!("{}", USAGE);
             echo!("{}", options::OPTIONS_HELP);
-            return Ok(());
-        } else if arg == "--copyright" {
-            echo!("{}", licenses::get_text());
             return Ok(());
         } else if arg == "--info" {
             just_info = true;
@@ -249,10 +280,13 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         std::env::remove_var("TOUCHHLE_FORCE_LANDSCAPE_VIEW_BOUNDS");
         std::env::remove_var("TOUCHHLE_TOUCH_LOCATION_PORTRAIT_TO_LANDSCAPE");
         std::env::remove_var("TOUCHHLE_TOUCH_MODE");
-        if app_id == "com.robtop.geometryjump" {
-            std::env::set_var("TOUCHHLE_TOUCH_LOCATION_PORTRAIT_TO_LANDSCAPE", "1");
-            std::env::set_var("TOUCHHLE_TOUCH_MODE", "right");
-        }
+        // NOTE: do not force a portrait->landscape touch remap on
+        // com.robtop.geometryjump (Geometry Dash) anymore. Its cocos2d-x view
+        // is mounted as a UIViewController's view, so UIWindow's landscape
+        // autorotation already makes locationInView: return coordinates in the
+        // game's own landscape space; the extra "right" remap rotated those
+        // already-correct coordinates a second time and taps activated the
+        // wrong buttons (press high -> settings, press low -> level menu).
         std::env::remove_var("TOUCHHLE_TOUCH_LOCATION_X_OFFSET");
         std::env::remove_var("TOUCHHLE_TOUCH_LOCATION_Y_OFFSET");
         std::env::remove_var("TOUCHHLE_PRESENT_STRETCH_TO_VIEWPORT");

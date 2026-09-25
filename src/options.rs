@@ -34,6 +34,109 @@ pub enum Button {
 /// Highest iOS version currently exposed by the emulator compatibility layer.
 pub const LATEST_IOS_VERSION: (i32, i32, i32) = (12, 0, 0);
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CorruptionOptions {
+    pub enabled: bool,
+    pub interval_frames: u32,
+    pub bytes_per_burst: u32,
+    pub max_offset: Option<u32>,
+    pub seed: u64,
+}
+
+impl Default for CorruptionOptions {
+    fn default() -> Self {
+        Self {
+            // RTCV corruption is opt-in only: enabled via touchHLE_options /
+            // --corrupt-game, never by default.
+            enabled: false,
+            interval_frames: 30,
+            bytes_per_burst: 8,
+            max_offset: None,
+            seed: 0x6a09e667f3bcc909,
+        }
+    }
+}
+
+/// How `-[EAGLContext presentRenderbuffer:]` gets a rendered frame onto the
+/// host window when the app draws into a fullscreen `CAEAGLLayer`
+/// (`--present-mode=`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PresentMode {
+    /// Present on the GPU (copy the renderbuffer into a texture and draw a
+    /// quad into the window). If the first frames come out black even though
+    /// the renderbuffer has content, automatically fall back to `Readback`.
+    Auto,
+    /// Always present on the GPU, never fall back.
+    Direct,
+    /// Read the renderbuffer back to system RAM with `glReadPixels()` and
+    /// push it through the Core Animation compositor. Slow (a full GPU
+    /// pipeline stall plus two full-frame copies per frame), but it avoids
+    /// touching the app's GL state and is a useful workaround for broken
+    /// vendor OpenGL ES 1.1 drivers.
+    Readback,
+}
+
+impl PresentMode {
+    pub fn from_short_name(name: &str) -> Result<Self, ()> {
+        match name {
+            "auto" => Ok(Self::Auto),
+            "direct" => Ok(Self::Direct),
+            "readback" => Ok(Self::Readback),
+            _ => Err(()),
+        }
+    }
+}
+
+/// Which host OpenGL ES driver to load on Android (`--gl-driver=`). Has no
+/// effect on other platforms.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GlDriverPreference {
+    /// On Android, use bundled ANGLE for apps that may use OpenGL ES 1.1 only
+    /// on detected Adreno devices; use the system driver for ES 2.0-only apps
+    /// and other or unrecognized GPUs.
+    Auto,
+    /// Always use the bundled ANGLE driver (when it is available).
+    Angle,
+    /// Always use the vendor's native (system) OpenGL ES driver.
+    Native,
+}
+
+impl GlDriverPreference {
+    pub fn from_short_name(name: &str) -> Result<Self, ()> {
+        match name {
+            "auto" => Ok(Self::Auto),
+            "angle" => Ok(Self::Angle),
+            "native" | "system" => Ok(Self::Native),
+            _ => Err(()),
+        }
+    }
+}
+
+/// Whether host buffer swaps wait for the display's vertical refresh
+/// (`--vsync=`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum VsyncMode {
+    /// Android: off (the emulator paces frames itself and the Android
+    /// compositor already synchronises to the display, so a blocking swap only
+    /// adds stalls). Other platforms: leave the driver's default alone.
+    Auto,
+    /// Swap interval 1: every swap waits for the next vertical refresh.
+    On,
+    /// Swap interval 0: swaps never block.
+    Off,
+}
+
+impl VsyncMode {
+    pub fn from_short_name(name: &str) -> Result<Self, ()> {
+        match name {
+            "auto" => Ok(Self::Auto),
+            "on" | "1" => Ok(Self::On),
+            "off" | "0" => Ok(Self::Off),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Struct containing all user-configurable options.
 #[derive(Clone)]
 pub struct Options {
@@ -45,6 +148,9 @@ pub struct Options {
     /// `--device-family=auto` (from the host display) or via the explicit
     /// `--screen-size=WxH` override below.
     pub host_screen_size: Option<(u32, u32)>,
+    /// Disable the Cheat Engine-style memory trainer overlay. The trainer
+    /// is off by default; opt in with `--trainer`.
+    pub trainer_disabled: bool,
     pub initial_orientation: DeviceOrientation,
     /// iOS version reported to guest applications. `None` uses the latest compatibility version.
     pub ios_version: Option<(i32, i32, i32)>,
@@ -68,12 +174,37 @@ pub struct Options {
     /// through touchHLE's desktop OpenGL 2.1 compatibility backend.
     pub gles2_compat: bool,
     pub direct_memory_access: bool,
+    /// CPU affinity policy for the emulator thread on Android
+    /// (`--affinity=`): `None` = default (big cores), or one of
+    /// `all` / `off` / `big` / an explicit CPU list like `4-7`.
+    pub affinity: Option<String>,
     pub gdb_listen_addrs: Option<Vec<SocketAddr>>,
     pub preferred_languages: Option<Vec<String>>,
     pub headless: bool,
     pub print_fps: bool,
     pub fps_limit: Option<f64>,
     pub force_composition: bool,
+    /// See [PresentMode]. Can also be set with the `TOUCHHLE_PRESENT_MODE`
+    /// environment variable (the option takes precedence).
+    pub present_mode: PresentMode,
+    /// Issue a `glFinish()` before the presented renderbuffer is copied to
+    /// the window. Only needed for drivers that don't order the copy after
+    /// the app's draws correctly; costs a GPU pipeline stall per frame.
+    /// Can also be enabled with `TOUCHHLE_PRESENT_FINISH=1`.
+    pub present_finish: bool,
+    /// See [GlDriverPreference]. Can also be set with the
+    /// `TOUCHHLE_GL_DRIVER` environment variable (the option takes
+    /// precedence).
+    pub gl_driver: GlDriverPreference,
+    /// See [VsyncMode]. Can also be set with the `TOUCHHLE_VSYNC` environment
+    /// variable (the option takes precedence).
+    pub vsync: VsyncMode,
+    /// Android: give the emulator thread a higher scheduling priority and
+    /// report its per-frame CPU time to the OS performance hint manager
+    /// (ADPF), so the CPU governor keeps the core clocked for the emulated
+    /// workload instead of reacting to the idle time between frames. Can be
+    /// disabled with `--no-perf-hints` or `TOUCHHLE_PERF_HINTS=0`.
+    pub perf_hints: bool,
     /// Force EAGL `initWithAPI:` to create an OpenGL ES 2.0 context even when
     /// the app requested an OpenGL ES 1.1 context.
     ///
@@ -86,6 +217,18 @@ pub struct Options {
     /// command line. Apps that legitimately rely on the ES 1.1 fixed-function
     /// pipeline should NOT enable this flag.
     pub prefer_gles2_context: bool,
+    /// Force EAGL `initWithAPI:` to create an OpenGL ES 1.1 (fixed-function)
+    /// context even when the app requested an OpenGL ES 2.0/3.x context.
+    ///
+    /// The inverse of `--prefer-gles2-context`. Games built on engines that
+    /// support both backends (cocos2d-x 2.x: Geometry Dash, etc.) pick ES 2.0
+    /// whenever context creation succeeds, even though they also ship a fully
+    /// working ES 1.1 fixed-function path. On hosts where the ES 2.0 path
+    /// misrenders, downgrading the context to ES 1.1 makes such engines take
+    /// their ES 1.1 code path instead. Enable with `--force-gles1-context`
+    /// (per-app via the options file) or `TOUCHHLE_FORCE_GLES1_CONTEXT=1`.
+    /// Apps that are ES 2.0-only will fail to create a context with this set.
+    pub force_gles1_context: bool,
     pub network_access: bool,
     pub popup_errors: bool,
     pub dumping_options: DumpingOptions,
@@ -102,6 +245,9 @@ pub struct Options {
     /// `glGetError()` clears the error queue, so guest `glGetError()` calls
     /// will see 0 instead of the real error. Diagnostic only.
     pub trace_gl_errors: bool,
+    /// Log every GLES call made by the guest (via the LoggingGLES wrapper).
+    /// Much noisier than `trace_gl_errors`. Diagnostic only.
+    pub verbose_gles: bool,
     /// After a `glTexImage2D(level=0, …)` upload, if the bound texture's
     /// `GL_TEXTURE_MIN_FILTER` is still the ES 1.1 default
     /// `GL_NEAREST_MIPMAP_LINEAR` (which makes the texture incomplete
@@ -120,12 +266,14 @@ pub struct Options {
     /// mipmaps are unaffected.
     pub fix_texture_min_filter: bool,
     pub zero_stack_after_guest_to_host_call: Option<u32>,
+    pub corruption: CorruptionOptions,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Options {
             fullscreen: false,
+            trainer_disabled: true,
             device_family: None,
             auto_device_family: false,
             host_screen_size: None,
@@ -146,19 +294,45 @@ impl Default for Options {
             gles1_implementation: None,
             gles2_compat: false,
             direct_memory_access: true,
+            affinity: None,
             gdb_listen_addrs: None,
             preferred_languages: None,
             headless: false,
             print_fps: false,
-            fps_limit: Some(60.0), // Original iPhone is 60Hz and uses v-sync,
+            fps_limit: Some(60.0),
             force_composition: false,
+            present_mode: std::env::var("TOUCHHLE_PRESENT_MODE")
+                .ok()
+                .and_then(|value| PresentMode::from_short_name(value.trim()).ok())
+                .unwrap_or(PresentMode::Auto),
+            present_finish: std::env::var_os("TOUCHHLE_PRESENT_FINISH")
+                .map(|value| value != "0")
+                .unwrap_or(false),
+            gl_driver: std::env::var("TOUCHHLE_GL_DRIVER")
+                .ok()
+                .and_then(|value| GlDriverPreference::from_short_name(value.trim()).ok())
+                .unwrap_or(GlDriverPreference::Auto),
+            vsync: std::env::var("TOUCHHLE_VSYNC")
+                .ok()
+                .and_then(|value| VsyncMode::from_short_name(value.trim()).ok())
+                .unwrap_or(VsyncMode::Auto),
+            perf_hints: std::env::var_os("TOUCHHLE_PERF_HINTS")
+                .map(|value| value != "0")
+                .unwrap_or(true),
             prefer_gles2_context: false,
+            force_gles1_context: std::env::var("TOUCHHLE_FORCE_GLES1_CONTEXT")
+                .map(|value| {
+                    let value = value.trim();
+                    value != "0" && !value.is_empty()
+                })
+                .unwrap_or(false),
             network_access: false,
             popup_errors: true,
             dumping_options: Default::default(),
             dumping_file: crate::paths::user_data_base_path().join("DUMP.txt"),
             ignore_gl_errors: false,
             trace_gl_errors: false,
+            verbose_gles: false,
             // On Android the host GLES driver is essentially always
             // ARM Mali / Qualcomm Adreno / something equally strict,
             // and apps shipped for iOS overwhelmingly upload PVRTC and
@@ -179,6 +353,7 @@ impl Default for Options {
             // pixel output for the common case.
             fix_texture_min_filter: cfg!(target_os = "android"),
             zero_stack_after_guest_to_host_call: None,
+            corruption: CorruptionOptions::default(),
         }
     }
 }
@@ -346,6 +521,8 @@ impl Options {
             );
         } else if arg == "--gles2-compat" {
             self.gles2_compat = true;
+        } else if let Some(value) = arg.strip_prefix("--affinity=") {
+            self.affinity = Some(value.to_string());
         } else if arg == "--disable-direct-memory-access" {
             self.direct_memory_access = false;
         } else if let Some(address) = arg.strip_prefix("--gdb=") {
@@ -375,8 +552,38 @@ impl Options {
             }
         } else if arg == "--force-composition" {
             self.force_composition = true;
+        } else if let Some(value) = arg.strip_prefix("--present-mode=") {
+            self.present_mode = PresentMode::from_short_name(value).map_err(|_| {
+                "Invalid value for --present-mode= (expected auto, direct or readback)"
+                    .to_string()
+            })?;
+        } else if arg == "--present-finish" {
+            self.present_finish = true;
+        } else if arg == "--no-present-finish" {
+            self.present_finish = false;
+        } else if let Some(value) = arg.strip_prefix("--gl-driver=") {
+            self.gl_driver = GlDriverPreference::from_short_name(value).map_err(|_| {
+                "Invalid value for --gl-driver= (expected auto, angle or native)".to_string()
+            })?;
+        } else if let Some(value) = arg.strip_prefix("--vsync=") {
+            self.vsync = VsyncMode::from_short_name(value).map_err(|_| {
+                "Invalid value for --vsync= (expected auto, on or off)".to_string()
+            })?;
+        } else if arg == "--vsync" {
+            self.vsync = VsyncMode::On;
+        } else if arg == "--no-vsync" {
+            self.vsync = VsyncMode::Off;
+        } else if arg == "--perf-hints" {
+            self.perf_hints = true;
+        } else if arg == "--no-perf-hints" {
+            self.perf_hints = false;
         } else if arg == "--prefer-gles2-context" {
             self.prefer_gles2_context = true;
+        } else if arg == "--force-gles1-context" {
+            self.force_gles1_context = true;
+            // GLES-native backend selection and EAGL both read this env var
+            // (the GLES backend layer has no `Options` access).
+            std::env::set_var("TOUCHHLE_FORCE_GLES1_CONTEXT", "1");
         } else if arg == "--allow-network-access" {
             self.network_access = true;
         } else if arg == "--no-error-popup" {
@@ -389,17 +596,59 @@ impl Options {
             self.ignore_gl_errors = true;
         } else if arg == "--trace-gl-errors" {
             self.trace_gl_errors = true;
+        } else if arg == "--verbose-gles" {
+            self.verbose_gles = true;
         } else if arg == "--fix-texture-min-filter" {
             self.fix_texture_min_filter = true;
+            // GLES1Native reads this as its source of truth (it has no
+            // `Options` access from inside the GL call path).
+            std::env::set_var("TOUCHHLE_FIX_TEXTURE_MIN_FILTER", "1");
         } else if arg == "--no-fix-texture-min-filter" {
             // Off-switch for the Android default. Useful when an iOS
             // title actually relies on mipmap minification and the
             // forced `GL_LINEAR` would visibly degrade quality.
             self.fix_texture_min_filter = false;
+            std::env::set_var("TOUCHHLE_FIX_TEXTURE_MIN_FILTER", "0");
         } else if let Some(value) = arg.strip_prefix("--zero-stack-after-guest-to-host-call=") {
             self.zero_stack_after_guest_to_host_call = Some(value.parse().map_err(|_| {
                 "Invalid value for --zero-stack-after-guest-to-host-call=".to_string()
             })?);
+        } else if arg == "--corrupt-game" {
+            self.corruption.enabled = true;
+        } else if arg == "--no-corrupt-game" {
+            self.corruption.enabled = false;
+        } else if arg == "--no-trainer" {
+            self.trainer_disabled = true;
+        } else if arg == "--trainer" {
+            self.trainer_disabled = false;
+        } else if let Some(value) = arg.strip_prefix("--corrupt-interval=") {
+            let frames: u32 = value
+                .parse()
+                .ok()
+                .filter(|&v| v > 0)
+                .ok_or_else(|| "Invalid value for --corrupt-interval= (must be > 0)".to_string())?;
+            self.corruption.enabled = true;
+            self.corruption.interval_frames = frames;
+        } else if let Some(value) = arg.strip_prefix("--corrupt-intensity=") {
+            let bytes: u32 = value
+                .parse()
+                .ok()
+                .filter(|&v| v > 0)
+                .ok_or_else(|| "Invalid value for --corrupt-intensity= (must be > 0)".to_string())?;
+            self.corruption.enabled = true;
+            self.corruption.bytes_per_burst = bytes;
+        } else if let Some(value) = arg.strip_prefix("--corrupt-seed=") {
+            let seed: u64 = value
+                .parse()
+                .map_err(|_| "Invalid value for --corrupt-seed=".to_string())?;
+            self.corruption.enabled = true;
+            self.corruption.seed = seed;
+        } else if let Some(value) = arg.strip_prefix("--corrupt-max-offset=") {
+            let off: u32 = value
+                .parse()
+                .map_err(|_| "Invalid value for --corrupt-max-offset=".to_string())?;
+            self.corruption.enabled = true;
+            self.corruption.max_offset = Some(off);
         } else {
             return Ok(false);
         };

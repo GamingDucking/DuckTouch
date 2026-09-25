@@ -705,6 +705,15 @@ pub const CLASSES: ClassExports = objc_classes! {
     // directly instead of adding the view to the presenter's view.
     () = msg![env; window addSubview:modal_view];
     () = msg![env; modal_vc viewDidAppear:animated];
+
+    // The modal hierarchy is now fully attached to a window. Any UIWebView
+    // load deferred because the view had no on-screen extent yet (e.g.
+    // Chrome's ToS screen, whose webview never receives -setFrame: again)
+    // gets another chance right now, synchronously — the NSTimer-based
+    // poll has never been observed to fire on Android.
+    crate::frameworks::uikit::ui_view::ui_web_view::retry_pending_loads_in_subtree(
+        env, modal_view,
+    );
 }
 
 - (id)modalViewController {

@@ -26,7 +26,7 @@ const kCGPathElementAddCurveToPoint: CGPathElementType = 3;
 const kCGPathElementCloseSubpath: CGPathElementType = 4;
 
 #[derive(Clone, Debug)]
-enum PathElement {
+pub(crate) enum PathElement {
     MoveTo(CGPoint),
     LineTo(CGPoint),
     QuadCurveTo {
@@ -42,9 +42,9 @@ enum PathElement {
 }
 
 #[derive(Default)]
-struct CGPathHostObject {
-    elements: Vec<PathElement>,
-    mutable: bool,
+pub(crate) struct CGPathHostObject {
+    pub(crate) elements: Vec<PathElement>,
+    pub(crate) mutable: bool,
 }
 impl HostObject for CGPathHostObject {}
 
@@ -71,6 +71,21 @@ fn alloc_path(env: &mut Environment, mutable: bool) -> CGPathRef {
         Box::new(CGPathHostObject {
             elements: Vec::new(),
             mutable,
+        }),
+        &mut env.mem,
+    )
+}
+
+
+/// Builds a fresh (immutable) CGPath from UI-side path commands. Used by
+/// `UIBezierPath` to hand out a `CGPath` for its element list.
+pub(crate) fn path_from_elements(env: &mut Environment, elements: Vec<PathElement>) -> CGPathRef {
+    let class = env.objc.get_known_class("_touchHLE_CGPath", &mut env.mem);
+    env.objc.alloc_object(
+        class,
+        Box::new(CGPathHostObject {
+            elements,
+            mutable: false,
         }),
         &mut env.mem,
     )

@@ -6,10 +6,12 @@
 //! `AVAudioSession`.
 
 use crate::dyld::{ConstantExports, HostConstant};
+use crate::Environment;
 use crate::frameworks::foundation::{ns_string, NSInteger, NSUInteger};
 use crate::mem::MutPtr;
 use crate::objc::{
-    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
+    autorelease, id, msg, msg_class, nil, objc_classes, objc_retainBlock, release, retain,
+    ClassExports, HostObject,
 };
 
 // MARK: - Category constants
@@ -32,6 +34,16 @@ pub const AVAudioSessionModeMeasurement: &str = "AVAudioSessionModeMeasurement";
 pub const AVAudioSessionModeMoviePlayback: &str = "AVAudioSessionModeMoviePlayback";
 pub const AVAudioSessionModeVideoChat: &str = "AVAudioSessionModeVideoChat";
 pub const AVAudioSessionModeSpokenAudio: &str = "AVAudioSessionModeSpokenAudio";
+// MARK: - Record permission constants (AVAudioSessionRecordPermission, iOS 8+)
+// FourCC values straight from the Apple SDK header:
+//   AVAudioSessionRecordPermissionUndetermined = 'undt'
+//   AVAudioSessionRecordPermissionDenied       = 'deny'
+//   AVAudioSessionRecordPermissionGranted      = 'grnt'
+
+pub const AVAudioSessionRecordPermissionUndetermined: u32 = u32::from_be_bytes(*b"undt");
+pub const AVAudioSessionRecordPermissionDenied: u32 = u32::from_be_bytes(*b"deny");
+pub const AVAudioSessionRecordPermissionGranted: u32 = u32::from_be_bytes(*b"grnt");
+
 
 // MARK: - Notification constants
 
@@ -326,6 +338,15 @@ pub(super) struct AVAudioSessionHostObject {
 }
 impl HostObject for AVAudioSessionHostObject {}
 
+/// Host object backing `AVAudioSessionPortDescription` instances we create
+/// ourselves (built-in mic for `availableInputs`, speaker for `currentRoute`).
+pub(super) struct AVAudioSessionPortDescriptionHostObject {
+    port_type: &'static str,
+    name: &'static str,
+    uid: &'static str,
+}
+impl HostObject for AVAudioSessionPortDescriptionHostObject {}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -489,6 +510,20 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; this maximumOutputNumberOfChannels]
 }
 
+- (NSInteger)outputNumberOfChannels {
+    // Current channel count on the active output route (stereo for the
+    // built-in route). Geometry Dash queries this selector; without a host
+    // implementation it fell through to the missing-selector soft-fail
+    // (logged a warning and returned 0).
+    msg![env; this currentHardwareOutputNumberOfChannels]
+}
+
+- (NSInteger)inputNumberOfChannels {
+    // Mirror of outputNumberOfChannels for the input side: one built-in mic
+    // channel when the host hardware has one.
+    msg![env; this currentHardwareInputNumberOfChannels]
+}
+
 - (f64)outputLatency {
     0.005 // 5ms — typical for built-in speaker
 }
@@ -511,7 +546,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (NSInteger)maximumInputNumberOfChannels {
-    0
+    // One built-in mic channel when the host hardware has one.
+    if crate::android_media::has_microphone() {
+        1
+    } else {
+        0
+    }
 }
 
 - (NSInteger)maximumOutputNumberOfChannels {
@@ -537,16 +577,47 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: - Input / output availability
 
 - (bool)isInputAvailable {
-    false
+    // Real answer from the host microphone (Android: AudioManager /
+    // AudioRecord probe; desktop: no mic bridge, so false).
+    crate::android_media::has_microphone()
+}
+
+// MARK: - Record permission (iOS 8+)
+
+- (NSUInteger)recordPermission {
+    if !crate::android_media::has_microphone() {
+        // No host microphone exists: report permanently denied so games
+        // don't loop waiting for a grant that can never happen.
+        AVAudioSessionRecordPermissionDenied
+    } else {
+        // The host mic exists; on Android the RECORD_AUDIO prompt is shown
+        // when capture actually starts (HostMedia.startMic), so the
+        // guest-visible permission is already granted.
+        AVAudioSessionRecordPermissionGranted
+    }
+}
+
+- (bool)requestRecordPermission:(id)response { // void (^)(BOOL granted)
+    let granted = crate::android_media::has_microphone();
+    if response != nil {
+        let response = objc_retainBlock(env, response);
+        let invoke_ptr: u32 = env.mem.read(response.cast::<u32>() + 3u32);
+        if invoke_ptr != 0 {
+            use crate::abi::CallFromHost;
+            let invoke = crate::abi::GuestFunction::from_addr_with_thumb_bit(invoke_ptr);
+            let block_arg: crate::mem::ConstVoidPtr =
+                crate::mem::Ptr::from_bits(response.to_bits()).cast_const();
+            let _: () = invoke.call_from_host(env, (block_arg, granted));
+        }
+        release(env, response);
+    }
+    true
 }
 
 - (bool)isOtherAudioPlaying {
     false
 }
 
-- (bool)secondaryAudioShouldBeSilencedHint {
-    false
-}
 
 // MARK: - Route
 
@@ -557,7 +628,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)availableInputs { // NSArray<AVAudioSessionPortDescription*>*
-    msg_class![env; NSArray new]
+    if !crate::android_media::has_microphone() {
+        return msg_class![env; NSArray new];
+    }
+    let port = built_in_mic_port(env);
+    let arr: id = msg_class![env; NSArray arrayWithObject:port];
+    release(env, port);
+    arr
 }
 
 - (bool)setPreferredInput:(id)_input error:(MutPtr<id>)_error {
@@ -596,7 +673,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 @implementation AVAudioSessionRouteDescription: NSObject
 
 - (id)inputs {
-    msg_class![env; NSArray new]
+    // Report built-in microphone as the sole input so games that check
+    // `currentRoute.inputs` see that a mic exists.
+    let port = built_in_mic_port(env);
+    let arr: id = msg_class![env; NSArray arrayWithObject:port];
+    release(env, port);
+    arr
 }
 
 - (id)outputs {
@@ -609,20 +691,40 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 @end
 
-// MARK: - AVAudioSessionPortDescription stub
-
+// MARK: - AVAudioSessionPortDescription
 @implementation AVAudioSessionPortDescription: NSObject
 
 - (id)portType {
-    ns_string::get_static_str(env, AVAudioSessionPortBuiltInSpeaker)
+    let default_type = AVAudioSessionPortBuiltInSpeaker;
+    let port_type = env
+        .objc
+        .get_host_object(this)
+        .and_then(|h| h.as_any().downcast_ref::<AVAudioSessionPortDescriptionHostObject>())
+        .map(|h| h.port_type)
+        .unwrap_or(default_type);
+    ns_string::get_static_str(env, port_type)
 }
 
 - (id)portName {
-    ns_string::get_static_str(env, "Speaker")
+    let default_name = "Speaker";
+    let name = env
+        .objc
+        .get_host_object(this)
+        .and_then(|h| h.as_any().downcast_ref::<AVAudioSessionPortDescriptionHostObject>())
+        .map(|h| h.name)
+        .unwrap_or(default_name);
+    ns_string::get_static_str(env, name)
 }
 
 - (id)UID {
-    ns_string::get_static_str(env, "Built-In Speaker")
+    let default_uid = "Built-In Speaker";
+    let uid = env
+        .objc
+        .get_host_object(this)
+        .and_then(|h| h.as_any().downcast_ref::<AVAudioSessionPortDescriptionHostObject>())
+        .map(|h| h.uid)
+        .unwrap_or(default_uid);
+    ns_string::get_static_str(env, uid)
 }
 
 - (id)channels { // NSArray<AVAudioSessionChannelDescription*>*
@@ -648,3 +750,16 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 };
+
+// Create a port description for the host's built-in microphone (used by
+// `-[AVAudioSession availableInputs]`).
+fn built_in_mic_port(env: &mut Environment) -> id {
+    let class = env.objc.get_known_class("AVAudioSessionPortDescription", &mut env.mem);
+    let host_object = Box::new(AVAudioSessionPortDescriptionHostObject {
+        port_type: AVAudioSessionPortBuiltInMic,
+        name: "iPhone Microphone",
+        uid: "Built-In Microphone",
+    });
+    let port = env.objc.alloc_object(class, host_object, &mut env.mem);
+    autorelease(env, port)
+}

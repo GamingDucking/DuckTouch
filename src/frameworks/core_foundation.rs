@@ -24,7 +24,9 @@ pub mod cf_data;
 pub mod cf_dictionary;
 pub mod cf_error;
 pub mod cf_host;
+pub mod cf_net_service;
 pub mod cf_locale;
+pub mod cf_notification_center;
 pub mod cf_number;
 pub mod cf_preferences;
 pub mod cf_run_loop;
@@ -45,6 +47,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         cf_run_loop_timer::CLASSES, // Special internal classes.
         cf_run_loop::CLASSES,
         cf_host::CLASSES,
+        cf_net_service::CLASSES,
         cf_stream::CLASSES,
         cf_uuid::CLASSES,
     ],
@@ -73,7 +76,9 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         cf_socket::FUNCTIONS,
         cf_data::FUNCTIONS,
         cf_host::FUNCTIONS,
+        cf_net_service::FUNCTIONS,
         cf_locale::FUNCTIONS,
+        cf_notification_center::FUNCTIONS,
         cf_number::FUNCTIONS,
         cf_preferences::FUNCTIONS,
         cf_run_loop::FUNCTIONS,

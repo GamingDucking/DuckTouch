@@ -35,8 +35,30 @@ do
     fi
 done
 
-for path in artifacts/macos/touchHLE.dmg artifacts/android/touchHLE.apk; do
-    if [ ! -e "$path" ]; then
+macos_dmg=""
+for candidate in \
+    artifacts/macos/HyperHLE.dmg \
+    artifacts/macos/touchHLE.dmg
+do
+    if [ -e "$candidate" ]; then
+        macos_dmg="$candidate"
+        break
+    fi
+done
+
+android_apk=""
+for candidate in \
+    artifacts/android/HyperHLE-Fork.apk \
+    artifacts/android/touchHLE.apk
+do
+    if [ -e "$candidate" ]; then
+        android_apk="$candidate"
+        break
+    fi
+done
+
+for path in "$macos_dmg" "$android_apk"; do
+    if [ -z "$path" ] || [ ! -e "$path" ]; then
         echo "Missing build artifact (all platform builds must succeed): $path" >&2
         exit 1
     fi
@@ -104,9 +126,9 @@ cd "$ROOT/dev-scripts"
 
 prefix="HyperHLE"
 
-./prepare-release.sh --create-zip-macos "$ROOT/artifacts/macos/touchHLE.dmg" \
+./prepare-release.sh --create-zip-macos "$ROOT/$macos_dmg" \
     -o "$ROOT/release/${prefix}_macOS_x86_64.zip"
-./prepare-release.sh --create-zip-android "$ROOT/artifacts/android/touchHLE.apk" \
+./prepare-release.sh --create-zip-android "$ROOT/$android_apk" \
     -o "$ROOT/release/${prefix}_Android_AArch64.zip"
 ./prepare-release.sh --create-zip-windows \
     "$ROOT/$windows_exe" \

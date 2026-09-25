@@ -522,6 +522,23 @@ impl PipeBuffer {
             write_handles: 1,
         }
     }
+
+    /// Есть ли непрочитанные байты (для poll(2): POLLIN на читающем конце).
+    pub(crate) fn poll_has_data(&self) -> bool {
+        !self.bytes.is_empty()
+    }
+
+    /// Открыт ли хоть один читающий конец (для poll(2): POLLOUT/POLLERR
+    /// на пишущем конце).
+    pub(crate) fn poll_has_readers(&self) -> bool {
+        self.read_handles > 0
+    }
+
+    /// Открыт ли хоть один пишущий конец (для poll(2): POLLHUP на читающем
+    /// конце — writer закрыт, данные кончились).
+    pub(crate) fn poll_has_writers(&self) -> bool {
+        self.write_handles > 0
+    }
 }
 
 #[derive(Debug)]
@@ -1095,24 +1112,14 @@ impl Fs {
 
     /// Attempts to change the working directory.
     pub fn change_working_directory(&mut self, new_path: &GuestPath) -> Result<&GuestPath, ()> {
-        let resolved = resolve_path(new_path, Some(&self.working_directory));
-        if !matches!(
-            self.lookup_node_inner(&resolved),
-            Some(FsNode::Directory { .. })
-        ) {
+        // The app volume is case-insensitive.  Resolve to the VFS spelling
+        // before saving the new CWD so later relative opens use the same path
+        // as stat/access and Foundation file-existence probes.
+        let resolved = self.resolve_case_insensitive_path(new_path).ok_or(())?;
+        if !self.is_dir(&resolved) {
             return Err(());
         }
-        let new_path = if resolved.is_empty() {
-            String::from("/")
-        } else {
-            let mut new_path = String::with_capacity(resolved.iter().map(|c| c.len() + 1).sum());
-            for component in resolved {
-                new_path.push('/');
-                new_path.push_str(component);
-            }
-            new_path
-        };
-        self.working_directory = GuestPathBuf::from(new_path);
+        self.working_directory = resolved;
         Ok(&self.working_directory)
     }
 
@@ -1164,6 +1171,38 @@ impl Fs {
     /// Like [Path::exists] but for the guest filesystem.
     pub fn exists(&self, path: &GuestPath) -> bool {
         self.lookup_node(path).is_some()
+    }
+
+    /// Resolve an existing guest path using the case-insensitive semantics of
+    /// the iPhone OS application volume.
+    ///
+    /// App bundles are normally deployed on case-insensitive HFS/APFS volumes,
+    /// whereas the virtual filesystem uses `HashMap` keys and would otherwise
+    /// make every caller reproduce a directory scan.  The returned path is
+    /// absolute, normalized, and uses the spelling stored in the VFS.  `None`
+    /// means that no matching entry exists; this method never manufactures a
+    /// path for a file that is not mounted.
+    pub fn resolve_case_insensitive_path(&self, path: &GuestPath) -> Option<GuestPathBuf> {
+        let components = resolve_path(path, Some(&self.working_directory));
+        let mut resolved_path = String::from("/");
+
+        for component in components {
+            let component_lower = component.to_lowercase();
+            // `enumerate` borrows the VFS, so copy the matching spelling before
+            // extending `resolved_path` for the next component.
+            let matching_component = {
+                let mut entries = self.enumerate(GuestPath::new(&resolved_path)).ok()?;
+                entries
+                    .find(|entry| entry.to_lowercase() == component_lower)
+                    .map(str::to_owned)?
+            };
+            if resolved_path != "/" {
+                resolved_path.push('/');
+            }
+            resolved_path.push_str(&matching_component);
+        }
+
+        Some(GuestPathBuf::from(resolved_path))
     }
 
     /// Returns access information about the file/directory at the path
@@ -1352,9 +1391,15 @@ impl Fs {
     /// Like [File::open] but for the guest filesystem.
     #[allow(dead_code)]
     pub fn open<P: AsRef<GuestPath>>(&self, path: P) -> Result<GuestFile, ()> {
-        // it would be nice to delegate to self.open_with_options, but
-        // currently it wants a mutable reference to self
-        let node = self.lookup_node(path.as_ref()).ok_or(())?;
+        // Read-only opens follow the same case-insensitive lookup semantics as
+        // the iPhone OS app volume.  Keep open_with_options separate because a
+        // missing O_CREAT target must retain the caller's requested spelling.
+        let resolved_path = self
+            .resolve_case_insensitive_path(path.as_ref())
+            .ok_or(())?;
+        // It would be nice to delegate to self.open_with_options, but it
+        // currently wants a mutable reference to self.
+        let node = self.lookup_node(&resolved_path).ok_or(())?;
         match node {
             FsNode::File { location, .. } => match location {
                 FileLocation::Path(host_path) => {
@@ -1892,5 +1937,67 @@ impl Fs {
             },
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn case_test_fs() -> Fs {
+        let bundle = FsNode::dir().with_child(
+            "Data",
+            FsNode::dir().with_child(
+                "data.unity3d",
+                FsNode::resource_file("test-data.unity3d".to_string()),
+            ),
+        );
+        Fs {
+            root: FsNode::dir().with_child(
+                "Var",
+                FsNode::dir().with_child(
+                    "Mobile",
+                    FsNode::dir().with_child(
+                        "Applications",
+                        FsNode::dir().with_child(
+                            "UUID",
+                            FsNode::dir().with_child("Granny.app", bundle),
+                        ),
+                    ),
+                ),
+            ),
+            working_directory: GuestPathBuf::from(
+                "/Var/Mobile/Applications/UUID/Granny.app".to_string(),
+            ),
+            home_directory: GuestPathBuf::from("/Var/Mobile/Applications/UUID".to_string()),
+            cow_dir: None,
+        }
+    }
+
+    #[test]
+    fn resolves_case_insensitively_and_normalizes_relative_paths() {
+        let fs = case_test_fs();
+        let absolute: String = fs
+            .resolve_case_insensitive_path(GuestPath::new(
+                "/var/mobile/applications/uuid/granny.app/DATA/DATA.UNITY3D",
+            ))
+            .unwrap()
+            .into();
+        assert_eq!(
+            absolute,
+            "/Var/Mobile/Applications/UUID/Granny.app/Data/data.unity3d"
+        );
+
+        let relative: String = fs
+            .resolve_case_insensitive_path(GuestPath::new("./data/../DATA/data.UNITY3D"))
+            .unwrap()
+            .into();
+        assert_eq!(
+            relative,
+            "/Var/Mobile/Applications/UUID/Granny.app/Data/data.unity3d"
+        );
+        assert!(fs
+            .resolve_case_insensitive_path(GuestPath::new("Data/not-present"))
+            .is_none());
     }
 }

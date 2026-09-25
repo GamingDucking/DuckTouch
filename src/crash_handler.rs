@@ -169,6 +169,11 @@ mod imp {
         unsafe { libc::close(fd) };
         let text = String::from_utf8_lossy(&buf[..off]).into_owned();
         let mut out = String::from("relevant /proc/self/maps entries:\n");
+        // Track the lowest mapping of libtouchHLE.so together with its file
+        // offset, so native backtrace frames can be converted to ELF file
+        // addresses for offline symbolization:
+        //   file_vaddr = frame_addr - load_base, load_base = map_start - map_offset
+        let mut touchhle_load_base: Option<(usize, usize)> = None;
         for line in text.lines() {
             // "start-end perms offset dev inode path"
             let mut it = line.splitn(2, ' ');
@@ -183,6 +188,15 @@ mod imp {
                 ) else {
                     continue;
                 };
+                if line.contains("libtouchHLE.so") && touchhle_load_base.is_none() {
+                    // Offset is the third field.
+                    let offset = line
+                        .split_whitespace()
+                        .nth(2)
+                        .and_then(|o| usize::from_str_radix(o, 16).ok())
+                        .unwrap_or(0);
+                    touchhle_load_base = Some((start.saturating_sub(offset), offset));
+                }
                 if addrs.iter().any(|a| {
                     let a = *a as usize;
                     a >= start && a < end
@@ -191,6 +205,12 @@ mod imp {
                     out.push('\n');
                 }
             }
+        }
+        if let Some((base, _)) = touchhle_load_base {
+            out.push_str(&format!(
+                "libtouchHLE.so load base: {:#x} (symbolize native frames with: llvm-symbolizer --obj=libtouchHLE.so <frame - base>)\n",
+                base
+            ));
         }
         out
     }
@@ -225,10 +245,15 @@ mod imp {
                 _ => (*(info as *const libc::siginfo_t)).si_addr() as usize,
             }
         };
+        let location = if sig == libc::SIGABRT {
+            " (abort; no fault address)".to_string()
+        } else {
+            format!(" at address {:#x}", addr)
+        };
         let msg = format!(
-            "touchHLE: FATAL: native host crash: {} at address {:#x} — NOT a guest/app error; this is a touchHLE or driver/JIT bug. The process will now terminate.\n",
+            "touchHLE: FATAL: native host crash: {}{} — the signal alone does not identify the root cause. Check preceding panic, loader and guest-fault messages. The process will now terminate.\n",
             std::str::from_utf8(&name[..name.len() - 1]).unwrap_or("SIGNAL"),
-            addr
+            location
         );
         let msg = format!(
             "{}last guest PC: {:#x}, LR: {:#x}\n",
@@ -253,10 +278,10 @@ mod imp {
             msg,
             (0..32)
                 .map(|i| {
-                    let idx = (crate::environment::GUEST_PC_RING_IDX
+                    let oldest_idx = crate::environment::GUEST_PC_RING_IDX
                         .load(Ordering::Relaxed)
-                        .wrapping_sub(1 - i as usize))
                         % 32;
+                    let idx = oldest_idx.wrapping_add(i) % 32;
                     format!(
                         " {:#x}",
                         crate::environment::GUEST_PC_RING[idx].load(Ordering::Relaxed)

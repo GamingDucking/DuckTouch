@@ -100,7 +100,17 @@ pub unsafe fn present_frame(
         viewport.3 as _,
     );
     gles.ClearColor(0.0, 0.0, 0.0, 1.0);
-    gles.Clear(gles11::COLOR_BUFFER_BIT | gles11::DEPTH_BUFFER_BIT | gles11::STENCIL_BUFFER_BIT);
+    // PERF: only the color buffer needs clearing here. The present quad runs
+    // with depth/stencil testing disabled (the caller disables caps before
+    // drawing), so clearing DEPTH|STENCIL is a wasted full-viewport pass —
+    // noticeable at scale-hack 4x on software rasterizers.
+    gles.Clear(gles11::COLOR_BUFFER_BIT);
+    // Keep the window's alpha channel at the 1.0 the clear just wrote. The
+    // frame texture's alpha is meaningless for an opaque CAEAGLLayer, but a
+    // window surface with an alpha channel may be blended by the OS
+    // compositor (Android's SurfaceFlinger), which would show through
+    // wherever the app left alpha < 1.
+    gles.ColorMask(gles11::TRUE, gles11::TRUE, gles11::TRUE, gles11::FALSE);
     gles.BindBuffer(gles11::ARRAY_BUFFER, 0);
     // Stretch the full rendered frame to fill the active host viewport.
     //
@@ -108,7 +118,8 @@ pub unsafe fn present_frame(
     // sampled from normal 0..1 texture coordinates and mapped to a full-screen
     // quad. This is the correct "fill the current window" behavior for
     // PotatoGold-style landscape tests.
-    if std::env::var_os("TOUCHHLE_PRESENT_STRETCH_TO_VIEWPORT").is_some() {
+    // PERF: cached read-once flag; present_frame runs every frame.
+    if crate::env_flag_cached!("TOUCHHLE_PRESENT_STRETCH_TO_VIEWPORT") {
         log_once!(
             "TOUCHHLE_PRESENT_STRETCH_TO_VIEWPORT=1: stretching full rendered frame to the active viewport [this log will only be shown once]"
         );
@@ -177,7 +188,8 @@ pub unsafe fn present_frame(
     // On-screen FPS overlay (simple bitmap font). Enabled by env var
     // TOUCHHLE_ONSCREEN_FPS=1 or by the runtime flag set via
     // crate::gles::present::set_onscreen_fps_enabled(true).
-    let onscreen_env = std::env::var_os("TOUCHHLE_ONSCREEN_FPS").is_some();
+    // PERF: cached read-once flag; present_frame runs every frame.
+    let onscreen_env = crate::env_flag_cached!("TOUCHHLE_ONSCREEN_FPS");
     let onscreen_runtime = ONSCREEN_FPS_ENABLED
         .get()
         .map(|b| b.load(Ordering::SeqCst))
@@ -191,6 +203,12 @@ pub unsafe fn present_frame(
             }
         }
     }
+
+    // Cheat Engine-style trainer overlay (floating button + panel). Drawn
+    // last so it sits on top of everything, including the FPS overlay.
+    crate::trainer_ui::draw(gles, viewport);
+
+    gles.ColorMask(gles11::TRUE, gles11::TRUE, gles11::TRUE, gles11::TRUE);
 }
 
 // --- Tiny bitmap font & overlay drawing implementation ---

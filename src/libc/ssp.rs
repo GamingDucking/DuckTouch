@@ -8,19 +8,15 @@
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
 use crate::environment::Environment;
 
-// Если защита стека поймает переполнение (буфер оверфлоу), игра вызовет эту
-// функцию.
-// На реальном iOS этот вызов аборт-ит гостевой процесс, а не хост. Чтобы не
-// ронять весь эмулятор из-за бага в одной игре, логируем громко и
-// возвращаемся: пусть гость продолжит работу до следующей фатальной ошибки
-// (которая, если что, тоже будет защищена аналогичной обработкой).
-pub fn __stack_chk_fail(_env: &mut Environment) {
+// Stack-protector failure is `noreturn` in the guest ABI. Returning from this
+// host stub normally would execute unreachable guest code, so use the same
+// validated recovery / controlled-session-end path as abort and assertions.
+pub fn __stack_chk_fail(env: &mut Environment) {
     log!(
         "*** __stack_chk_fail: stack smashing detected in guest! The guest's stack canary was \
-         corrupted. This usually means the app has a real buffer overflow bug. On real iOS this \
-         would abort the process; the emulator will keep running but the app may behave \
-         unpredictably from this point on."
+         corrupted. Attempting validated recovery without terminating the emulator process."
     );
+    crate::libc::stdlib::recover_or_end_guest_termination(env, "__stack_chk_fail()");
 }
 
 pub const FUNCTIONS: FunctionExports = &[

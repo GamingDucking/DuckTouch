@@ -613,6 +613,37 @@ pub const CLASSES: ClassExports = objc_classes! {
     if msg![env; this pointInside:point withEvent:event] { this } else { nil }
 }
 
+// Chrome for iOS extends UIButton with a category offering extra accessors.
+// These are benign no-ops / sensible defaults for an emulator.
+
+- (id)displayedText {
+    msg![env; this currentTitle]
+}
+
+- (id)text {
+    msg![env; this currentTitle]
+}
+
+- (())hidePlaceholderImage {
+    // Nothing to hide.
+}
+
+- (bool)isPreEditing {
+    false
+}
+
+- (bool)animatingEVCert {
+    false
+}
+
+- (id)rightView {
+    nil
+}
+
+- (id)leftView {
+    nil
+}
+
 @end
 
 // MARK: - UIRoundedRectButton

@@ -53,6 +53,7 @@ const _SC_2_SW_DEV: SysConfName = 24;
 const _SC_2_UPE: SysConfName = 25;
 const _SC_STREAM_MAX: SysConfName = 26;
 const _SC_TZNAME_MAX: SysConfName = 27;
+const _SC_GETPW_R_SIZE_MAX: SysConfName = 71;
 const _SC_PAGESIZE: SysConfName = 29;
 const _SC_NPROCESSORS_CONF: SysConfName = 57;
 const _SC_NPROCESSORS_ONLN: SysConfName = 58;
@@ -61,7 +62,7 @@ const _SC_MONOTONIC_CLOCK: SysConfName = 201;
 const _SC_THREAD_SAFE_FUNCTIONS: SysConfName = 202;
 
 fn sleep(env: &mut Environment, seconds: u32) -> u32 {
-    env.sleep(Duration::from_secs(seconds.into()));
+    env.sleep_guest(Duration::from_secs(seconds.into()));
     // sleep() returns the amount of time remaining that should have been slept,
     // but wasn't, if the thread was woken up early by a signal.
     // touchHLE never does that currently, so 0 is always correct here.
@@ -77,7 +78,7 @@ fn usleep(env: &mut Environment, useconds: useconds_t) -> i32 {
         return -1;
     }
 
-    env.sleep(Duration::from_micros(useconds.into()));
+    env.sleep_guest(Duration::from_micros(useconds.into()));
     0 // success
 }
 
@@ -145,19 +146,16 @@ fn access(env: &mut Environment, path: ConstPtr<u8>, mode: i32) -> i32 {
             return -1;
         }
     };
-    let resolved_binding = if !binding.starts_with('/') && !env.fs.exists(GuestPath::new(&binding))
-    {
-        let bundle_root = env.bundle.bundle_path().as_str().trim_end_matches('/');
-        let relative = binding.strip_prefix("Data/").unwrap_or(&binding);
-        let relative = relative.strip_prefix("Data/").unwrap_or(relative);
-        let candidate = format!("{bundle_root}/Data/{relative}");
-        if env.fs.exists(GuestPath::new(&candidate)) {
-            candidate
-        } else {
-            binding.clone()
-        }
-    } else {
-        binding.clone()
+    // Keep `access` in lockstep with stat/open.  Unity uses access() as an
+    // existence probe for Data/data.unity3d on some player versions, so a
+    // case-only or stale-bundle-path mismatch must not make it reject a file
+    // that open() would successfully load.
+    let Some(resolved_binding) =
+        crate::libc::posix_io::resolve_existing_guest_path(env, &binding)
+    else {
+        env.note_missing_unity_player_archive(&binding);
+        set_errno(env, ENOENT);
+        return -1;
     };
     let guest_path = GuestPath::new(&resolved_binding);
     let (exists, read, write, execute) = env.fs.access(guest_path);
@@ -211,7 +209,7 @@ fn fork(env: &mut Environment) -> i32 {
     -1
 }
 
-fn unlink(env: &mut Environment, path: ConstPtr<u8>) -> i32 {
+pub(crate) fn unlink(env: &mut Environment, path: ConstPtr<u8>) -> i32 {
     set_errno(env, 0);
 
     let Ok(path_str) = env.mem.cstr_at_utf8(path) else {
@@ -478,6 +476,7 @@ fn getdtablesize(_env: &mut Environment) -> i32 {
 
 fn sysconf(_env: &mut Environment, name: SysConfName) -> i32 {
     match name {
+        _SC_GETPW_R_SIZE_MAX => 1024,
         _SC_PAGESIZE => PAGE_SIZE.try_into().unwrap(),
         _SC_NPROCESSORS_CONF | _SC_NPROCESSORS_ONLN => 1,
         _SC_PHYS_PAGES => 131072, // ~512 MiB / 4 KiB pages
@@ -552,6 +551,8 @@ fn fchmod(_env: &mut Environment, _fd: i32, _mode: u32) -> i32 {
 // Darwin/XNU `<sys/syscall.h>` selector numbers used by the few syscalls
 // touchHLE knows how to implement directly. The full list is enormous; we
 // only enumerate the ones we resolve here.
+const SYS_FORK: i32 = 2;
+const SYS_STAT: i32 = 188;
 const SYS_THREAD_SELFID: i32 = 372;
 const SYS_GETPID: i32 = 20;
 const SYS_GETPPID: i32 = 39;
@@ -577,9 +578,16 @@ const SYS_GETEGID: i32 = 43;
 /// `syscall(SYS_thread_selfid)` etc, and return `-1` with `errno = ENOSYS`
 /// for every other selector, which is exactly the contract Apple's
 /// kernel uses for selectors the host doesn't implement.
-fn syscall(env: &mut Environment, number: i32, _args: DotDotDot) -> i32 {
+fn syscall(env: &mut Environment, number: i32, args: DotDotDot) -> i32 {
     log_dbg!("syscall({}) called", number);
     match number {
+        SYS_FORK => self::fork(env),
+        SYS_STAT => {
+            let mut args = args.start();
+            let path: ConstPtr<u8> = args.next(env);
+            let buffer: MutPtr<crate::libc::posix_io::stat::stat> = args.next(env);
+            crate::libc::posix_io::stat::stat(env, path, buffer)
+        }
         SYS_GETPID => self::getpid(env),
         SYS_GETPPID => self::getppid(env),
         SYS_GETUID => self::getuid(env) as i32,

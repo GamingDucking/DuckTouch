@@ -82,9 +82,9 @@ pub struct State {
 }
 
 pub(crate) struct UIViewHostObject {
-    layer: id,
-    subviews: Vec<id>,
-    superview: id,
+    pub(crate) layer: id,
+    pub(crate) subviews: Vec<id>,
+    pub(crate) superview: id,
     view_controller: id,
     /// Only used by UIWindow. Strong reference for the iOS 4
     /// rootViewController property.
@@ -191,6 +191,21 @@ fn init_common(env: &mut Environment, this: id) -> id {
     let layer: id = msg![env; layer_class layer];
     () = msg![env; layer setDelegate:this];
     () = msg![env; layer setOpaque:true];
+    // A view's backing layer inherits the view's contentScaleFactor, which
+    // defaults to the main screen's scale (1.0 on non-retina devices, 2.0 on
+    // retina ones). EAGL derives the renderbuffer size from the layer's
+    // bounds * contentsScale, so without this retina-aware apps would
+    // allocate a half-size framebuffer and render zoomed / cropped.
+    let screen_scale: crate::frameworks::core_graphics::CGFloat = {
+        let screen: id = msg_class![env; UIScreen mainScreen];
+        msg![env; screen scale]
+    };
+    env.objc
+        .borrow_mut::<UIViewHostObject>(this)
+        .content_scale_factor = screen_scale;
+    env.objc
+        .borrow_mut::<crate::frameworks::core_animation::ca_layer::CALayerHostObject>(layer)
+        .contents_scale = screen_scale;
     crate::frameworks::core_animation::ca_layer::set_use_implicit_animations(env, layer, false);
 
     // A view's backing layer is not retained by the view.
@@ -233,25 +248,31 @@ fn touchhle_cocos_is_gl_or_game_view_name(class_name: &str) -> bool {
 }
 
 fn touchhle_cocos_landscape_rect(env: &Environment) -> CGRect {
-    let size = std::env::var("TOUCHHLE_COCOS_LANDSCAPE_SIZE")
-        .or_else(|_| std::env::var("TOUCHHLE_UNITY_LANDSCAPE_SIZE"))
-        .or_else(|_| std::env::var("TOUCHHLE_ENGINE_LANDSCAPE_SIZE"))
-        .ok()
-        .and_then(|v| {
-            let mut parts = v.split(|c| c == 'x' || c == 'X' || c == ',');
-            let w = parts.next()?.trim().parse::<f32>().ok()?;
-            let h = parts.next()?.trim().parse::<f32>().ok()?;
-            Some((w, h))
-        })
-        .unwrap_or_else(|| {
-            match env.bundle.bundle_identifier() {
-                // Existing known iPad-ish Cocos clones keep using their old safe size.
-                "com.apprisetec9.minionjump" | "com.risinghighapps.kingdomprincepro" => {
-                    (1024.0, 768.0)
+    // PERF: computed once; both the env lookups and the parse are not free
+    // and this is consulted from layout/hit-test paths.
+    let bundle_id = env.bundle.bundle_identifier();
+    static CACHED: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
+    let size = *CACHED.get_or_init(|| {
+        std::env::var("TOUCHHLE_COCOS_LANDSCAPE_SIZE")
+            .or_else(|_| std::env::var("TOUCHHLE_UNITY_LANDSCAPE_SIZE"))
+            .or_else(|_| std::env::var("TOUCHHLE_ENGINE_LANDSCAPE_SIZE"))
+            .ok()
+            .and_then(|v| {
+                let mut parts = v.split(|c| c == 'x' || c == 'X' || c == ',');
+                let w = parts.next()?.trim().parse::<f32>().ok()?;
+                let h = parts.next()?.trim().parse::<f32>().ok()?;
+                Some((w, h))
+            })
+            .unwrap_or_else(|| {
+                match bundle_id {
+                    // Existing known iPad-ish Cocos clones keep using their old safe size.
+                    "com.apprisetec9.minionjump" | "com.risinghighapps.kingdomprincepro" => {
+                        (1024.0, 768.0)
+                    }
+                    _ => (480.0, 320.0),
                 }
-                _ => (480.0, 320.0),
-            }
-        });
+            })
+    });
     CGRect {
         origin: CGPoint { x: 0.0, y: 0.0 },
         size: CGSize {
@@ -271,11 +292,11 @@ fn touchhle_cocos_should_force_landscape_view(env: &mut Environment, view: id) -
         return false;
     }
 
-    if std::env::var_os("TOUCHHLE_COCOS_FORCE_LANDSCAPE_VIEW").is_some()
-        || std::env::var_os("TOUCHHLE_UNITY_FORCE_LANDSCAPE_VIEW").is_some()
-        || std::env::var_os("TOUCHHLE_ENGINE_FORCE_LANDSCAPE_VIEW").is_some()
+    if crate::env_flag_cached!("TOUCHHLE_COCOS_FORCE_LANDSCAPE_VIEW")
+        || crate::env_flag_cached!("TOUCHHLE_UNITY_FORCE_LANDSCAPE_VIEW")
+        || crate::env_flag_cached!("TOUCHHLE_ENGINE_FORCE_LANDSCAPE_VIEW")
         || env.bundle.bundle_identifier() == "com.disney.SwampyGame"
-        || std::env::var_os("TOUCHHLE_FORCE_LANDSCAPE_VIEW_BOUNDS").is_some()
+        || crate::env_flag_cached!("TOUCHHLE_FORCE_LANDSCAPE_VIEW_BOUNDS")
     {
         return true;
     }
@@ -304,7 +325,7 @@ fn touchhle_cocos_sanitize_rect(rect: CGRect) -> CGRect {
 }
 
 fn touchhle_cocos_should_fuzz_hit_testing(env: &mut Environment, view: id) -> bool {
-    if std::env::var_os("TOUCHHLE_COCOS_STRICT_HITTEST").is_some() {
+    if crate::env_flag_cached!("TOUCHHLE_COCOS_STRICT_HITTEST") {
         return false;
     }
     let class_name = touchhle_cocos_view_class_name(env, view);
@@ -600,19 +621,13 @@ pub const CLASSES: ClassExports = objc_classes! {
         invoke_void_block(env, animations);
     }
 
-    // 2. Fire `completion(BOOL finished)` after `delay + duration`
-    //    seconds via a one-shot NSTimer on the main run loop. We must
-    //    retain the block first because the user-supplied block is
-    //    typically a stack block; on real iOS the runtime promotes it
-    //    to the heap as part of the call. _Block_copy is a no-op for
-    //    global blocks but `objc::retain` does the right thing for
-    //    blocks that have an isa pointing at `_NSConcreteMallocBlock`.
+    // Copy for asynchronous use: guest code may reuse stack storage
+    // once this method returns. A plain ObjC retain cannot promote a block.
     if completion.is_null() {
         return;
     }
     let total_delay = (delay + duration).max(0.0);
-    let completion_id: id = completion.cast();
-    retain(env, completion_id);
+    let completion = crate::libc::blocks::_Block_copy(env, completion.cast_void().cast_const());
 
     // Pack the block pointer into an NSNumber so it survives userInfo.
     let bits = completion.to_bits();
@@ -645,9 +660,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     let block: MutPtr<()> = MutPtr::from_bits(bits);
     if !block.is_null() {
         invoke_bool_block(env, block, true);
-        // Pair the retain we issued in `animateWithDuration:...`.
-        let block_id: id = block.cast();
-        release(env, block_id);
+        // Balance the heap copy held by this timer.
+        crate::libc::blocks::_Block_release(env, block.cast_void().cast_const());
     }
 }
 
@@ -812,7 +826,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         let view_class: Class = msg![env; this class];
         let class_name = env.objc.get_class_name(view_class).to_owned();
 
-        if std::env::var_os("TOUCHHLE_FORCE_LANDSCAPE_VIEW_BOUNDS").is_some()
+        if crate::env_flag_cached!("TOUCHHLE_FORCE_LANDSCAPE_VIEW_BOUNDS")
             && (class_name == "UIWindow" || class_name.contains("EAGLView"))
         {
             let forced_bounds = CGRect {
@@ -1225,9 +1239,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         env.objc.borrow::<UIViewHostObject>(this).gesture_recognizers.clone();
     for r in &old {
         // Clear the recognizer's view back-pointer before releasing.
-        env.objc
-            .borrow_mut::<crate::frameworks::uikit::ui_gesture_recognizer::UIGestureRecognizerHostObject>(*r)
-            .view = nil;
+        super::ui_gesture_recognizer::set_view(env, *r, nil);
     }
     for r in old { release(env, r); }
     let mut new_list: Vec<id> = Vec::new();
@@ -1240,9 +1252,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     env.objc.borrow_mut::<UIViewHostObject>(this).gesture_recognizers = new_list.clone();
     for r in &new_list {
-        env.objc
-            .borrow_mut::<crate::frameworks::uikit::ui_gesture_recognizer::UIGestureRecognizerHostObject>(*r)
-            .view = this;
+        super::ui_gesture_recognizer::set_view(env, *r, this);
     }
 }
 
@@ -1607,7 +1617,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())setBounds:(CGRect)bounds {
     let mut bounds = touchhle_cocos_sanitize_rect(bounds);
 
-    if std::env::var_os("TOUCHHLE_FORCE_LANDSCAPE_VIEW_BOUNDS").is_some() {
+    if crate::env_flag_cached!("TOUCHHLE_FORCE_LANDSCAPE_VIEW_BOUNDS") {
         let view_class: Class = msg![env; this class];
         let class_name = env.objc.get_class_name(view_class).to_owned();
         if class_name == "UIWindow" || class_name.contains("EAGLView") {
@@ -1663,7 +1673,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     let mut frame = touchhle_cocos_sanitize_rect(frame);
 
-    if std::env::var_os("TOUCHHLE_FORCE_LANDSCAPE_VIEW_BOUNDS").is_some() {
+    if crate::env_flag_cached!("TOUCHHLE_FORCE_LANDSCAPE_VIEW_BOUNDS") {
         let view_class: Class = msg![env; this class];
         let class_name = env.objc.get_class_name(view_class).to_owned();
         if class_name == "UIWindow" || class_name.contains("EAGLView") {
@@ -1723,10 +1733,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     if touchhle_cocos_should_fuzz_hit_testing(env, this) {
         let bounds: CGRect = msg![env; this bounds];
-        let inset = std::env::var("TOUCHHLE_COCOS_HITTEST_SLOP")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(12.0);
+        // PERF: parsed once; this runs for every fuzzy hit test.
+        static SLOP: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        let inset = *SLOP.get_or_init(|| {
+            std::env::var("TOUCHHLE_COCOS_HITTEST_SLOP")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(12.0)
+        });
         return point.x >= bounds.origin.x - inset
             && point.y >= bounds.origin.y - inset
             && point.x <= bounds.origin.x + bounds.size.width + inset
@@ -1877,6 +1891,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     let this_layer = env.objc.borrow::<UIViewHostObject>(this).layer;
     let other_layer = env.objc.borrow::<UIViewHostObject>(actual_other).layer;
     msg![env; this_layer convertRect:rect toLayer:other_layer]
+}
+
+- (id)traitCollection {
+    // iOS ≥ 8 asks views for their trait collection. Returning nil is the
+    // documented legacy behaviour for views not in a trait environment and
+    // satisfies engines probing for size classes without crashing.
+    nil
 }
 
 - (CGSize)sizeThatFits:(CGSize)size { size }

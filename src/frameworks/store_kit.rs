@@ -10,6 +10,35 @@ mod sk_product;
 
 use crate::dyld::{ConstantExports, HostConstant};
 
+/// Whether guest in-app purchases are emulated ("Lucky Patcher"-style free
+/// buys). Off by default; `TOUCHHLE_IAP_EMULATION` in the environment forces
+/// it on at startup, and the Cheat Engine overlay's `IAP` button latches it
+/// per session.
+static IAP_EMULATION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `SKPaymentTransactionStatePurchased` — the transaction succeeded.
+pub const SK_PAYMENT_TRANSACTION_STATE_PURCHASED: crate::frameworks::foundation::NSInteger = 1;
+/// `SKPaymentTransactionStateFailed` — the transaction did not go through.
+pub const SK_PAYMENT_TRANSACTION_STATE_FAILED: crate::frameworks::foundation::NSInteger = 2;
+/// `SKPaymentTransactionStateRestored` — a previously purchased product was
+/// restored.
+pub const SK_PAYMENT_TRANSACTION_STATE_RESTORED: crate::frameworks::foundation::NSInteger = 3;
+
+/// Current IAP emulation switch.
+pub fn emulation_enabled() -> bool {
+    IAP_EMULATION.load(std::sync::atomic::Ordering::Relaxed)
+        || crate::env_flag_cached!("TOUCHHLE_IAP_EMULATION")
+}
+
+/// Change the IAP emulation switch (Cheat Engine overlay `IAP` button).
+pub fn set_emulation_enabled(enabled: bool) {
+    IAP_EMULATION.store(enabled, std::sync::atomic::Ordering::Relaxed);
+    log!(
+        "StoreKit IAP emulation {} (in-app purchases auto-succeed while on)",
+        if enabled { "ON" } else { "OFF" }
+    );
+}
+
 /// Constants used by the StoreKit framework.
 ///
 /// These are NSString-typed `extern const` symbols. Apps that link against

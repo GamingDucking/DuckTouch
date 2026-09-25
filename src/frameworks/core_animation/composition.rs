@@ -29,7 +29,11 @@ use std::time::{Duration, Instant};
 
 #[derive(Default)]
 pub(super) struct State {
-    texture_framebuffer: Option<(GLuint, GLuint)>,
+    /// (texture, framebuffer, width, height). Keeping the dimensions here is
+    /// important because Android can recreate/resize the SDL surface while the
+    /// compositor state survives; reusing the old-sized texture otherwise
+    /// makes the compositor sample undefined texels (often a black screen).
+    texture_framebuffer: Option<(GLuint, GLuint, u32, u32)>,
     recomposite_next: Option<Instant>,
     fps_counter: Option<FpsCounter>,
     misc_gl_objects: Option<MiscGlObjects>,
@@ -187,17 +191,75 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     let window = env.window.as_mut().unwrap();
     let mut gles = window.make_internal_gl_ctx_current();
 
+    // The compositor shares the GL context with the guest app, but on real
+    // iOS Core Animation composites on its own render queue: the app's GL
+    // state (buffer bindings in particular) is never disturbed. The guest
+    // relies on that — cocos2d-style engines bind a vertex/index VBO once
+    // during initialisation and then pass pointer *offsets* every frame
+    // without re-binding. Saving and restoring the bindings here keeps that
+    // assumption valid, and keeps the guest-visible GLShadowState mirror
+    // (see eagl::GLShadowState) consistent with the driver: leaving both
+    // bindings at 0 (the old behaviour) made the next gl*Pointer(offset)
+    // call be classified as a client pointer while the app meant it as an
+    // offset into its still-bound VBO — sprite geometry then read garbage
+    // and 2D games rendered only their clear colour.
+    let mut saved_array_buffer: GLint = 0;
+    let mut saved_element_array_buffer: GLint = 0;
+    unsafe {
+        gles.GetIntegerv(gles11::ARRAY_BUFFER_BINDING, &mut saved_array_buffer);
+        // Swallow errors: some strict drivers reject individual binding
+        // queries, and a wrong "0" only degrades to the old behaviour.
+        let _ = gles.GetError();
+        gles.GetIntegerv(
+            gles11::ELEMENT_ARRAY_BUFFER_BINDING,
+            &mut saved_element_array_buffer,
+        );
+        let _ = gles.GetError();
+    }
+
     // Set up GL objects needed for render-to-texture. We could draw directly
     // to the screen instead, but this way we can reuse the code for scaling and
     // rotating the screen and drawing the virtual cursor.
-    let texture = if let Some((texture, framebuffer)) = env
+    let cached_texture_framebuffer = env
         .framework_state
         .core_animation
         .composition
-        .texture_framebuffer
+        .texture_framebuffer;
+    let cached_target_was_resized = cached_texture_framebuffer
+        .map(|(_, _, old_width, old_height)| (old_width, old_height) != (fb_width, fb_height))
+        .unwrap_or(false);
+    let texture = if let Some((texture, framebuffer, old_width, old_height)) =
+        cached_texture_framebuffer
     {
         unsafe {
             gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, framebuffer);
+            if (old_width, old_height) != (fb_width, fb_height) {
+                // Reallocate the compositor target when the Android surface or
+                // scale changes. Sampling an old-sized texture is undefined on
+                // strict native GLES1 drivers and commonly presents as black.
+                gles.BindTexture(gles11::TEXTURE_2D, texture);
+                gles.TexImage2D(
+                    gles11::TEXTURE_2D,
+                    0,
+                    gles11::RGBA as _,
+                    fb_width as _,
+                    fb_height as _,
+                    0,
+                    gles11::RGBA,
+                    gles11::UNSIGNED_BYTE,
+                    std::ptr::null(),
+                );
+                gles.TexParameteri(
+                    gles11::TEXTURE_2D,
+                    gles11::TEXTURE_WRAP_S,
+                    gles11::CLAMP_TO_EDGE as _,
+                );
+                gles.TexParameteri(
+                    gles11::TEXTURE_2D,
+                    gles11::TEXTURE_WRAP_T,
+                    gles11::CLAMP_TO_EDGE as _,
+                );
+            }
         };
         texture
     } else {
@@ -227,6 +289,19 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
                 gles11::TEXTURE_MAG_FILTER,
                 gles11::LINEAR as _,
             );
+            // This texture is the compositor's final frame. It is frequently
+            // NPOT on phones, and GL_REPEAT makes strict GLES1 drivers mark it
+            // incomplete and sample black.
+            gles.TexParameteri(
+                gles11::TEXTURE_2D,
+                gles11::TEXTURE_WRAP_S,
+                gles11::CLAMP_TO_EDGE as _,
+            );
+            gles.TexParameteri(
+                gles11::TEXTURE_2D,
+                gles11::TEXTURE_WRAP_T,
+                gles11::CLAMP_TO_EDGE as _,
+            );
 
             gles.GenFramebuffersOES(1, &mut framebuffer);
             gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, framebuffer);
@@ -241,14 +316,30 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
             // ХАК: Убраны вызовы assert_eq!, которые убивали приложение
             // при ошибках GL (типа GL_OUT_OF_MEMORY = 1285)
             let _ = gles.GetError(); // Просто сбрасываем флаг текущей ошибки, чтобы он не висел
-            let _ = gles.CheckFramebufferStatusOES(gles11::FRAMEBUFFER_OES); // Проверяем, но не крашимся
+            let status = gles.CheckFramebufferStatusOES(gles11::FRAMEBUFFER_OES);
+            if status != gles11::FRAMEBUFFER_COMPLETE_OES {
+                log!(
+                    "Warning: Core Animation compositor framebuffer is incomplete: {status:#x} ({fb_width}x{fb_height})"
+                );
+            }
         }
         env.framework_state
             .core_animation
             .composition
-            .texture_framebuffer = Some((texture, framebuffer));
+            .texture_framebuffer = Some((texture, framebuffer, fb_width, fb_height));
         texture
     };
+    if cached_target_was_resized {
+        env.framework_state
+            .core_animation
+            .composition
+            .texture_framebuffer = Some((
+                texture,
+                cached_texture_framebuffer.unwrap().1,
+                fb_width,
+                fb_height,
+            ));
+    }
 
     // Set up various other GL objects that will be reused on every frame.
     let misc_gl_objects = env
@@ -274,7 +365,12 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
                     gles11::GENERATE_MIPMAP,
                     gles11::TRUE as _,
                 );
-                upload_rgba8_pixels(gles.as_mut(), image.pixels(), (dimension as _, dimension as _));
+                upload_rgba8_pixels(
+                    gles.as_mut(),
+                    image.pixels(),
+                    (dimension as _, dimension as _),
+                    None,
+                );
                 gles.TexParameteri(
                     gles11::TEXTURE_2D,
                     gles11::TEXTURE_MIN_FILTER,
@@ -333,6 +429,17 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     // Clear the framebuffer and set up state to prepare for rendering
     unsafe {
         gles.Viewport(0, 0, fb_width as _, fb_height as _);
+        // The compositor owns this internal context, but its state persists
+        // across frames. Reset the tests/masks that can make every fragment
+        // fail or every color channel unwritable after a previous layer or
+        // presentation pass. Native Adreno GLES1 is particularly strict here.
+        gles.Disable(gles11::DEPTH_TEST);
+        gles.Disable(gles11::STENCIL_TEST);
+        gles.Disable(gles11::SCISSOR_TEST);
+        gles.Disable(gles11::CULL_FACE);
+        gles.ColorMask(gles11::TRUE, gles11::TRUE, gles11::TRUE, gles11::TRUE);
+        gles.DepthMask(gles11::TRUE);
+        gles.StencilMask(!0);
         gles.ClearColor(0.0, 0.0, 0.0, 1.0);
         gles.Clear(gles11::COLOR_BUFFER_BIT);
         gles.Color4f(1.0, 1.0, 1.0, 1.0);
@@ -406,6 +513,14 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
             present_frame_args.1,
             present_frame_args.2,
         );
+        // Hand the context back to the guest with the buffer bindings it
+        // left behind (see the save at the top of this function).
+        gles.BindBuffer(gles11::ARRAY_BUFFER, saved_array_buffer as _);
+        gles.BindBuffer(
+            gles11::ELEMENT_ARRAY_BUFFER,
+            saved_element_array_buffer as _,
+        );
+        let _ = gles.GetError();
     }
     std::mem::drop(gles);
     window.swap_window();
@@ -455,7 +570,25 @@ unsafe fn composite_layer_recursive(
 
     // This is both acting as the presentationLayer and the private render layer
     // It might need to be reworked in the future into a guest presentationLayer
-    let host_obj = animation_state.create_presentation_layer(env, layer);
+    //
+    // PERF: the presentation layer is a clone of the layer's host object.
+    // For a CAEAGLLayer presented through the compositor that would clone a
+    // full frame of pixels (hundreds of KB to several MB) every time it is
+    // composited, so take the pixels out for the duration of the clone and
+    // leave only a placeholder (with the real dimensions) in the copy — the
+    // upload below reads the pixels from the original layer anyway.
+    let presented_pixels = env
+        .objc
+        .borrow_mut::<CALayerHostObject>(layer)
+        .presented_pixels
+        .take();
+    let mut host_obj = animation_state.create_presentation_layer(env, layer);
+    if let Some((pixels, width, height)) = presented_pixels {
+        host_obj.presented_pixels = Some((Vec::new(), width, height));
+        env.objc
+            .borrow_mut::<CALayerHostObject>(layer)
+            .presented_pixels = Some((pixels, width, height));
+    }
 
     if host_obj.hidden {
         return;
@@ -582,7 +715,7 @@ unsafe fn composite_layer_recursive(
             gles.GenTextures(1, &mut t);
             gles.BindTexture(gles11::TEXTURE_2D, t);
             let pixels = image.pixels();
-            upload_rgba8_pixels(gles.as_mut(), pixels, (img_w, img_h));
+            upload_rgba8_pixels(gles.as_mut(), pixels, (img_w, img_h), None);
             gles.TexParameteri(
                 gles11::TEXTURE_2D,
                 gles11::TEXTURE_WRAP_S,
@@ -666,6 +799,10 @@ unsafe fn composite_layer_recursive(
         }
     }
 
+    // Dimensions of the texture storage that already exists (if any), so the
+    // uploads below can update it in place.
+    let mut texture_size = host_obj.gles_texture_size;
+
     // Update original layer texture with CAEAGLLayer pixels (slow path), if any
     if need_update {
         let original_host_obj = env.objc.borrow_mut::<CALayerHostObject>(layer);
@@ -681,7 +818,12 @@ unsafe fn composite_layer_recursive(
                 }
             }
 
-            upload_rgba8_pixels(gles.as_mut(), pixels, (width, height));
+            texture_size = Some(upload_rgba8_pixels(
+                gles.as_mut(),
+                pixels,
+                (width, height),
+                texture_size,
+            ));
         }
     }
 
@@ -692,22 +834,32 @@ unsafe fn composite_layer_recursive(
 
             // No special handling for opacity is needed here: the alpha channel
             // on an image is meaningful and won't be ignored.
-            upload_rgba8_pixels(gles.as_mut(), image.pixels(), image.dimensions());
+            texture_size = Some(upload_rgba8_pixels(
+                gles.as_mut(),
+                image.pixels(),
+                image.dimensions(),
+                texture_size,
+            ));
         } else if let Some(cg_context) = host_obj.cg_context {
             // Make sure this is in sync with the code in ca_layer.rs that
             // sets up the context!
             let (width, height, data) = cg_bitmap_context::get_data(&env.objc, cg_context);
             let size = width * height * 4;
             let pixels = env.mem.bytes_at(data.cast(), size);
-            upload_rgba8_pixels(gles.as_mut(), pixels, (width, height));
+            texture_size = Some(upload_rgba8_pixels(
+                gles.as_mut(),
+                pixels,
+                (width, height),
+                texture_size,
+            ));
         }
     }
 
     if need_update {
-        // Update original layer field
-        env.objc
-            .borrow_mut::<CALayerHostObject>(layer)
-            .gles_texture_is_up_to_date = true;
+        // Update original layer fields
+        let original_host_obj = env.objc.borrow_mut::<CALayerHostObject>(layer);
+        original_host_obj.gles_texture_is_up_to_date = true;
+        original_host_obj.gles_texture_size = texture_size;
     }
 
     // Draw texture, if any
@@ -840,7 +992,37 @@ unsafe fn upload_slice<T: SafeWrite>(
     )
 }
 
-unsafe fn upload_rgba8_pixels(gles: &mut dyn GLES, pixels: &[u8], dimensions: (u32, u32)) {
+/// Upload RGBA8 `pixels` to the texture bound to `GL_TEXTURE_2D`.
+///
+/// `current_size` is the size of the storage the texture already has (if it
+/// was uploaded to before); when it matches, the contents are replaced in
+/// place with `glTexSubImage2D`, which lets the driver update the existing
+/// allocation instead of orphaning it and allocating a new one on every
+/// change (a measurable per-frame cost for layers that update continuously,
+/// e.g. a CAEAGLLayer presented through the compositor). Returns the size of
+/// the texture storage afterwards.
+unsafe fn upload_rgba8_pixels(
+    gles: &mut dyn GLES,
+    pixels: &[u8],
+    dimensions: (u32, u32),
+    current_size: Option<(u32, u32)>,
+) -> (u32, u32) {
+    if current_size == Some(dimensions) {
+        gles.TexSubImage2D(
+            gles11::TEXTURE_2D,
+            0,
+            0,
+            0,
+            dimensions.0 as _,
+            dimensions.1 as _,
+            gles11::RGBA,
+            gles11::UNSIGNED_BYTE,
+            pixels.as_ptr() as *const _,
+        );
+        // The parameters below were already applied when the storage was
+        // first created.
+        return dimensions;
+    }
     gles.TexImage2D(
         gles11::TEXTURE_2D,
         0,
@@ -879,4 +1061,5 @@ unsafe fn upload_rgba8_pixels(gles: &mut dyn GLES, pixels: &[u8], dimensions: (u
         gles11::TEXTURE_WRAP_T,
         gles11::CLAMP_TO_EDGE as _,
     );
+    dimensions
 }

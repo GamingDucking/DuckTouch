@@ -401,6 +401,13 @@ fn pthread_equal(env: &mut Environment, thread1: pthread_t, thread2: pthread_t) 
     }
 }
 
+pub fn thread_id_for_pthread(env: &mut Environment, thread: pthread_t) -> Option<ThreadId> {
+    State::get(env)
+        .threads
+        .get(&thread)
+        .map(|host_object| host_object.thread_id)
+}
+
 pub fn pthread_self(env: &mut Environment) -> pthread_t {
     let current_thread = env.current_thread;
     if current_thread == 0 && !State::get(env).main_thread_object_created {
@@ -418,12 +425,33 @@ pub fn pthread_self(env: &mut Environment) -> pthread_t {
         );
     }
 
-    let (&ptr, _) = State::get(env)
+    if let Some((&ptr, _)) = State::get(env)
         .threads
         .iter()
         .find(|&(_ptr, host_obj)| host_obj.thread_id == current_thread)
-        .unwrap();
-    ptr
+    {
+        return ptr;
+    }
+    // No registered pthread object for this thread yet (e.g. a raw host-side
+    // thread that entered emulated code without calling pthread_create --
+    // Gameloft games on 3GS do this, and the previous code panicked here,
+    // which unwound across a coroutine boundary and aborted the whole
+    // process). Registering a synthetic object is safe: it behaves exactly
+    // like a pthread_self()-created thread object.
+    let opaque = env.mem.alloc_and_write(OpaqueThread {
+        magic: MAGIC_THREAD,
+    });
+    assert!(!State::get(env).threads.contains_key(&opaque));
+    State::get(env)
+        .threads
+        .insert(opaque, ThreadHostObject::new(current_thread, DEFAULT_ATTR));
+    log!(
+        "Warning: pthread_self: thread {} had no registered pthread object; \
+         created synthetic object {:?} instead of panicking",
+        current_thread,
+        opaque
+    );
+    opaque
 }
 
 pub fn pthread_exit(env: &mut Environment, retval: MutVoidPtr) {
@@ -456,7 +484,16 @@ pub fn pthread_exit(env: &mut Environment, retval: MutVoidPtr) {
 fn pthread_join(env: &mut Environment, thread: pthread_t, retval: MutPtr<MutVoidPtr>) -> i32 {
     let current_thread = env.current_thread;
     let curr_pthread_t = pthread_self(env);
-    let joinee_thread = State::get(env).threads.get_mut(&thread).unwrap().thread_id;
+    // POSIX: joining a thread handle that no longer exists (already exited
+    // and reclaimed, or a stale pthread_t) is ESRCH, not a panic. Guest code
+    // (e.g. Gameloft games on 3GS) can legally do this.
+    let Some(joinee_thread) = State::get(env).threads.get(&thread).map(|t| t.thread_id) else {
+        log_dbg!(
+            "pthread_join: thread handle {:?} not found, returning ESRCH",
+            thread
+        );
+        return ESRCH;
+    };
 
     assert!(joinee_thread != 0);
     if joinee_thread == current_thread {
@@ -464,7 +501,13 @@ fn pthread_join(env: &mut Environment, thread: pthread_t, retval: MutPtr<MutVoid
         return EDEADLK;
     }
 
-    let host_obj_curr = State::get(env).threads.get(&curr_pthread_t).unwrap();
+    let Some(host_obj_curr) = State::get(env).threads.get(&curr_pthread_t) else {
+        log_dbg!(
+            "pthread_join: current thread handle {:?} not registered, returning ESRCH",
+            curr_pthread_t
+        );
+        return ESRCH;
+    };
     if let Some(thread) = host_obj_curr.joined_by {
         if thread == joinee_thread {
             log_dbg!("Thread attempted deadlocking join, returning EDEADLK!");
@@ -472,7 +515,13 @@ fn pthread_join(env: &mut Environment, thread: pthread_t, retval: MutPtr<MutVoid
         }
     }
 
-    let host_obj_joinee = State::get(env).threads.get_mut(&thread).unwrap();
+    let Some(host_obj_joinee) = State::get(env).threads.get_mut(&thread) else {
+        log_dbg!(
+            "pthread_join: thread handle {:?} disappeared, returning ESRCH",
+            thread
+        );
+        return ESRCH;
+    };
     if host_obj_joinee.attr.detachstate == PTHREAD_CREATE_DETACHED {
         log_dbg!("Thread attempted join with detached thread, returning EINVAL!");
         return EINVAL;
@@ -706,10 +755,42 @@ fn pthread_sigmask(
 }
 
 /// `pthread_kill` — send a signal to a specific thread.
-/// Not supported in HLE; returns 0 (success) to avoid app abort.
-fn pthread_kill(_env: &mut Environment, thread: pthread_t, sig: i32) -> i32 {
-    log_dbg!("pthread_kill(thread={:?}, sig={}) -> stub 0", thread, sig);
-    0
+///
+/// Signal delivery in touchHLE is synchronous and runs on the calling guest
+/// thread (see `crate::libc::signal`), so a signal aimed at the calling
+/// thread is exactly `raise()`. A signal aimed at any *other* thread is
+/// delivered on the calling thread as well: refusing it would hang the
+/// crash reporters that signal a worker thread, and the only observable
+/// difference is the receiver's `pthread_self()`.
+fn pthread_kill(env: &mut Environment, thread: pthread_t, sig: i32) -> i32 {
+    // `sig == 0` is the documented way of asking whether a thread exists,
+    // without sending anything.
+    if sig == 0 {
+        return if State::get(env).threads.contains_key(&thread) {
+            0
+        } else {
+            ESRCH
+        };
+    }
+    let Some(target_thread) = State::get(env).threads.get(&thread).map(|t| t.thread_id) else {
+        // A stale or foreign pthread_t: this is what the real kernel
+        // reports when the thread does not exist.
+        return ESRCH;
+    };
+    if target_thread != env.current_thread {
+        log!(
+            "Warning: pthread_kill() targets thread {} while running on \
+             thread {}; delivering signal {} on the calling thread.",
+            target_thread,
+            env.current_thread,
+            sig
+        );
+    }
+    if crate::libc::signal::raise(env, sig) == 0 {
+        0
+    } else {
+        EINVAL
+    }
 }
 
 /// `pthread_attr_setscope` — set the contention scope attribute.

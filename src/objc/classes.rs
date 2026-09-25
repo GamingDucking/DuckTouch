@@ -20,6 +20,7 @@ use crate::mach_o::MachO;
 use crate::mem::{
     guest_size_of, ConstPtr, ConstVoidPtr, GuestUSize, Mem, MutVoidPtr, Ptr, SafeRead,
 };
+use crate::fastmap::FxHashMap;
 use std::collections::{HashMap, VecDeque};
 
 /// Generic pointer to an Objective-C class or metaclass.
@@ -40,11 +41,13 @@ pub(super) struct ClassHostObject {
     pub(super) name: String,
     pub(super) is_metaclass: bool,
     pub(super) superclass: Class,
-    pub(super) methods: HashMap<SEL, IMP>,
-    pub(super) guest_method_signatures: HashMap<SEL, ConstPtr<u8>>,
+    pub(super) methods: FxHashMap<SEL, IMP>,
+    pub(super) guest_method_signatures: FxHashMap<SEL, ConstPtr<u8>>,
     /// Maps ivar name to a tuple of an offset (as pointer) and an alignment.
     /// (Alignment is used during ivar reconciliation.)
     pub(super) ivars: HashMap<String, (ConstPtr<GuestUSize>, u32)>,
+    /// Scalar encodings/sizes for read-only trainer field identification.
+    pub(super) scalar_ivars: HashMap<String, (u8, u32)>,
     /// Maps declared @property name to the guest-memory pointer of its
     /// `property_t` entry (as read from the binary's property list).
     /// This is what `class_getProperty` queries.
@@ -309,6 +312,7 @@ impl ClassHostObject {
             instance_start: size,
             instance_size: size,
             ivars: HashMap::default(),
+            scalar_ivars: Default::default(),
             properties: HashMap::default(),
         }
     }
@@ -352,11 +356,12 @@ impl ClassHostObject {
             name,
             is_metaclass,
             superclass,
-            methods: HashMap::new(),
-            guest_method_signatures: HashMap::new(),
+            methods: FxHashMap::default(),
+            guest_method_signatures: FxHashMap::default(),
             instance_start,
             instance_size,
             ivars: HashMap::new(),
+            scalar_ivars: Default::default(),
             properties: HashMap::new(),
         };
         if !base_methods.is_null() {
@@ -752,9 +757,25 @@ impl ObjC {
 
         assert!(list.size % 4 == 0);
         let base: ConstPtr<Class> = Ptr::from_bits(list.addr);
-        for i in 0..(list.size / 4) {
+        let total_entries = list.size / 4;
+        let mut garbage_entries: u32 = 0;
+        for i in 0..total_entries {
             let class = mem.read(base + i);
             let metaclass = Self::read_isa(class, mem);
+
+            // A truncated Mach-O (e.g. Bug Heroes Quest's trimmed armv6 slice,
+            // whose __DATA is entirely past EOF and therefore zero-filled) can
+            // have __objc_classlist entries pointing into zeroed memory: the
+            // class pointer itself reads as nil, or the class struct is zeroed
+            // so its isa (the metaclass) reads as nil. A real class always has
+            // both. Skip garbage entries *before* anything else: registering a
+            // nil object is a no-op in register_static_object, so the name
+            // would still be inserted into `self.classes` below and the
+            // inheritance pass would panic on `get_host_object(nil).unwrap()`.
+            if class == nil || metaclass == nil {
+                garbage_entries += 1;
+                continue;
+            }
 
             let name = if let Some(fakes) = substitute_classes(bundle, mem, class, metaclass) {
                 let (class_host_object, metaclass_host_object) = fakes;
@@ -811,6 +832,25 @@ impl ObjC {
 
             self.classes.insert(name.to_string(), class);
         }
+
+        if garbage_entries > 0 {
+            log!(
+                "Warning: register_bin_classes: {garbage_entries} of {total_entries} ObjC class entries were garbage (truncated/zero-filled binary — the .ipa is likely damaged); the app may fail to start or misbehave."
+            );
+        }
+
+        self.reconcile_bin_class_ivars(mem);
+    }
+
+    fn reconcile_bin_class_ivars(&mut self, mem: &mut Mem) {
+        // Host classes are linked lazily. A class list can be empty, contain
+        // only independent roots, or have every entry skipped above. In those
+        // cases non-lazy symbol binding need not have loaded NSObject at all.
+        // Materialize the real host implementation before building the graph,
+        // rather than assuming a guest class import has already done so.
+        // get_known_class preserves an already registered class and its identity;
+        // it does not reparent independent guest roots to NSObject.
+        self.get_known_class("NSObject", mem);
 
         let mut queue = VecDeque::<Class>::new();
         let mut found_ns_object = false;
@@ -1039,6 +1079,16 @@ impl ObjC {
                 }
             };
             let class = data.class;
+            // In a truncated binary the category entry itself can live in
+            // zero-filled memory (nil/garbage class pointer), or it can target
+            // a class that was skipped as garbage in register_bin_classes.
+            // Skip instead of panicking on get_host_object().unwrap().
+            if class == nil || !self.objects.contains_key(&class) {
+                log!(
+                    "Warning: register_bin_categories: skipping category #{i} — its class ({class:?}) is nil or was not registered (truncated binary)"
+                );
+                continue;
+            }
             let metaclass = Self::read_isa(class, mem);
             for (class, methods) in [
                 (class, data.instance_methods),
@@ -1066,6 +1116,7 @@ impl ObjC {
                         instance_start: Default::default(),
                         instance_size: Default::default(),
                         ivars: Default::default(),
+                        scalar_ivars: Default::default(),
                         properties: Default::default(),
                     },
                 );
@@ -1276,97 +1327,33 @@ pub fn object_getClass(env: &mut crate::Environment, obj: id) -> Class {
     objc_obj.isa
 }
 
-pub fn objc_retainAutoreleasedReturnValue(
-    env: &mut crate::Environment,
-    name: ConstPtr<u8>,
-) -> Class {
-    if name.is_null() {
-        return nil;
-    }
-
-    let name_str = match env.mem.cstr_at_utf8(name) {
-        Ok(s) => s.to_string(),
-        Err(_) => return nil,
-    };
-    if let Some(class) = env.objc.get_class(&name_str, false, &env.mem) {
-        return class;
-    }
-
-    if ObjC::find_template(&name_str).is_some() {
-        return env.objc.link_class(&name_str, false, &mut env.mem);
-    }
-
-    nil
+/// ARC return-value helpers use the ordinary retain/autorelease fallback.
+/// We do not implement the caller/callee optimisation that elides the pair.
+/// Their argument is an object, not a C string naming an Objective-C class.
+pub fn objc_retainAutoreleasedReturnValue(env: &mut crate::Environment, obj: id) -> id {
+    crate::objc::retain(env, obj)
 }
 
-pub fn objc_autoreleaseReturnValue(env: &mut crate::Environment, name: ConstPtr<u8>) -> Class {
-    if name.is_null() {
-        return nil;
-    }
-
-    let name_str = match env.mem.cstr_at_utf8(name) {
-        Ok(s) => s.to_string(),
-        Err(_) => return nil,
-    };
-    if let Some(class) = env.objc.get_class(&name_str, false, &env.mem) {
-        return class;
-    }
-
-    if ObjC::find_template(&name_str).is_some() {
-        return env.objc.link_class(&name_str, false, &mut env.mem);
-    }
-
-    nil
+pub fn objc_autoreleaseReturnValue(env: &mut crate::Environment, obj: id) -> id {
+    crate::objc::autorelease(env, obj)
 }
 
-pub fn objc_retainAutoreleaseReturnValue(
-    env: &mut crate::Environment,
-    name: ConstPtr<u8>,
-) -> Class {
-    if name.is_null() {
-        return nil;
-    }
-
-    let name_str = match env.mem.cstr_at_utf8(name) {
-        Ok(s) => s.to_string(),
-        Err(_) => return nil,
-    };
-    if let Some(class) = env.objc.get_class(&name_str, false, &env.mem) {
-        return class;
-    }
-
-    if ObjC::find_template(&name_str).is_some() {
-        return env.objc.link_class(&name_str, false, &mut env.mem);
-    }
-
-    nil
+pub fn objc_retainAutoreleaseReturnValue(env: &mut crate::Environment, obj: id) -> id {
+    objc_retainAutorelease(env, obj)
 }
 
-pub fn objc_autoreleasePoolPush(env: &mut crate::Environment, name: ConstPtr<u8>) -> Class {
-    if name.is_null() {
-        return nil;
-    }
-
-    let name_str = match env.mem.cstr_at_utf8(name) {
-        Ok(s) => s.to_string(),
-        Err(_) => return nil,
-    };
-    if let Some(class) = env.objc.get_class(&name_str, false, &env.mem) {
-        return class;
-    }
-
-    if ObjC::find_template(&name_str).is_some() {
-        return env.objc.link_class(&name_str, false, &mut env.mem);
-    }
-
-    nil
+/// The opaque token is a retained NSAutoreleasePool. Its implementation
+/// already tracks nested pools per guest thread and drains inner pools first.
+pub fn objc_autoreleasePoolPush(env: &mut crate::Environment) -> MutVoidPtr {
+    let pool: id = crate::objc::msg_class![env; NSAutoreleasePool new];
+    pool.cast_void()
 }
 
-pub fn objc_autoreleasePoolPop(_env: &mut crate::Environment, _context: MutVoidPtr) {
-    // touchHLE manages autorelease pools through NSAutoreleasePool objects, so
-    // the matching `objc_autoreleasePoolPush` is a no-op stub that returns
-    // nil, and there is nothing to drain here. iPhone OS 2.x/3.x apps target
-    // this path very rarely (it's primarily used by ARC).
+pub fn objc_autoreleasePoolPop(env: &mut crate::Environment, context: MutVoidPtr) {
+    if !context.is_null() {
+        let pool: id = context.cast();
+        let (): () = crate::objc::msg![env; pool drain];
+    }
 }
 
 pub fn class_getSuperclass(env: &mut crate::Environment, cls: Class) -> Class {
@@ -1667,6 +1654,56 @@ pub fn method_getName(env: &mut crate::Environment, m: ConstVoidPtr) -> SEL {
         Some((_cls, sel)) => sel,
         None => SEL::null(),
     }
+}
+
+/// `BOOL class_isMetaClass(Class cls)`
+///
+/// Per Apple's [Objective-C Runtime Reference](https://developer.apple.com/documentation/objectivec/1418629-class_ismetaclass):
+/// returns `YES` if `cls` is a metaclass, `NO` otherwise (including when
+/// `cls` is `Nil` or not a class at all).
+///
+/// Chrome's networking layer calls this during Objective-C runtime
+/// introspection.
+pub fn class_isMetaClass(env: &mut crate::Environment, cls: Class) -> bool {
+    if cls.is_null() {
+        return false;
+    }
+    if let Some(host_obj) = env.objc.get_host_object(cls) {
+        if let Some(class_obj) = host_obj.as_any().downcast_ref::<ClassHostObject>() {
+            return class_obj.is_metaclass;
+        }
+        if let Some(unimpl) = host_obj.as_any().downcast_ref::<UnimplementedClass>() {
+            return unimpl.is_metaclass;
+        }
+        if let Some(fake) = host_obj.as_any().downcast_ref::<FakeClass>() {
+            return fake.is_metaclass;
+        }
+    }
+    // Guest-defined class: read the class struct from guest memory and check
+    // the CLS_META flag in its class_rw_t data (flags bit 0x2, matching the
+    // legacy Objective-C runtime this project targets).
+    let class_t_size = std::mem::size_of::<class_t>() as GuestUSize;
+    if env
+        .mem
+        .get_bytes_fallible(cls.cast_const().cast(), class_t_size)
+        .is_none()
+    {
+        return false;
+    }
+    let class_struct: class_t = env.mem.read(cls.cast());
+    if class_struct.data.is_null() {
+        return false;
+    }
+    let rw_size = std::mem::size_of::<class_rw_t>() as GuestUSize;
+    if env
+        .mem
+        .get_bytes_fallible(class_struct.data.cast(), rw_size)
+        .is_none()
+    {
+        return false;
+    }
+    let rw: class_rw_t = env.mem.read(class_struct.data.cast());
+    (rw._flags & 0x2) != 0
 }
 
 pub fn objc_getMetaClass(env: &mut crate::Environment, cls: Class, name: SEL) -> ConstVoidPtr {
@@ -2399,7 +2436,7 @@ pub fn object_getIndexedIvars(_env: &mut crate::Environment, obj: id) -> ConstVo
 ///
 /// > Exchanges the implementations of two methods. This is an atomic
 /// > version of the following:
-/// > ```
+/// > ```text
 /// > IMP imp1 = method_getImplementation(m1);
 /// > IMP imp2 = method_getImplementation(m2);
 /// > method_setImplementation(m1, imp2);
@@ -2662,4 +2699,90 @@ pub fn class_getProperty(
 
     // Property not found in hierarchy — return NULL (spec-compliant).
     ConstVoidPtr::null()
+}
+
+#[cfg(test)]
+mod class_registration_tests {
+    use super::*;
+
+    fn runtime() -> (ObjC, Mem) {
+        let mut mem = Mem::new();
+        mem.set_null_segment_size(0x1000);
+        let mut objc = ObjC::new();
+        objc.register_host_selectors(&mut mem);
+        (objc, mem)
+    }
+
+    #[test]
+    fn reconciliation_loads_nsobject_without_guest_class_imports() {
+        let (mut objc, mut mem) = runtime();
+        assert!(objc.classes.is_empty());
+
+        // Same graph as an empty class list or one with all entries skipped.
+        objc.reconcile_bin_class_ivars(&mut mem);
+
+        let class = objc.get_class("NSObject", false, &mem).unwrap();
+        let root = objc.borrow::<ClassHostObject>(class);
+        assert!(root.superclass == nil);
+        assert!(!root.methods.is_empty()); // Real implementation, not a placeholder.
+        let meta = ObjC::read_isa(class, &mem);
+        assert!(ObjC::read_isa(meta, &mem) == meta);
+        assert!(objc.borrow::<ClassHostObject>(meta).superclass == class);
+    }
+
+    #[test]
+    fn reconciliation_preserves_existing_nsobject_identity() {
+        let (mut objc, mut mem) = runtime();
+        let original = objc.get_known_class("NSObject", &mut mem);
+        let meta = ObjC::read_isa(original, &mem);
+        let class_count = objc.classes.len();
+
+        objc.reconcile_bin_class_ivars(&mut mem);
+        objc.reconcile_bin_class_ivars(&mut mem);
+
+        assert!(objc.get_class("NSObject", false, &mem) == Some(original));
+        assert!(ObjC::read_isa(original, &mem) == meta);
+        assert_eq!(objc.classes.len(), class_count);
+    }
+
+    #[test]
+    fn reconciliation_preserves_independent_roots_and_visits_their_children() {
+        let (mut objc, mut mem) = runtime();
+        // Synthetic graph nodes: reconciliation uses class metadata, not isa.
+        let root = objc.alloc_static_object(
+            nil,
+            Box::new(ClassHostObject {
+                name: "IndependentRoot".to_string(),
+                instance_start: 4,
+                instance_size: 16,
+                ..Default::default()
+            }),
+            &mut mem,
+        );
+        let child = objc.alloc_static_object(
+            nil,
+            Box::new(ClassHostObject {
+                name: "IndependentChild".to_string(),
+                superclass: root,
+                instance_start: 4,
+                instance_size: 8,
+                ..Default::default()
+            }),
+            &mut mem,
+        );
+        objc.classes.insert("IndependentRoot".to_string(), root);
+        objc.classes.insert("IndependentChild".to_string(), child);
+        assert!(objc.get_class("NSObject", false, &mem).is_none());
+
+        objc.reconcile_bin_class_ivars(&mut mem);
+
+        assert!(objc.borrow::<ClassHostObject>(root).superclass == nil);
+        let child_host = objc.borrow::<ClassHostObject>(child);
+        assert!(child_host.superclass == root);
+        assert_eq!(child_host.instance_start, 16);
+        assert_eq!(child_host.instance_size, 20);
+        // A second reconciliation must not grow the child a second time.
+        objc.reconcile_bin_class_ivars(&mut mem);
+        assert_eq!(objc.borrow::<ClassHostObject>(child).instance_size, 20);
+    }
 }

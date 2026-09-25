@@ -227,6 +227,35 @@ fn CFStringGetSmallestEncoding(env: &mut Environment, the_string: CFStringRef) -
     CFStringConvertNSStringEncodingToEncoding(env, ns_enc)
 }
 
+/// `CFStringRef CFStringConvertEncodingToIANACharSetName(CFStringEncoding encoding)`
+///
+/// Apple docs: returns the IANA character-set name registered for `encoding`,
+/// or NULL if the encoding has no IANA equivalent. Games use this when building
+/// HTTP headers (e.g. `Content-Type: text/html; charset=...`). We return the
+/// canonical IANA names for the encodings touchHLE supports and NULL for the
+/// rest, matching real CFString behavior.
+fn CFStringConvertEncodingToIANACharSetName(
+    env: &mut Environment,
+    encoding: CFStringEncoding,
+) -> CFStringRef {
+    let name: &'static str = match encoding {
+        kCFStringEncodingMacRoman => "macintosh",
+        kCFStringEncodingASCII => "us-ascii",
+        kCFStringEncodingUTF8 => "utf-8",
+        kCFStringEncodingUTF16 | kCFStringEncodingUnicode => "utf-16",
+        kCFStringEncodingUTF16BE => "utf-16be",
+        kCFStringEncodingUTF16LE => "utf-16le",
+        kCFStringEncodingUTF32 => "utf-32",
+        kCFStringEncodingUTF32BE => "utf-32be",
+        kCFStringEncodingUTF32LE => "utf-32le",
+        kCFStringEncodingISOLatin1 => "iso-8859-1",
+        kCFStringEncodingWindowsLatin1 => "windows-1252",
+        kCFStringEncodingNextStepLatin => "x-nextstep",
+        _ => return nil,
+    };
+    ns_string::get_static_str(env, name)
+}
+
 fn CFStringGetMostCompatibleMacStringEncoding(
     _env: &mut Environment,
     encoding: CFStringEncoding,
@@ -637,6 +666,32 @@ fn CFStringGetLength(env: &mut Environment, the_string: CFStringRef) -> CFIndex 
 
     let length: NSUInteger = msg![env; the_string length];
     length.try_into().unwrap_or(0)
+}
+
+/// `CFIndex CFStringGetMaximumSizeForEncoding(CFIndex length,
+///                                            CFStringEncoding encoding)`
+///
+/// Per Apple's Core Foundation reference, returns "the maximum number of
+/// bytes a string of a specified length (in UTF-16 code units) could occupy
+/// after conversion to the specified encoding". This is an upper bound used
+/// by callers to size buffers; it never inspects the actual string.
+///
+/// Worst-case bytes per UTF-16 code unit: 3 for UTF-8 (a code unit maps to
+/// at most 3 bytes on its own; surrogate pairs map to 4 bytes but consume
+/// two code units), 4 for UTF-32, 2 for UTF-16, 1 for 8-bit encodings that
+/// cannot represent everything (the caller must handle truncation).
+/// Chrome calls this before converting URLs and header strings to UTF-8.
+fn CFStringGetMaximumSizeForEncoding(_env: &mut Environment, length: CFIndex, encoding: CFStringEncoding) -> CFIndex {
+    if length < 0 {
+        return 0;
+    }
+    // Mirror CoreFoundation's own constants for the encodings that matter;
+    // anything else gets a conservative 4-bytes-per-unit bound.
+    match encoding {
+        kCFStringEncodingUTF8 => length * 3,
+        kCFStringEncodingUTF16 | kCFStringEncodingUTF16BE | kCFStringEncodingUTF16LE => length * 2,
+        _ => length * 4,
+    }
 }
 
 fn CFStringGetCharacterAtIndex(
@@ -1077,7 +1132,7 @@ fn CFStringFindCharacterFromSet(
 // MARK: - Comparison
 
 pub type CFStringCompareFlags = CFOptionFlags;
-fn CFStringCompare(
+pub fn CFStringCompare(
     env: &mut Environment,
     a: CFStringRef,
     b: CFStringRef,
@@ -2313,6 +2368,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CFStringIsEncodingAvailable(_)),
     export_c_func!(CFStringGetSystemEncoding()),
     export_c_func!(CFStringGetFastestEncoding(_)),
+    export_c_func!(CFStringConvertEncodingToIANACharSetName(_)),
     export_c_func!(CFStringGetSmallestEncoding(_)),
     export_c_func!(CFStringGetMostCompatibleMacStringEncoding(_)),
     // Immutable constructors
@@ -2341,6 +2397,7 @@ pub const FUNCTIONS: FunctionExports = &[
     )),
     // Queries
     export_c_func!(CFStringGetLength(_)),
+    export_c_func!(CFStringGetMaximumSizeForEncoding(_, _)),
     export_c_func!(CFStringGetCharacterAtIndex(_, _)),
     export_c_func!(CFStringGetCharacters(_, _, _)),
     export_c_func!(CFStringGetCharacterFromInlineBuffer(_, _)),

@@ -38,7 +38,14 @@ use crate::Environment;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Default)]
-pub(super) struct CALayerHostObject {
+pub(crate) struct CALayerHostObject {
+    // CAMetalLayer storage (Metal presentation path). Kept on the layer host
+    // object so CALayer subclasses keep working with the CoreAnimation
+    // machinery instead of carrying a foreign host object type.
+    pub(crate) metal_device: id,
+    pub(crate) metal_pixel_format: GuestUSize,
+    pub(crate) metal_drawable_size: CGSize,
+    pub(crate) metal_framebuffer_only: bool,
     delegate: id,
     pub(super) sublayers: Vec<id>,
     superlayer: id,
@@ -78,6 +85,10 @@ pub(super) struct CALayerHostObject {
     pub(super) cg_context: Option<CGContextRef>,
     pub(super) gles_texture: Option<crate::gles::gles11_raw::types::GLuint>,
     pub(super) gles_texture_is_up_to_date: bool,
+    /// Dimensions of the storage currently allocated for `gles_texture`, so
+    /// the compositor can update it in place (`glTexSubImage2D`) rather than
+    /// reallocating it (`glTexImage2D`) whenever the contents change.
+    pub(super) gles_texture_size: Option<(u32, u32)>,
     pub(super) animations: HashMap<String, id>,
     pub(super) anonymous_animations: HashSet<id>,
     pub(super) name: Option<String>,
@@ -106,11 +117,30 @@ pub(super) struct CALayerHostObject {
     /// Whether implicit animations are enabled for property changes on this
     /// layer. UIView-backing layers disable this; standalone CALayers enable
     /// it. TODO: Remove once CAActions are implemented.
+    /// `-[CALayer contentsScale]` — multiplier from layer points to backing
+    /// pixels. Real iOS defaults a layer backing a view to the view's
+    /// `contentScaleFactor`, which in turn defaults to the screen's scale.
+    /// EAGL (`renderbufferStorage:fromDrawable:`) derives the renderbuffer
+    /// size from `bounds * contentsScale`, so this must round-trip for
+    /// retina-aware apps to allocate correctly-sized buffers.
+    pub(crate) contents_scale: CGFloat,
     pub(super) use_implicit_animations: bool,
 }
 impl HostObject for CALayerHostObject {}
 
 impl CALayerHostObject {
+    // CAMetalLayer helpers: metal.rs lives in a sibling module tree, so it
+    // cannot reach the pub(super) fields directly. Route frame/bounds access
+    // through these methods.
+    pub(crate) fn get_bounds_frame(&self) -> CGRect {
+        self.bounds
+    }
+    pub(crate) fn set_bounds_metal(&mut self, bounds: CGRect) {
+        self.bounds = bounds;
+    }
+    pub(crate) fn set_frame_metal(&mut self, frame: CGRect) {
+        self.bounds = frame;
+    }
     pub(super) fn superlayer_to_layer_transform(&self) -> CGAffineTransform {
         CGAffineTransform::make_translation(-self.bounds.origin.x, -self.bounds.origin.y)
             .concat(CGAffineTransform::make_translation(
@@ -342,6 +372,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 + (id)alloc {
     let host_object = Box::new(CALayerHostObject {
+        metal_device: nil,
+        metal_pixel_format: 0,
+        metal_drawable_size: CGSize {
+            width: 0.0,
+            height: 0.0,
+        },
+        metal_framebuffer_only: false,
         delegate: nil,
         sublayers: Vec::new(),
         superlayer: nil,
@@ -372,6 +409,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         cg_context: None,
         gles_texture: None,
         gles_texture_is_up_to_date: false,
+        gles_texture_size: None,
         animations: HashMap::new(),
         anonymous_animations: HashSet::new(),
         name: None,
@@ -386,6 +424,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         magnification_filter: kCAFilterLinear.to_owned(),
         minification_filter_bias: 0.0,
         use_implicit_animations: true,
+        contents_scale: 1.0,
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
@@ -590,6 +629,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // --- ДОБАВЛЕНЫ МЕТОДЫ ДЛЯ Z-POSITION ---
 - (CGFloat)zPosition { env.objc.borrow::<CALayerHostObject>(this).z_position }
+
+- (CGFloat)contentsScale {
+    env.objc.borrow::<CALayerHostObject>(this).contents_scale
+}
+- (())setContentsScale:(CGFloat)scale {
+    let safe_scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+    env.objc.borrow_mut::<CALayerHostObject>(this).contents_scale = safe_scale;
+}
 - (())setZPosition:(CGFloat)z_position { env.objc.borrow_mut::<CALayerHostObject>(this).z_position = z_position; }
 // ---------------------------------------
 

@@ -43,6 +43,11 @@ pub fn main() {
         Some(ref s) if !s.is_empty()
     );
 
+    // Consumers that need a compact build identifier should not have to parse
+    // the display-oriented version string (or inherit its dirty suffix).
+    let commit_hash_for_label = commit_hash.as_deref().unwrap_or("git rev. unknown");
+    std::fs::write(out_dir.join("commit_hash.txt"), commit_hash_for_label).unwrap();
+
     // Sanity check: warn if the Cargo.toml version doesn't match the latest tag.
     if let Some(tag) = git_output(&["describe", "--tags", "--abbrev=0"]) {
         if tag

@@ -34,6 +34,173 @@ const VM_PROT_WRITE: vm_prot_t = 2;
 #[allow(dead_code)]
 const VM_PROT_EXECUTE: vm_prot_t = 4;
 
+/// Which OpenGL ES API generations an executable references, judged from the
+/// OpenGL ES symbols it imports. See [scan_gles_api_usage].
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct GlesApiUsage {
+    /// Imports at least one entry point that only exists in OpenGL ES 1.1
+    /// (fixed-function pipeline: matrix stack, client-side arrays, lighting…).
+    pub uses_es1: bool,
+    /// Imports at least one entry point that only exists in OpenGL ES 2.0+
+    /// (shaders, programs, generic vertex attributes).
+    pub uses_es2: bool,
+}
+
+impl GlesApiUsage {
+    /// The executable renders with shaders and never references the ES 1.1
+    /// fixed-function pipeline, i.e. it can only ever ask EAGL for an
+    /// OpenGL ES 2.0 context.
+    pub fn is_es2_only(self) -> bool {
+        self.uses_es2 && !self.uses_es1
+    }
+}
+
+/// Entry points that exist in OpenGL ES 1.1 but not in OpenGL ES 2.0. Only
+/// unambiguous fixed-function names are listed: anything shared by both APIs
+/// (`glBindTexture`, `glEnable`, `glViewport`, …) is deliberately absent.
+const GLES1_ONLY_SYMBOLS: &[&str] = &[
+    "_glAlphaFunc",
+    "_glAlphaFuncx",
+    "_glClientActiveTexture",
+    "_glColor4f",
+    "_glColor4ub",
+    "_glColor4x",
+    "_glColorPointer",
+    "_glDisableClientState",
+    "_glEnableClientState",
+    "_glFogf",
+    "_glFogfv",
+    "_glFogx",
+    "_glFogxv",
+    "_glFrustumf",
+    "_glFrustumx",
+    "_glLightModelf",
+    "_glLightModelfv",
+    "_glLightf",
+    "_glLightfv",
+    "_glLoadIdentity",
+    "_glLoadMatrixf",
+    "_glLoadMatrixx",
+    "_glMaterialf",
+    "_glMaterialfv",
+    "_glMatrixMode",
+    "_glMultMatrixf",
+    "_glMultMatrixx",
+    "_glNormal3f",
+    "_glNormalPointer",
+    "_glOrthof",
+    "_glOrthox",
+    "_glPointSize",
+    "_glPointSizePointerOES",
+    "_glPopMatrix",
+    "_glPushMatrix",
+    "_glRotatef",
+    "_glRotatex",
+    "_glScalef",
+    "_glScalex",
+    "_glShadeModel",
+    "_glTexCoordPointer",
+    "_glTexEnvf",
+    "_glTexEnvfv",
+    "_glTexEnvi",
+    "_glTexEnviv",
+    "_glTexEnvx",
+    "_glTranslatef",
+    "_glTranslatex",
+    "_glVertexPointer",
+    "_glDrawTexfOES",
+    "_glDrawTexiOES",
+];
+
+/// Entry points that exist in OpenGL ES 2.0 but not in OpenGL ES 1.1.
+const GLES2_ONLY_SYMBOLS: &[&str] = &[
+    "_glAttachShader",
+    "_glCompileShader",
+    "_glCreateProgram",
+    "_glCreateShader",
+    "_glEnableVertexAttribArray",
+    "_glGetAttribLocation",
+    "_glGetUniformLocation",
+    "_glLinkProgram",
+    "_glShaderSource",
+    "_glUniform1i",
+    "_glUniform4fv",
+    "_glUniformMatrix4fv",
+    "_glUseProgram",
+    "_glVertexAttribPointer",
+];
+
+/// Find out which OpenGL ES API generations a Mach-O executable references,
+/// from the raw file bytes, without parsing the file.
+///
+/// Imported symbols have to survive in an executable's symbol string table
+/// for `dyld` to bind them (even in fully stripped binaries), so a NUL-
+/// delimited string scan for the well-known `_gl*` names is an accurate and
+/// cheap (single pass, no allocation) way to tell an ES 2.0-only game from
+/// one that (also) drives the ES 1.1 fixed-function pipeline. Fat binaries
+/// are scanned as a whole, which can only err on the side of reporting more
+/// usage.
+///
+/// This runs before the window (and therefore the host GL driver) exists, so
+/// it can steer the driver choice on Android: see
+/// `crate::window::Window::new`.
+pub fn scan_gles_api_usage(bytes: &[u8]) -> GlesApiUsage {
+    let mut usage = GlesApiUsage::default();
+    // Split on NUL bytes; only strings that start with "_gl" are candidates,
+    // which keeps the per-string work negligible for the ~99.9% that aren't.
+    for s in bytes.split(|&b| b == 0) {
+        if s.len() < 4 || !s.starts_with(b"_gl") {
+            continue;
+        }
+        let Ok(name) = std::str::from_utf8(s) else {
+            continue;
+        };
+        if !usage.uses_es1 && GLES1_ONLY_SYMBOLS.contains(&name) {
+            usage.uses_es1 = true;
+        } else if !usage.uses_es2 && GLES2_ONLY_SYMBOLS.contains(&name) {
+            usage.uses_es2 = true;
+        }
+        if usage.uses_es1 && usage.uses_es2 {
+            break;
+        }
+    }
+    usage
+}
+
+#[cfg(test)]
+mod gles_api_usage_tests {
+    use super::*;
+
+    #[test]
+    fn es2_only_binary() {
+        let bytes = b"junk\0_glUseProgram\0_glBindTexture\0_glVertexAttribPointer\0more";
+        let usage = scan_gles_api_usage(bytes);
+        assert!(usage.uses_es2);
+        assert!(!usage.uses_es1);
+        assert!(usage.is_es2_only());
+    }
+
+    #[test]
+    fn mixed_binary_is_not_es2_only() {
+        let bytes = b"\0_glCreateShader\0_glMatrixMode\0";
+        let usage = scan_gles_api_usage(bytes);
+        assert!(usage.uses_es2 && usage.uses_es1);
+        assert!(!usage.is_es2_only());
+    }
+
+    #[test]
+    fn es1_binary_and_shared_names() {
+        let usage = scan_gles_api_usage(b"_glEnable\0_glEnableClientState\0_glViewport");
+        assert!(usage.uses_es1 && !usage.uses_es2);
+        // Shared names alone don't count as either.
+        let usage = scan_gles_api_usage(b"_glEnable\0_glBindTexture\0_glDrawArrays\0");
+        assert_eq!(usage, GlesApiUsage::default());
+        // A prefix match isn't a match.
+        let usage = scan_gles_api_usage(b"_glUseProgramObjectARB\0_glMatrixModeEXT\0");
+        assert_eq!(usage, GlesApiUsage::default());
+    }
+}
+
 #[derive(Debug)]
 pub struct MachO {
     /// Name (for debugging purposes and sorting)
@@ -234,6 +401,27 @@ impl Reloc {
     }
 }
 
+/// Subtypes supported by the 32-bit iPhone OS ARM backend, in selection
+/// preference order. Keep generic ARMv7 ahead of specialized ARMv7 variants.
+/// ARM_ALL is a generic ARM image, not a wildcard accepting arbitrary ISAs.
+fn arm_subtype_priority(subtype: cpu_subtype_t) -> Option<u8> {
+    // Mach-O reserves the high byte for capability requirements. No such
+    // requirements are supported by this ARM32 backend (in particular LIB64
+    // is not valid here). Do not silently strip unknown required capabilities.
+    if (subtype as u32) & 0xff00_0000 != 0 {
+        return None;
+    }
+    match subtype {
+        mach_object::CPU_SUBTYPE_ARM_V7 => Some(4),
+        mach_object::CPU_SUBTYPE_ARM_V7S => Some(3),
+        mach_object::CPU_SUBTYPE_ARM_V7F => Some(2),
+        mach_object::CPU_SUBTYPE_ARM_V6 => Some(1),
+        mach_object::CPU_SUBTYPE_ARM_ALL => Some(0),
+        // Excludes older ARM/XScale, watchOS ARMv7k, ARMv8 and unknown values.
+        _ => None,
+    }
+}
+
 fn cpu_subtype_to_str(ty: cpu_subtype_t) -> &'static str {
     match ty {
         mach_object::CPU_SUBTYPE_ARM_ALL => "armv???",
@@ -256,6 +444,57 @@ fn cpu_subtype_to_str(ty: cpu_subtype_t) -> &'static str {
     }
 }
 
+/// Only the virtual tail (vmsize - filesize) is zero-filled. Missing bytes
+/// inside the declared file range are corruption, not BSS.
+fn validate_segment_file_range(
+    fileoff: u64,
+    filesize: u64,
+    vmsize: u64,
+    file_len: usize,
+) -> Result<(), &'static str> {
+    if filesize > vmsize {
+        return Err("Mach-O segment file size exceeds its virtual size");
+    }
+    if filesize == 0 {
+        return Ok(());
+    }
+    let end = fileoff
+        .checked_add(filesize)
+        .ok_or("Mach-O segment file range overflows")?;
+    if end > file_len as u64 {
+        return Err("Mach-O segment extends past end of file; executable is truncated or malformed (check the IPA)");
+    }
+    Ok(())
+}
+
+fn validate_segment_ranges(commands: &[MachCommand], file_len: usize) -> Result<(), &'static str> {
+    for MachCommand(command, _) in commands {
+        if let LoadCommand::Segment {
+            segname,
+            fileoff,
+            filesize,
+            vmsize,
+            ..
+        } = command
+        {
+            // mach_object exposes these fields as usize. Use checked
+            // conversions: usize does not implement Into<u64> in Rust.
+            let offset =
+                u64::try_from(*fileoff).map_err(|_| "Segment file offset does not fit u64")?;
+            let size =
+                u64::try_from(*filesize).map_err(|_| "Segment file size does not fit u64")?;
+            let virtual_size =
+                u64::try_from(*vmsize).map_err(|_| "Segment virtual size does not fit u64")?;
+            if let Err(error) = validate_segment_file_range(offset, size, virtual_size, file_len) {
+                log!("Rejecting Mach-O: segment {} fileoff={:#x} filesize={:#x} vmsize={:#x}, file length={:#x}: {}",
+                    segname, fileoff, filesize, vmsize, file_len, error);
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
 impl MachO {
     /// Load the all the sections from a Mach-O binary (provided as `bytes`)
     /// into the guest memory (`into_mem`), and return a struct containing
@@ -276,12 +515,20 @@ impl MachO {
             OFile::MachFile { header, commands } => (header, commands),
             OFile::FatFile { files, .. } => {
                 let mut best_subslice: Option<&[u8]> = None;
-                let mut best_type = None;
-                let mut had_truncated_slice = false;
+                let mut best_priority = None;
+                let mut had_invalid_slice = false;
                 for (arch, _) in files {
                     if arch.cputype != mach_object::CPU_TYPE_ARM {
                         continue;
                     }
+                    let Some(priority) = arm_subtype_priority(arch.cpusubtype) else {
+                        log!(
+                            "Skipping unsupported ARM FAT subtype {:#x}",
+                            arch.cpusubtype
+                        );
+                        had_invalid_slice = true;
+                        continue;
+                    };
                     // Per Apple's Mach-O FAT documentation, each `fat_arch`
                     // gives an absolute offset and size into the wrapping FAT
                     // file. Some malformed / partially-downloaded IPAs (e.g.
@@ -305,22 +552,42 @@ impl MachO {
                             off.saturating_add(size),
                             bytes.len(),
                         );
-                        had_truncated_slice = true;
+                        had_invalid_slice = true;
                         continue;
                     }
-                    if arch.cpusubtype == mach_object::CPU_SUBTYPE_ARM_V7
-                        || (arch.cpusubtype == mach_object::CPU_SUBTYPE_ARM_V6
-                            && best_type != Some(mach_object::CPU_SUBTYPE_ARM_V7))
-                        || best_type.is_none()
-                    {
-                        best_subslice = Some(&bytes[off..off + size]);
-                        best_type = Some(arch.cpusubtype);
+                    // A FAT range can fit while the Mach-O inside it declares
+                    // missing segment bytes. Validate before ranking candidates,
+                    // and before any guest memory is reserved for a candidate.
+                    let subslice = &bytes[off..off + size];
+                    let usable = match OFile::parse(&mut Cursor::new(subslice)) {
+                        Ok(OFile::MachFile { header, commands }) => {
+                            header.cputype == mach_object::CPU_TYPE_ARM
+                                && header.cpusubtype == arch.cpusubtype
+                                && arm_subtype_priority(header.cpusubtype).is_some()
+                                && !header.is_64bit()
+                                && !header.is_bigend()
+                                && validate_segment_ranges(&commands, subslice.len()).is_ok()
+                        }
+                        _ => false,
+                    };
+                    if !usable {
+                        log!(
+                            "Skipping invalid ARM FAT slice at {:#x} (subtype {:#x})",
+                            off,
+                            arch.cpusubtype
+                        );
+                        had_invalid_slice = true;
+                        continue;
+                    }
+                    if best_priority.map_or(true, |best| priority > best) {
+                        best_subslice = Some(subslice);
+                        best_priority = Some(priority);
                     }
                 }
                 return if let Some(subslice) = best_subslice {
                     MachO::load_from_bytes(subslice, into_mem, name, slide_to_address)
-                } else if had_truncated_slice {
-                    Err("FAT binary is truncated: declared ARM slice extends past end of file (the .ipa may be corrupt or incomplete)")
+                } else if had_invalid_slice {
+                    Err("FAT binary has no usable ARM slice: slices are truncated, malformed or unsupported (check the IPA)")
                 } else {
                     Err("No supported architecture in the fat binary")
                 };
@@ -333,11 +600,6 @@ impl MachO {
         if header.cputype != mach_object::CPU_TYPE_ARM {
             return Err("Executable is not for an ARM CPU!");
         }
-        log!(
-            "Loading {} slice for {:?}",
-            cpu_subtype_to_str(header.cpusubtype),
-            name
-        );
 
         let is_bigend = header.is_bigend();
         if is_bigend {
@@ -347,7 +609,24 @@ impl MachO {
         if is_64bit {
             return Err("Executable is not 32-bit!");
         }
-        // TODO: Check cpusubtype (should be some flavour of ARMv6/ARMv7)
+        if arm_subtype_priority(header.cpusubtype).is_none() {
+            log!(
+                "Rejecting {:?}: unsupported ARM CPU subtype {:#x}",
+                name,
+                header.cpusubtype
+            );
+            return Err("Unsupported ARM CPU subtype or capabilities (expected ARM_ALL, ARMv6, ARMv7, ARMv7f or ARMv7s)");
+        }
+
+        log!(
+            "Loading {} slice for {:?}",
+            cpu_subtype_to_str(header.cpusubtype),
+            name
+        );
+
+        // Do not mutate guest memory until every file-backed segment, including
+        // __LINKEDIT, is known to fit the selected thin image.
+        validate_segment_ranges(&commands, bytes.len())?;
 
         let split_segs = (header.flags & mach_object::MH_SPLIT_SEGS) != 0;
 
@@ -475,26 +754,10 @@ impl MachO {
                             let file_end = fileoff
                                 .checked_add(filesize_usize)
                                 .ok_or("Segment file range overflows host usize")?;
-                            if file_end > bytes.len() {
-                                log!(
-                                    "Warning: segment {} declares file range \
-                                     {:#x}..{:#x}, past end of Mach-O file \
-                                     ({:#x}); loading available bytes and \
-                                     leaving the rest zero-filled",
-                                    segname,
-                                    fileoff,
-                                    file_end,
-                                    bytes.len(),
-                                );
-                            }
-                            if fileoff < bytes.len() {
-                                let available_end = file_end.min(bytes.len());
-                                let src = &bytes[fileoff..available_end];
-                                let copy_len = src.len() as GuestUSize;
-                                let dst =
-                                    into_mem.bytes_at_mut(Ptr::from_bits(vmaddr + slide), copy_len);
-                                dst.copy_from_slice(src);
-                            }
+                            let src = &bytes[fileoff..file_end];
+                            let dst =
+                                into_mem.bytes_at_mut(Ptr::from_bits(vmaddr + slide), filesize);
+                            dst.copy_from_slice(src);
                         }
                     }
 
@@ -549,8 +812,21 @@ impl MachO {
                     nextrel,
                     ..
                 } => {
-                    let indirectsyms =
-                        &bytes[indirectsymoff as usize..][..nindirectsyms as usize * 4];
+                    let indirectsyms = {
+                        let start = indirectsymoff as usize;
+                        let len = nindirectsyms as usize * 4;
+                        if len == 0 || start >= bytes.len() || start + len > bytes.len() {
+                            log!(
+                                "Warning: indirect symbol table out of bounds (offset {:#x}, {} entries, file size {:#x}); skipping.",
+                                indirectsymoff,
+                                nindirectsyms,
+                                bytes.len()
+                            );
+                            &[][..]
+                        } else {
+                            &bytes[start..start + len]
+                        }
+                    };
                     for idx in indirectsyms.chunks(4) {
                         assert!(!is_bigend);
                         let idx = u32::from_le_bytes(idx.try_into().unwrap());
@@ -584,7 +860,25 @@ impl MachO {
                         })
                     }
 
-                    let extrels = &bytes[extreloff as usize..][..nextrel as usize * 8];
+                    let extrels = {
+                        let start = extreloff as usize;
+                        let len = nextrel as usize * 8;
+                        if len == 0 {
+                            // A zero-length external relocation table is normal
+                            // (no externally-relocated symbols) — don't warn.
+                            &[][..]
+                        } else if start >= bytes.len() || start + len > bytes.len() {
+                            log!(
+                                "Warning: external relocation table out of bounds (offset {:#x}, {} entries, file size {:#x}); skipping.",
+                                extreloff,
+                                nextrel,
+                                bytes.len()
+                            );
+                            &[][..]
+                        } else {
+                            &bytes[start..start + len]
+                        }
+                    };
                     for entry in extrels.chunks(8) {
                         let entry_arr: [u8; 8] = match entry.try_into() {
                             Ok(a) => a,
@@ -885,16 +1179,42 @@ impl MachO {
                     S_NON_LAZY_SYMBOL_POINTERS => (ST::NonLazySymbolPointers, Some(4)),
                     _ => (ST::Normal, None),
                 };
-                let dyld_indirect_symbol_info = dyld_entry_size.map(|entry_size| {
-                    let indirect_start = section.reserved1 as usize;
-                    assert!(size.is_multiple_of(entry_size));
-                    let indirect_count = (size / entry_size) as usize;
-                    let indirects = &mut indirect_undef_symbols[indirect_start..][..indirect_count];
-                    let syms = indirects.iter_mut().map(|sym| sym.take()).collect();
-                    DyldIndirectSymbolInfo {
-                        entry_size,
-                        indirect_undef_symbols: syms,
+                let dyld_indirect_symbol_info = dyld_entry_size.and_then(|entry_size| {
+                    if entry_size == 0 || !size.is_multiple_of(entry_size) {
+                        log!(
+                            "Warning: section {:?} has invalid entry size {} for size {:#x}; skipping indirect symbol info.",
+                            name,
+                            entry_size,
+                            size
+                        );
+                        return None;
                     }
+                    let indirect_start = section.reserved1 as usize;
+                    let indirect_count = (size / entry_size) as usize;
+                    // Corrupt or trimmed binaries (e.g. Bug Heroes Quest) can
+                    // declare an indirect symbol table that is past EOF; in
+                    // that case the table above was skipped and is empty.
+                    // Pad with anonymous entries instead of panicking: the
+                    // dyld code skips `None` entries gracefully.
+                    let indirects = match indirect_undef_symbols
+                        .get(indirect_start..)
+                        .and_then(|s| s.get(..indirect_count))
+                    {
+                        Some(s) => s.to_vec(),
+                        None => {
+                            log!(
+                                "Warning: indirect symbol entries [{}, {}) out of range for table of length {}; treating as anonymous.",
+                                indirect_start,
+                                indirect_start + indirect_count,
+                                indirect_undef_symbols.len()
+                            );
+                            vec![None; indirect_count]
+                        }
+                    };
+                    Some(DyldIndirectSymbolInfo {
+                        entry_size,
+                        indirect_undef_symbols: indirects,
+                    })
                 });
 
                 Section {
@@ -942,5 +1262,182 @@ impl MachO {
     /// Get a section by its name (`&str`) or type ([SectionType]).
     pub fn get_section<P: SectionPredicate>(&self, by: P) -> Option<&Section> {
         self.sections.iter().find(|section| by.test(section))
+    }
+}
+
+#[cfg(test)]
+mod segment_validation_tests {
+    use super::*;
+
+    #[test]
+    fn missing_file_bytes_are_not_bss() {
+        // Ranges from the BH Quest crash report.
+        assert!(validate_segment_file_range(0, 0x427000, 0x427000, 0x32fad0).is_err());
+        assert!(validate_segment_file_range(0x427000, 0x23000, 0x23000, 0x32fad0).is_err());
+        assert!(validate_segment_file_range(0x100, 0x100, 0x1000, 0x200).is_ok());
+        assert!(validate_segment_file_range(0x100, 0x100, 0x1000, 0x1ff).is_err());
+    }
+
+    #[test]
+    fn empty_segments_and_overflow() {
+        assert!(validate_segment_file_range(u64::MAX, 0, 0x1000, 0).is_ok());
+        assert!(validate_segment_file_range(0, 0, 0, 0).is_ok());
+        assert!(validate_segment_file_range(u64::MAX, 1, 1, usize::MAX).is_err());
+        assert!(validate_segment_file_range(0, 2, 1, 2).is_err());
+    }
+
+    // Minimal 32-bit ARM Mach-O with a single LC_SEGMENT and no sections.
+    fn thin(subtype: u32, address: u32, file_size: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for word in [0xfeedfaceu32, 12, subtype, 2, 1, 56, 0, 1, 56] {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        let mut name = [0u8; 16];
+        name[..6].copy_from_slice(b"__TEXT");
+        bytes.extend_from_slice(&name);
+        for word in [address, 0x2000, 0, file_size, 7, 5, 0, 0] {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        assert_eq!(bytes.len(), 84);
+        bytes
+    }
+
+    #[test]
+    fn thin_loader_rejects_truncation() {
+        let bytes = thin(6, 0x1000, 128);
+        let mut mem = Mem::new();
+        let result = MachO::load_from_bytes(&bytes, &mut mem, "truncated".into(), 0);
+        assert!(matches!(result, Err(e) if e.contains("extends past end of file")));
+    }
+
+    #[test]
+    fn fat_loader_falls_back_from_internally_truncated_armv7() {
+        let invalid = thin(9, 0x1000, 128); // ARMv7, preferred but incomplete
+        let valid = thin(6, 0x9000, 84); // ARMv6, complete with a virtual zero tail
+        let mut bytes = Vec::new();
+        for word in [0xcafebabeu32, 2, 12, 9, 48, 84, 0, 12, 6, 132, 84, 0] {
+            bytes.extend_from_slice(&word.to_be_bytes());
+        }
+        bytes.extend_from_slice(&invalid);
+        bytes.extend_from_slice(&valid);
+        let mut mem = Mem::new();
+        let image = MachO::load_from_bytes(&bytes, &mut mem, "fat-test".into(), 0).unwrap();
+        assert_eq!(image.text_base, 0x9000);
+        assert_eq!(
+            mem.bytes_at(Ptr::<u8, false>::from_bits(0x9000), 84),
+            &valid[..]
+        );
+        assert!(mem
+            .bytes_at(Ptr::<u8, false>::from_bits(0x9000 + 84), 16)
+            .iter()
+            .all(|&b| b == 0));
+    }
+
+    #[test]
+    fn arm_subtype_allowlist_and_capabilities() {
+        for subtype in [0, 6, 9, 10, 11] {
+            assert!(arm_subtype_priority(subtype).is_some());
+        }
+        for subtype in [
+            5u32,
+            7,
+            8,
+            12,
+            13,
+            14,
+            0x1234,
+            0x8000_0009,
+            0x0100_0006,
+            u32::MAX,
+        ] {
+            assert!(arm_subtype_priority(subtype as cpu_subtype_t).is_none());
+        }
+        let priorities: Vec<_> = [0, 6, 10, 11, 9]
+            .into_iter()
+            .map(|s| arm_subtype_priority(s).unwrap())
+            .collect();
+        assert!(priorities.windows(2).all(|p| p[0] < p[1]));
+    }
+
+    #[test]
+    fn thin_loader_rejects_unsupported_cpu_subtype() {
+        for subtype in [12, 13, 0x1234, 0x8000_0009] {
+            let bytes = thin(subtype, 0x1000, 84);
+            let mut mem = Mem::new();
+            let result = MachO::load_from_bytes(&bytes, &mut mem, "unsupported".into(), 0);
+            assert!(matches!(result, Err(e) if e.contains("Unsupported ARM CPU subtype")));
+        }
+    }
+
+    fn fat_pair(first_type: u32, first: &[u8], second_type: u32, second: &[u8]) -> Vec<u8> {
+        assert_eq!((first.len(), second.len()), (84, 84));
+        let mut bytes = Vec::new();
+        for word in [
+            0xcafebabeu32,
+            2,
+            12,
+            first_type,
+            48,
+            84,
+            0,
+            12,
+            second_type,
+            132,
+            84,
+            0,
+        ] {
+            bytes.extend_from_slice(&word.to_be_bytes());
+        }
+        bytes.extend_from_slice(first);
+        bytes.extend_from_slice(second);
+        bytes
+    }
+
+    #[test]
+    fn fat_loader_skips_unsupported_and_mismatched_subtypes() {
+        for (table_subtype, header_subtype) in [(12, 12), (9, 6), (9, 13)] {
+            let bytes = fat_pair(
+                table_subtype,
+                &thin(header_subtype, 0x1000, 84),
+                6,
+                &thin(6, 0x9000, 84),
+            );
+            let mut mem = Mem::new();
+            let image = MachO::load_from_bytes(&bytes, &mut mem, "subtypes".into(), 0).unwrap();
+            assert_eq!(image.text_base, 0x9000);
+        }
+    }
+
+    #[test]
+    fn fat_loader_prefers_armv7_regardless_of_slice_order() {
+        for reverse in [false, true] {
+            let v6 = thin(6, 0x1000, 84);
+            let v7 = thin(9, 0x9000, 84);
+            let bytes = if reverse {
+                fat_pair(9, &v7, 6, &v6)
+            } else {
+                fat_pair(6, &v6, 9, &v7)
+            };
+            let mut mem = Mem::new();
+            let image = MachO::load_from_bytes(&bytes, &mut mem, "preference".into(), 0).unwrap();
+            assert_eq!(image.text_base, 0x9000);
+        }
+    }
+
+    #[test]
+    fn fat_loader_rejects_images_with_no_supported_subtype() {
+        let bytes = fat_pair(12, &thin(12, 0x1000, 84), 13, &thin(13, 0x9000, 84));
+        let mut mem = Mem::new();
+        assert!(MachO::load_from_bytes(&bytes, &mut mem, "unsupported-fat".into(), 0).is_err());
+    }
+
+    #[test]
+    fn thin_loader_accepts_supported_cpu_subtypes() {
+        for subtype in [0, 6, 9, 10, 11] {
+            let bytes = thin(subtype, 0x9000, 84);
+            let mut mem = Mem::new();
+            let image = MachO::load_from_bytes(&bytes, &mut mem, "supported".into(), 0).unwrap();
+            assert_eq!(image.text_base, 0x9000);
+        }
     }
 }

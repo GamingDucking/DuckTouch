@@ -37,6 +37,7 @@
 //! the `NSURLConnection` stub's rationale: faking `200 OK` with empty data
 //! crashes apps that parse protocol-specific fields from the body.
 
+use super::NSUInteger;
 use crate::abi::{CallFromHost, GuestFunction};
 use crate::mem::{ConstVoidPtr, Ptr};
 use crate::objc::{
@@ -82,6 +83,10 @@ struct NSURLSessionConfigurationHostObject {
     identifier: id,
     allows_cellular_access: bool,
     http_additional_headers: id,
+    /// `NSURLCache *`, retained when explicitly supplied by the guest.
+    url_cache: id,
+    /// NSURLRequestCachePolicy / NSUInteger.
+    request_cache_policy: NSUInteger,
     timeout_interval_for_request: f64,
     timeout_interval_for_resource: f64,
 }
@@ -299,6 +304,8 @@ pub const CLASSES: ClassExports = objc_classes! {
             .objc
             .borrow_mut::<NSURLSessionConfigurationHostObject>(this);
         host.allows_cellular_access = true;
+        // NSURLRequestUseProtocolCachePolicy is the documented default.
+        host.request_cache_policy = 0;
         // Apple defaults: 60s request timeout, 7 days resource timeout.
         host.timeout_interval_for_request = 60.0;
         host.timeout_interval_for_resource = 604800.0;
@@ -340,6 +347,34 @@ pub const CLASSES: ClassExports = objc_classes! {
     release(env, old);
 }
 
+- (id)URLCache {
+    env.objc
+        .borrow::<NSURLSessionConfigurationHostObject>(this)
+        .url_cache
+}
+- (())setURLCache:(id)url_cache {
+    retain(env, url_cache);
+    let old = env
+        .objc
+        .borrow::<NSURLSessionConfigurationHostObject>(this)
+        .url_cache;
+    env.objc
+        .borrow_mut::<NSURLSessionConfigurationHostObject>(this)
+        .url_cache = url_cache;
+    release(env, old);
+}
+
+- (NSUInteger)requestCachePolicy {
+    env.objc
+        .borrow::<NSURLSessionConfigurationHostObject>(this)
+        .request_cache_policy
+}
+- (())setRequestCachePolicy:(NSUInteger)policy {
+    env.objc
+        .borrow_mut::<NSURLSessionConfigurationHostObject>(this)
+        .request_cache_policy = policy;
+}
+
 - (f64)timeoutIntervalForRequest {
     env.objc
         .borrow::<NSURLSessionConfigurationHostObject>(this)
@@ -366,12 +401,14 @@ pub const CLASSES: ClassExports = objc_classes! {
     let &NSURLSessionConfigurationHostObject {
         identifier,
         http_additional_headers,
+        url_cache,
         ..
     } = env
         .objc
         .borrow::<NSURLSessionConfigurationHostObject>(this);
     release(env, identifier);
     release(env, http_additional_headers);
+    release(env, url_cache);
     env.objc.dealloc_object(this, &mut env.mem);
 }
 

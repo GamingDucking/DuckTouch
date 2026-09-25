@@ -73,7 +73,20 @@ pub fn gradient_color_at(
     gradient: CGGradientRef,
     t: CGFloat,
 ) -> (CGFloat, CGFloat, CGFloat, CGFloat) {
-    let stops = &env.objc.borrow::<CGGradientHostObject>(gradient).stops;
+    color_at(&env.objc.borrow::<CGGradientHostObject>(gradient).stops, t)
+}
+
+/// Snapshot stops once so rasterisation can mutably borrow guest bitmap memory
+/// without repeatedly borrowing the gradient host object for every pixel.
+pub(super) fn color_sampler(
+    env: &Environment,
+    gradient: CGGradientRef,
+) -> impl Fn(CGFloat) -> (CGFloat, CGFloat, CGFloat, CGFloat) {
+    let stops = env.objc.borrow::<CGGradientHostObject>(gradient).stops.clone();
+    move |t| color_at(&stops, t)
+}
+
+fn color_at(stops: &[ColorStop], t: CGFloat) -> (CGFloat, CGFloat, CGFloat, CGFloat) {
     if stops.is_empty() {
         return (0.0, 0.0, 0.0, 1.0);
     }

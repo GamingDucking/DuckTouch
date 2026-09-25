@@ -85,12 +85,12 @@ impl ClassHostObject {
         for i in 0..count {
             let ivar_ptr: ConstPtr<ivar_t> = Ptr::from_bits(ivars_base_ptr.to_bits() + i * entsize);
 
-            // TODO: support type strings
             let ivar_t {
                 offset,
                 name,
                 alignment,
-                ..
+                type_,
+                size,
             } = mem.read(ivar_ptr);
 
             let Ok(name_string) = mem.cstr_at_utf8(name) else {
@@ -100,6 +100,20 @@ impl ClassHostObject {
                 );
                 continue;
             };
+            // Only plain scalar types, never pointers, objects or aggregates.
+            self.scalar_ivars.remove(name_string);
+            if let Some(bytes) = mem.get_bytes_fallible(type_.cast(), 2) {
+                let code = bytes[0];
+                let width = match code {
+                    b'c' | b'C' => 1,
+                    b's' | b'S' => 2,
+                    b'i' | b'I' | b'l' | b'L' | b'f' => 4,
+                    _ => 0,
+                };
+                if bytes[1] == 0 && width != 0 && size == width {
+                    self.scalar_ivars.insert(name_string.into(), (code, width));
+                }
+            }
             self.ivars.insert(name_string.into(), (offset, alignment));
         }
     }
@@ -153,6 +167,41 @@ impl ClassHostObject {
 }
 
 impl ObjC {
+    /// Identify an exact scalar field on a registered object. This diagnostic
+    /// never messages guest objects or invokes the permissive fake-borrow path.
+    /// The caller supplies the live allocation containing the candidate.
+    pub(crate) fn diagnostic_scalar_field(
+        &self, mem: &Mem, base: u32, allocation_size: u32, addr: u32,
+        width: u32, encoding: u8,
+    ) -> Option<&str> {
+        let object = id::from_bits(base);
+        self.get_host_object(object)?;
+        let offset = addr.checked_sub(base)?;
+        if offset < 4 || offset.checked_add(width)? > allocation_size { return None; }
+        let bytes = mem.get_bytes_fallible(ConstVoidPtr::from_bits(base), 4)?;
+        let mut class = id::from_bits(u32::from_le_bytes(bytes.try_into().ok()?));
+        let mut budget = 256usize;
+        for _ in 0..16 {
+            let host = self.get_host_object(class)?.as_any()
+                .downcast_ref::<ClassHostObject>()?;
+            if host.is_metaclass { return None; }
+            for (name, &(code, size)) in &host.scalar_ivars {
+                budget = budget.checked_sub(1)?;
+                let code = match code { b'l' => b'i', b'L' => b'I', _ => code };
+                if code != encoding || size != width { continue; }
+                let (pointer, _) = host.ivars.get(name)?;
+                let bytes = mem.get_bytes_fallible(pointer.cast(), 4)?;
+                let field_offset = u32::from_le_bytes(bytes.try_into().ok()?);
+                if field_offset == offset && offset.checked_add(width)? <= host.instance_size {
+                    return Some(name);
+                }
+            }
+            if host.superclass == nil { break; }
+            class = host.superclass;
+        }
+        None
+    }
+
     /// Checks if the object's class has an ivar in its class chain with the
     /// provided name and returns the pointer to the object's ivar, if any,
     /// or None if the object's class doesn't have an ivar with that name.
@@ -551,3 +600,59 @@ macro_rules! todo_objc_setter {
     };
 }
 pub use crate::todo_objc_setter;
+
+#[cfg(test)]
+mod trainer_metadata_tests {
+    use super::*;
+    use crate::mem::PAGE_SIZE;
+    use crate::objc::TrivialHostObject;
+
+    #[test]
+    fn exact_field_requires_registered_object_offset_width_and_scalar_type() {
+        let mut mem = Mem::new();
+        mem.set_null_segment_size(PAGE_SIZE);
+        let mut objc = ObjC::new();
+        let offset = mem.alloc_and_write(8u32).cast_const();
+        let mut host = ClassHostObject { instance_size: 16, ..Default::default() };
+        host.ivars.insert("_coins".into(), (offset, 2));
+        host.scalar_ivars.insert("_coins".into(), (b'i', 4));
+        let class = objc.alloc_static_object(nil, Box::new(host), &mut mem);
+        let object = objc.alloc_object_sized(class, 16, Box::new(TrivialHostObject), &mut mem);
+        let base = object.to_bits();
+        assert_eq!(objc.diagnostic_scalar_field(&mem, base, 16, base + 8, 4, b'i'), Some("_coins"));
+        assert_eq!(objc.diagnostic_scalar_field(&mem, base, 16, base + 9, 4, b'i'), None);
+        assert_eq!(objc.diagnostic_scalar_field(&mem, base, 16, base + 8, 1, b'C'), None);
+        assert_eq!(objc.diagnostic_scalar_field(&mem, base, 16, base + 8, 4, b'f'), None);
+        assert_eq!(objc.diagnostic_scalar_field(&mem, base, 8, base + 8, 4, b'i'), None);
+        let subclass = objc.alloc_static_object(nil, Box::new(ClassHostObject {
+            superclass: class, instance_size: 16, ..Default::default()
+        }), &mut mem);
+        let inherited = objc.alloc_object_sized(subclass, 16, Box::new(TrivialHostObject), &mut mem).to_bits();
+        assert_eq!(objc.diagnostic_scalar_field(&mem, inherited, 16, inherited + 8, 4, b'i'), Some("_coins"));
+        // A corrupt superclass cycle is bounded instead of hanging the trainer.
+        objc.borrow_mut::<ClassHostObject>(class).superclass = subclass;
+        assert_eq!(objc.diagnostic_scalar_field(&mem, inherited, 16, inherited + 12, 4, b'i'), None);
+        // Same isa bytes in an arbitrary allocation are NOT proof of an object.
+        let raw = mem.alloc(16);
+        mem.write(raw.cast(), class);
+        assert_eq!(objc.diagnostic_scalar_field(&mem, raw.to_bits(), 16, raw.to_bits() + 8, 4, b'i'), None);
+    }
+
+    #[test]
+    fn binary_metadata_rejects_pointer_fields_even_if_named_money() {
+        let mut mem = Mem::new();
+        mem.set_null_segment_size(PAGE_SIZE);
+        let offset = mem.alloc_and_write(8u32).cast_const();
+        let name = mem.alloc_and_write_cstr(b"_money").cast_const();
+        let size = guest_size_of::<ivar_t>();
+        let list: MutPtr<ivar_list_t> = mem.alloc(guest_size_of::<ivar_list_t>() + size).cast();
+        mem.write(list, ivar_list_t { entsize: size, count: 1 });
+        let mut host = ClassHostObject::default();
+        for (encoding, expected) in [(b"i".as_slice(), true), (b"@".as_slice(), false), (b"^i".as_slice(), false)] {
+            let type_ = mem.alloc_and_write_cstr(encoding).cast_const();
+            mem.write((list + 1).cast(), ivar_t { offset, name, type_, alignment: 2, size: 4 });
+            host.add_ivars_from_bin(list.cast_const(), &mem);
+            assert_eq!(host.scalar_ivars.contains_key("_money"), expected);
+        }
+    }
+}

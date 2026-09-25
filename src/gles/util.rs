@@ -255,13 +255,21 @@ pub fn try_decode_pvrtc(
         return true;
     }
 
+    // RGB PVRTC is opaque by definition; force its decoded alpha channel to
+    // 0xff.
     let is_opaque = matches!(
         internalformat,
         gles11::COMPRESSED_RGB_PVRTC_4BPPV1_IMG | gles11::COMPRESSED_RGB_PVRTC_2BPPV1_IMG
     );
     let upload_format = gles11::RGBA;
-    let pixels =
-        crate::image::decode_pvrtc_with_alpha(pvrtc_data, is_2bit, width_u, height_u, is_opaque);
+
+    let pixels = crate::image::decode_pvrtc_with_alpha(
+        pvrtc_data,
+        is_2bit,
+        width_u,
+        height_u,
+        is_opaque,
+    );
     unsafe {
         gles.TexImage2D(
             target,

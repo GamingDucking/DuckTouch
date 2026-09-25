@@ -63,6 +63,14 @@ struct AudioQueueHostObject {
     volume: f32,
     /// Stereo pan, -1.0 (full left) .. 1.0 (full right), 0.0 (centered).
     pan: f32,
+    /// Playback rate (kAudioQueueParam_PlayRate). 1.0 = normal speed.
+    play_rate: f32,
+    /// Pitch offset in cents (kAudioQueueParam_Pitch), -1200..1200.
+    pitch: f32,
+    /// Stored kAudioQueueParam_VolumeRampTime (seconds).
+    volume_ramp_time: f32,
+    /// Stored kAudioQueueProperty_EnableLevelMetering value.
+    level_metering_enabled: bool,
     buffers: Vec<AudioQueueBufferRef>,
     /// There is also a queue of OpenAL buffers, which must be kept in sync:
     /// the nth item in this queue must also be the nth item in the OpenAL
@@ -135,6 +143,19 @@ pub type AudioQueueOutputCallback = GuestFunction;
 
 type AudioQueueParameterID = u32;
 pub const kAudioQueueParam_Volume: AudioQueueParameterID = 1;
+// `kAudioQueueParam_PlayRate` per Apple's `AudioQueue.h`: playback rate as a
+// fraction of normal speed (0.5 .. 2.0 on real hardware). Implemented with
+// OpenAL's per-source `AL_PITCH`, which resamples the source (changing both
+// speed and pitch) — close enough for game SFX/music speed-up effects.
+pub const kAudioQueueParam_PlayRate: AudioQueueParameterID = 2;
+// `kAudioQueueParam_Pitch` per Apple's `AudioQueue.h`: pitch shift in half
+// steps (-24 .. 24), 0 = normal. Approximated with `AL_PITCH` as 2^(pitch/12)
+// (OpenAL can't shift pitch without also changing tempo).
+pub const kAudioQueueParam_Pitch: AudioQueueParameterID = 3;
+// `kAudioQueueParam_VolumeRampTime` per Apple's `AudioQueue.h`: duration in
+// seconds over which volume changes are ramped. Stored for get; ramps are
+// applied instantly.
+pub const kAudioQueueParam_VolumeRampTime: AudioQueueParameterID = 4;
 // `kAudioQueueParam_Pan` per Apple's `AudioQueue.h`. Range -1.0 (full left)
 // to 1.0 (full right). Mirrors `AVAudioPlayer.pan`.
 pub const kAudioQueueParam_Pan: AudioQueueParameterID = 13;
@@ -147,6 +168,15 @@ const kAudioQueueProperty_MagicCookie: AudioQueuePropertyID = fourcc(b"aqmc");
 const kAudioQueueProperty_StreamDescription: AudioQueuePropertyID = fourcc(b"aqft");
 const kAudioQueueProperty_MaximumOutputPacketSize: AudioQueuePropertyID = fourcc(b"aqmv");
 const kAudioQueueProperty_EnableLevelMetering: AudioQueuePropertyID = fourcc(b"aqme");
+/// `kAudioQueueDeviceProperty_SampleRate` ('devr') from Apple's
+/// `AudioQueue.h`: the hardware sample rate the queue plays at. We always
+/// play at the format's native rate, so this reports the queue's format
+/// sample rate.
+const kAudioQueueProperty_DeviceSampleRate: AudioQueuePropertyID = fourcc(b"devr");
+/// `kAudioQueueDeviceProperty_NumberChannels` ('dev#') from Apple's
+/// `AudioQueue.h`: the number of channels the device mixes. Reports the
+/// queue format's channel count.
+const kAudioQueueProperty_DeviceNumberChannels: AudioQueuePropertyID = fourcc(b"dev#");
 /// `kAudioQueueProperty_HardwareCodecPolicy` from Apple's `AudioQueue.h`.
 /// Controls whether the queue uses hardware or software codecs. touchHLE only
 /// ships software codecs (the host has no audio hardware codec), so this is
@@ -237,6 +267,10 @@ pub fn AudioQueueNewOutput(
         run_loop: in_callback_run_loop,
         volume: 1.0,
         pan: 0.0,
+        play_rate: 1.0,
+        pitch: 0.0,
+        volume_ramp_time: 0.0,
+        level_metering_enabled: false,
         buffers: Vec::new(),
         buffer_queue: VecDeque::new(),
         is_running: AudioQueueIsRunning::Stopped,
@@ -302,7 +336,9 @@ fn apply_al_pan(context: &OpenAL<'_>, al_source: ALuint, pan: f32) {
         );
         // Panning is purely cosmetic; if the driver rejects any of these calls
         // just clear the error rather than crashing the whole emulator.
-        let _ = context.GetError();
+        unsafe {
+            let _ = context.GetError();
+        }
     }
 }
 
@@ -324,6 +360,18 @@ pub fn AudioQueueGetParameter(
     match in_param_id {
         kAudioQueueParam_Volume => {
             env.mem.write(out_value, host_object.volume);
+            0
+        }
+        kAudioQueueParam_PlayRate => {
+            env.mem.write(out_value, host_object.play_rate);
+            0
+        }
+        kAudioQueueParam_Pitch => {
+            env.mem.write(out_value, host_object.pitch);
+            0
+        }
+        kAudioQueueParam_VolumeRampTime => {
+            env.mem.write(out_value, host_object.volume_ramp_time);
             0
         }
         kAudioQueueParam_Pan => {
@@ -378,6 +426,61 @@ pub fn AudioQueueSetParameter(
                     context.Sourcef(al_source, al::AL_MAX_GAIN, clamped);
                 }
             }
+            0
+        }
+        kAudioQueueParam_PlayRate => {
+            // Playback speed: clamp to the hardware range and feed OpenAL's
+            // per-source pitch (resampling). Stored even when no source is
+            // live yet; `AudioQueueStart`/enqueue re-applies it.
+            let clamped = in_value.clamp(0.5, 2.0);
+            host_object.play_rate = clamped;
+            let al_source = host_object.al_source;
+            log_dbg!(
+                "AudioQueueSetParameter kAudioQueueParam_PlayRate is set to {}",
+                clamped
+            );
+            if let Some(al_source) = al_source {
+                let context = env
+                    .framework_state
+                    .audio_toolbox
+                    .make_al_context_current(&mut env.openal_manager);
+                unsafe {
+                    context.Sourcef(al_source, al::AL_PITCH, clamped);
+                }
+                unsafe {
+                    let _ = context.GetError();
+                }
+            }
+            0
+        }
+        kAudioQueueParam_Pitch => {
+            // Pitch shift in half steps (-24..24). OpenAL can't shift pitch
+            // without tempo, approximate with 2^(pitch/12).
+            let clamped = in_value.clamp(-24.0, 24.0);
+            host_object.pitch = clamped;
+            let al_source = host_object.al_source;
+            log_dbg!(
+                "AudioQueueSetParameter kAudioQueueParam_Pitch is set to {}",
+                clamped
+            );
+            if let Some(al_source) = al_source {
+                let context = env
+                    .framework_state
+                    .audio_toolbox
+                    .make_al_context_current(&mut env.openal_manager);
+                unsafe {
+                    context.Sourcef(al_source, al::AL_PITCH, 2.0f32.powf(clamped / 12.0));
+                }
+                unsafe {
+                    let _ = context.GetError();
+                }
+            }
+            0
+        }
+        kAudioQueueParam_VolumeRampTime => {
+            // Stored for Get; volume changes are applied instantly because
+            // OpenAL has no ramp support.
+            host_object.volume_ramp_time = in_value.max(0.0);
             0
         }
         kAudioQueueParam_Pan => {
@@ -590,6 +693,8 @@ fn property_size(property_id: AudioQueuePropertyID) -> Option<GuestUSize> {
         kAudioQueueProperty_MaximumOutputPacketSize => Some(guest_size_of::<u32>()),
         kAudioQueueProperty_EnableLevelMetering => Some(guest_size_of::<u32>()),
         kAudioQueueProperty_HardwareCodecPolicy => Some(guest_size_of::<u32>()),
+        kAudioQueueProperty_DeviceSampleRate => Some(guest_size_of::<f64>()),
+        kAudioQueueProperty_DeviceNumberChannels => Some(guest_size_of::<u32>()),
         _ => None,
     }
 }
@@ -692,9 +797,26 @@ fn AudioQueueGetProperty(
                 max_packet
             );
         }
+        kAudioQueueProperty_StreamDescription => {
+            env.mem.write(out_property_data.cast(), host_object.format);
+        }
+        kAudioQueueProperty_DeviceSampleRate => {
+            env.mem.write(
+                out_property_data.cast::<f64>(),
+                host_object.format.sample_rate,
+            );
+        }
+        kAudioQueueProperty_DeviceNumberChannels => {
+            env.mem.write(
+                out_property_data.cast::<u32>(),
+                host_object.format.channels_per_frame,
+            );
+        }
         kAudioQueueProperty_EnableLevelMetering => {
-            // Level metering is not implemented; report it as disabled (0).
-            env.mem.write(out_property_data.cast::<u32>(), 0u32);
+            env.mem.write(
+                out_property_data.cast::<u32>(),
+                u32::from(host_object.level_metering_enabled),
+            );
         }
         kAudioQueueProperty_HardwareCodecPolicy => {
             env.mem.write(
@@ -770,13 +892,18 @@ fn AudioQueueSetProperty(
             0 // success
         }
         kAudioQueueProperty_EnableLevelMetering => {
-            // We don't implement level metering, but we accept the write so
-            // the caller's setup code keeps going. The matching getter
-            // always reports metering as disabled.
             let required = guest_size_of::<u32>();
             if in_data_size < required || in_property_data.is_null() {
                 return kAudioQueueErr_InvalidPropertySize;
             }
+            let enabled = env.mem.read(in_property_data.cast::<u32>()) != 0;
+            let Some(host_object) = State::get(&mut env.framework_state)
+                .audio_queues
+                .get_mut(&in_aq)
+            else {
+                return kAudioQueueErr_InvalidProperty;
+            };
+            host_object.level_metering_enabled = enabled;
             0 // success
         }
         _ => {
@@ -951,6 +1078,26 @@ pub fn is_supported_audio_format(format: &AudioStreamBasicDescription) -> bool {
         kAudioFormatMPEG4AAC => channels_per_frame == 1 || channels_per_frame == 2,
         _ => false,
     }
+}
+
+fn downmix_i16_to_mono(pcm: &[u8], channels: u32) -> Vec<u8> {
+    let channels = channels as usize;
+    let Some(frame_size) = channels.checked_mul(2) else {
+        return Vec::new();
+    };
+    if channels < 2 {
+        return pcm.to_vec();
+    }
+    let mut mono = Vec::with_capacity(pcm.len() / channels);
+    for frame in pcm.chunks_exact(frame_size) {
+        let sum: i64 = frame
+            .chunks_exact(2)
+            .map(|sample| i16::from_le_bytes([sample[0], sample[1]]) as i64)
+            .sum();
+        let sample = (sum / channels as i64).clamp(i16::MIN as i64, i16::MAX as i64) as i16;
+        mono.extend_from_slice(&sample.to_le_bytes());
+    }
+    mono
 }
 
 pub fn decode_buffer(
@@ -1188,19 +1335,21 @@ pub fn decode_buffer(
                     Vec::new(),
                 );
             };
-            let al_format = match decoded.channels {
-                1 => al::AL_FORMAT_MONO16,
-                2 => al::AL_FORMAT_STEREO16,
+            let (al_format, pcm) = match decoded.channels {
+                1 => (al::AL_FORMAT_MONO16, decoded.bytes),
+                2 => (al::AL_FORMAT_STEREO16, decoded.bytes),
                 other => {
                     log!(
-                        "Warning: decode_buffer: MP3/AAC produced unsupported \
-                         channel count {}; downmixing to mono.",
+                        "Warning: decode_buffer: MP3/AAC produced unsupported channel count {}; downmixing to mono.",
                         other
                     );
-                    al::AL_FORMAT_MONO16
+                    (
+                        al::AL_FORMAT_MONO16,
+                        downmix_i16_to_mono(&decoded.bytes, other),
+                    )
                 }
             };
-            (al_format, decoded.sample_rate as ALsizei, decoded.bytes)
+            (al_format, decoded.sample_rate as ALsizei, pcm)
         }
         _ => {
             // Copy values out of the packed struct before formatting to
@@ -1261,7 +1410,9 @@ fn prime_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
         // silent instead of panicking.
         let err = unsafe {
             // Clear any pre-existing error so we only observe GenSources'.
-            let _ = context.GetError();
+            unsafe {
+                let _ = context.GetError();
+            }
             context.GenSources(1, &mut al_source);
             context.GetError()
         };
@@ -1276,14 +1427,18 @@ fn prime_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
             if al_source != 0 {
                 unsafe {
                     context.DeleteSources(1, &al_source);
-                    let _ = context.GetError();
+                    unsafe {
+                        let _ = context.GetError();
+                    }
                 }
             }
             return;
         }
         unsafe {
             context.Sourcef(al_source, al::AL_MAX_GAIN, volume);
-            let _ = context.GetError();
+            unsafe {
+                let _ = context.GetError();
+            }
         };
         apply_al_pan(&context, al_source, pan);
         host_object.al_source = Some(al_source);
@@ -1629,8 +1784,6 @@ pub fn AudioQueueStart(
     };
 
     if is_supported_audio_format(&host_object.format) {
-        host_object.is_running = AudioQueueIsRunning::Running;
-
         let Some(al_source) = host_object.al_source else {
             // prime_audio_queue should have created the OpenAL source, but
             // it bails out early for unsupported formats and missing
@@ -1640,8 +1793,9 @@ pub fn AudioQueueStart(
                  priming; skipping playback.",
                 in_aq
             );
-            return 0;
+            return kAudioQueueErr_InvalidProperty;
         };
+        host_object.is_running = AudioQueueIsRunning::Running;
         unsafe { context.SourcePlay(al_source) };
         assert!(unsafe { context.GetError() } == 0);
     } else {
@@ -1649,7 +1803,7 @@ pub fn AudioQueueStart(
             "AudioQueueStart: Unsupported format {:?}, not starting",
             host_object.format
         );
-        return 0;
+        return kAudioQueueErr_InvalidProperty;
     }
 
     notify_aq_is_running(env, in_aq);
@@ -1911,6 +2065,10 @@ pub fn AudioQueueNewInput(
         run_loop: in_callback_run_loop,
         volume: 1.0,
         pan: 0.0,
+        play_rate: 1.0,
+        pitch: 0.0,
+        volume_ramp_time: 0.0,
+        level_metering_enabled: false,
         buffers: Vec::new(),
         buffer_queue: VecDeque::new(),
         is_running: AudioQueueIsRunning::Stopped,
@@ -1962,3 +2120,29 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(AudioQueueDispose(_, _)),
     export_c_func!(AudioQueueNewInput(_, _, _, _, _, _, _)),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::downmix_i16_to_mono;
+
+    #[test]
+    fn downmix_averages_each_interleaved_frame() {
+        let samples = [12000i16, -6000, 0, i16::MIN, i16::MAX, -32768];
+        let input = samples
+            .into_iter()
+            .flat_map(i16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let output = downmix_i16_to_mono(&input, 3);
+        let decoded = output
+            .chunks_exact(2)
+            .map(|sample| i16::from_le_bytes([sample[0], sample[1]]))
+            .collect::<Vec<_>>();
+        assert_eq!(decoded, [2000, -10923]);
+    }
+
+    #[test]
+    fn downmix_drops_incomplete_frames() {
+        let input = [0x01, 0x00, 0x02];
+        assert!(downmix_i16_to_mono(&input, 2).is_empty());
+    }
+}

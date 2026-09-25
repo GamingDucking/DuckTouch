@@ -26,6 +26,7 @@ pub mod ab_people_picker_navigation_controller;
 pub mod asidentifier_manager;
 pub mod chipmunk_space;
 pub mod ns_array;
+pub mod ns_attributed_string;
 pub mod ns_assertion_handler;
 pub mod ns_autorelease_pool;
 pub mod ns_bundle;
@@ -57,6 +58,7 @@ pub mod ns_keyed_archiver;
 pub mod ns_keyed_unarchiver;
 pub mod ns_locale;
 pub mod ns_lock;
+pub mod ns_map_table;
 pub mod ns_log;
 pub mod ns_metadata_query;
 pub mod ns_notification;
@@ -85,12 +87,14 @@ pub mod ns_time_zone;
 pub mod ns_timer;
 pub mod ns_ubiquitous_key_value_store;
 pub mod ns_undo_manager;
+pub mod ns_net_service;
 pub mod ns_url;
+pub mod ns_user_defaults;
+pub mod url_protocol;
 pub mod ns_url_connection;
 pub mod ns_url_request;
 pub mod ns_url_response;
 pub mod ns_url_session;
-pub mod ns_user_defaults;
 pub mod ns_uuid;
 pub mod ns_value;
 pub mod ns_xml_parser;
@@ -866,6 +870,10 @@ pub const STUB_CONSTANTS: ConstantExports = &[
         HostConstant::NSString("kMDItemFSContentChangeDate"),
     ),
     (
+        "_NSMetadataItemFSSizeKey",
+        HostConstant::NSString("kMDItemFSSize"),
+    ),
+    (
         "_NSMetadataUbiquitousItemIsDownloadedKey",
         HostConstant::NSString("NSMetadataUbiquitousItemIsDownloadedKey"),
     ),
@@ -1496,6 +1504,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         asidentifier_manager::CLASSES,
         chipmunk_space::CLASSES,
         ns_array::CLASSES,
+        ns_attributed_string::CLASSES,
         ns_assertion_handler::CLASSES,
         ns_autorelease_pool::CLASSES,
         ns_bundle::CLASSES,
@@ -1526,6 +1535,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ns_keyed_unarchiver::CLASSES,
         ns_locale::CLASSES,
         ns_lock::CLASSES,
+        ns_map_table::CLASSES,
         ns_metadata_query::CLASSES,
         ns_notification::CLASSES,
         ns_notification_center::CLASSES,
@@ -1553,11 +1563,13 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ns_timer::CLASSES,
         ns_ubiquitous_key_value_store::CLASSES,
         ns_undo_manager::CLASSES,
+        ns_net_service::CLASSES,
         ns_url::CLASSES,
         ns_url_connection::CLASSES,
         ns_url_request::CLASSES,
         ns_url_response::CLASSES,
         ns_url_session::CLASSES,
+        url_protocol::CLASSES,
         ns_user_defaults::CLASSES,
         ns_uuid::CLASSES,
         ns_value::CLASSES,
@@ -1603,6 +1615,7 @@ pub struct State {
     pub ns_undo_manager: ns_undo_manager::State,
     ns_user_defaults: ns_user_defaults::State,
     ns_url_session: ns_url_session::State,
+    url_protocol: url_protocol::State,
     /// Singleton for [NSURLCache sharedURLCache].
     pub url_cache_singleton: crate::objc::id,
 }
@@ -1619,7 +1632,7 @@ pub type NSUInteger = u32;
 // this should be equal to NSIntegerMax
 pub const NSNotFound: i32 = 0x7fffffff;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 #[repr(C, packed)]
 pub struct NSRange {
     pub location: NSUInteger,
