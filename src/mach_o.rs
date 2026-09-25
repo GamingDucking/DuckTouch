@@ -1304,8 +1304,14 @@ mod segment_validation_tests {
         let mut mem = Mem::new();
         let image = MachO::load_from_bytes(&bytes, &mut mem, "fat-test".into(), 0).unwrap();
         assert_eq!(image.text_base, 0x9000);
-        assert_eq!(mem.bytes_at(Ptr::from_bits(0x9000), 84), &valid[..]);
-        assert!(mem.bytes_at(Ptr::from_bits(0x9000 + 84), 16).iter().all(|&b| b == 0));
+        assert_eq!(
+            mem.bytes_at(Ptr::<u8, false>::from_bits(0x9000), 84),
+            &valid[..]
+        );
+        assert!(mem
+            .bytes_at(Ptr::<u8, false>::from_bits(0x9000 + 84), 16)
+            .iter()
+            .all(|&b| b == 0));
     }
 
     #[test]

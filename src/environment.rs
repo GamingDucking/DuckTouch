@@ -214,6 +214,40 @@ struct BinaryDependencyNode {
     dependencies: Vec<String>,
 }
 
+fn canonicalize_dylib_path(path: &str) -> String {
+    let (directory, name) = path.rsplit_once('/').unwrap_or(("", path));
+    let canonical_name = match name {
+        "libstdc++.6.dylib" => "libstdc++.6.0.9.dylib",
+        "libz.1.dylib" | "libz.dylib" | "libz.1.1.3.dylib" => "libz.1.2.3.dylib",
+        "libsqlite3.0.dylib" => "libsqlite3.dylib",
+        _ => name,
+    };
+    if directory.is_empty() {
+        canonical_name.to_owned()
+    } else {
+        format!("{directory}/{canonical_name}")
+    }
+}
+
+fn load_transitive_dependencies<T>(
+    roots: &[String],
+    mut load: impl FnMut(&str) -> Result<Option<(T, Vec<String>)>, String>,
+) -> Result<Vec<T>, String> {
+    let mut pending: VecDeque<String> = roots.iter().cloned().collect();
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut loaded = Vec::new();
+    while let Some(path) = pending.pop_front() {
+        if !visited.insert(canonicalize_dylib_path(&path)) {
+            continue;
+        }
+        if let Some((binary, dependencies)) = load(&path)? {
+            pending.extend(dependencies);
+            loaded.push(binary);
+        }
+    }
+    Ok(loaded)
+}
+
 /// Topologically sorts the binary dylibs using Kahn's algorithm
 /// and returns the sorted list of indices
 fn generate_binary_load_order(graph: &[BinaryDependencyNode]) -> Result<Vec<usize>, String> {
@@ -567,40 +601,19 @@ impl Environment {
         .map_err(|e| format!("Could not load executable: {e}"))?;
         drop(executable_bytes);
 
-        let mut dylibs = Vec::new();
-        for dylib in &executable.dynamic_libraries {
-            // There are some Free Software libraries bundled with touchHLE and
-            // exposed via the guest file system (see Fs::new()).
+        let dylibs = load_transitive_dependencies(&executable.dynamic_libraries, |dylib| {
             let dylib_path = fs::GuestPath::new(dylib);
             if fs.is_file(dylib_path) {
-                // We use hardcoded slide values for libgcc and libstdc++
-                // based on base addresses of those dylibs prior to iOS 3.1
-                // TODO: implement some kind of ASLR instead of hardcoding
                 assert!(dylib_path.as_str().starts_with("/usr/lib/"));
-
                 let name = dylib_path.file_name().unwrap();
                 let dylib_slide = match name {
                     "libstdc++.6.dylib" | "libstdc++.6.0.9.dylib" => 0x3748a000,
-
-                    // ДОБАВИТЬ ЭТО: Честный базовый адрес для libc++ (iOS 5.0+)
                     "libc++.1.dylib" => 0x38000000,
-                    // На случай, если игра также потянет за собой libc++abi
                     "libc++abi.dylib" => 0x38100000,
                     "libiconv.2.dylib" => 0x32000000,
-
                     "libgcc_s.1.dylib" => 0x30000000,
-                    "libz.1.dylib" | "libz.1.2.3.dylib" | "libz.dylib" | "libz.1.1.3.dylib" => {
-                        // We build `libz` from sources with our OSS toolchain,
-                        // the base address is already set and sliding is not
-                        // needed.
-                        0
-                    }
-                    "libsqlite3.dylib" | "libsqlite3.0.dylib" => {
-                        // We build `libsqlite3` from sources with our OSS
-                        // toolchain, the base address is already set and
-                        // sliding is not needed.
-                        0
-                    }
+                    "libz.1.dylib" | "libz.1.2.3.dylib" | "libz.dylib" | "libz.1.1.3.dylib" => 0,
+                    "libsqlite3.dylib" | "libsqlite3.0.dylib" => 0,
                     _ => {
                         log!(
                             "Warning: unknown binary slide for {:?}; loading at slide 0. App may fail to bind some symbols.",
@@ -609,32 +622,29 @@ impl Environment {
                         0
                     }
                 };
-
-                let dylib = mach_o::MachO::load_from_file(
+                let binary = mach_o::MachO::load_from_file(
                     fs::GuestPath::new(dylib),
                     &fs,
                     &mut mem,
                     dylib_slide,
                 )
                 .map_err(|e| format!("Could not load bundled dylib: {e}"))?;
-
-                dylibs.push(dylib);
-            // Otherwise, look for it in our host implementations.
-            } else if !crate::dyld::DYLIB_LIST
-                .iter()
-                .any(|d| d.path == dylib || d.aliases.contains(&dylib.as_str()))
-                // The Swift runtime dylibs are provided host-side by
-                // `dyld::swift_runtime` (all `__swift_*` entry points, type
-                // metadata slots and `__swift_FORCE_LOAD_$_*` autolink
-                // shims), so listing them here would be pure noise.
-                && !dylib.rsplit('/').next().unwrap_or(&dylib).starts_with("libswift")
-            {
-                log!(
-                    "Warning: app binary depends on unimplemented or missing dylib \"{}\"",
-                    dylib
-                );
+                let dependencies = binary.dynamic_libraries.clone();
+                Ok(Some((binary, dependencies)))
+            } else {
+                let implemented_in_host = crate::dyld::DYLIB_LIST
+                    .iter()
+                    .any(|d| d.path == dylib || d.aliases.contains(&dylib));
+                let is_swift = dylib.rsplit('/').next().unwrap_or(dylib).starts_with("libswift");
+                if !implemented_in_host && !is_swift {
+                    log!(
+                        "Warning: app binary depends on unimplemented or missing dylib \"{}\"",
+                        dylib
+                    );
+                }
+                Ok(None)
             }
-        }
+        })?;
 
         let entry_point_addr = executable
             .entry_point_pc
@@ -3319,6 +3329,45 @@ mod dylib_sorting_tests {
         assert!(
             result.is_err(),
             "Sort should detect self-dependency as a cycle and return an error"
+        );
+    }
+
+    #[test]
+    fn test_transitive_dependencies_and_aliases_are_loaded_once() {
+        let roots = vec![
+            "/usr/lib/libstdc++.6.dylib".to_owned(),
+            "/usr/lib/libstdc++.6.0.9.dylib".to_owned(),
+        ];
+        let mut visited = Vec::new();
+        let loaded = load_transitive_dependencies(&roots, |path| {
+            visited.push(path.to_owned());
+            let dependencies = match path {
+                "/usr/lib/libstdc++.6.dylib" | "/usr/lib/libstdc++.6.0.9.dylib" => {
+                    Some(vec!["/usr/lib/libgcc_s.1.dylib".to_owned()])
+                }
+                "/usr/lib/libgcc_s.1.dylib" => {
+                    Some(vec!["/usr/lib/libSystem.B.dylib".to_owned()])
+                }
+                _ => None,
+            };
+            Ok(dependencies.map(|dependencies| (path.to_owned(), dependencies)))
+        })
+        .unwrap();
+
+        assert_eq!(
+            loaded,
+            vec![
+                "/usr/lib/libstdc++.6.dylib".to_owned(),
+                "/usr/lib/libgcc_s.1.dylib".to_owned(),
+            ]
+        );
+        assert_eq!(
+            visited,
+            vec![
+                "/usr/lib/libstdc++.6.dylib".to_owned(),
+                "/usr/lib/libgcc_s.1.dylib".to_owned(),
+                "/usr/lib/libSystem.B.dylib".to_owned(),
+            ]
         );
     }
 }

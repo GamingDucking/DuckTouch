@@ -346,11 +346,12 @@ pub const CLASSES: ClassExports = objc_classes! {
     };
 
     // 5. CACHE INSERTION
+    let bundle_for_cache = retain(env, this);
     env.framework_state
         .foundation
         .ns_bundle
         .bundle_cache
-        .insert(path_str, this);
+        .insert(path_str, bundle_for_cache);
     this
 }
 

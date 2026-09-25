@@ -604,7 +604,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         return;
     }
 
-    if env.current_thread == 0 {
+    if env.current_thread == 0 && wait {
         if sel_name.ends_with(':') {
             () = msg_send(env, (this, sel, arg));
         } else {
@@ -680,7 +680,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 
     log_dbg!(
-        "performSelectorOnMainThread:{} from background thread {} (wait={}) — scheduling",
+        "performSelectorOnMainThread:{} from thread {} (wait={}) — scheduling",
         sel_name, env.current_thread, wait
     );
     msg![env; this performSelector:sel withObject:arg afterDelay:0.0]
