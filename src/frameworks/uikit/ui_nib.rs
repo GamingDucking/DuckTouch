@@ -86,11 +86,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     let bundle: id = if bundle == nil {
         main_bundle
     } else {
-        // TODO: non-main bundles
-        assert_eq!(bundle, main_bundle);
         bundle
     };
-
     retain(env, nib_name);
     retain(env, bundle);
     let host_object = Box::new(UINibHostObject {

@@ -33,6 +33,7 @@ pub struct UITextViewHostObject {
     superclass: super::UIScrollViewHostObject,
     editable: bool,
     text: id,
+    selected_range: NSRange,
     font: id,
     text_color: id,
     text_alignment: UITextAlignment,
@@ -64,9 +65,10 @@ impl Default for UITextViewHostObject {
     fn default() -> Self {
         UITextViewHostObject {
             superclass: Default::default(),
-            editable: false,
-            font: nil,
+            editable: true,
             text: nil,
+            selected_range: NSRange { location: 0, length: 0 },
+            font: nil,
             text_color: nil,
             text_alignment: UITextAlignmentLeft,
             return_key_type: 0,
@@ -164,11 +166,25 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)text { env.objc.borrow::<UITextViewHostObject>(this).text }
 - (())setText:(id)new_text {
     let new_text: id = if new_text != nil { msg![env; new_text copy] } else { nil };
-    let hostobj  = env.objc.borrow_mut::<UITextViewHostObject>(this);
+    let text_length: NSUInteger = if new_text != nil { msg![env; new_text length] } else { 0 };
+    let hostobj = env.objc.borrow_mut::<UITextViewHostObject>(this);
     let old_text = std::mem::replace(&mut hostobj.text, new_text);
+    hostobj.selected_range.location = hostobj.selected_range.location.min(text_length);
+    hostobj.selected_range.length = hostobj.selected_range.length.min(text_length - hostobj.selected_range.location);
     release(env, old_text);
-    update_scroll(env,this);
+    update_scroll(env, this);
     () = msg![env; this setNeedsDisplay];
+}
+
+- (NSRange)selectedRange { env.objc.borrow::<UITextViewHostObject>(this).selected_range }
+- (())setSelectedRange:(NSRange)range {
+    let text: id = msg![env; this text];
+    let length: NSUInteger = if text == nil { 0 } else { msg![env; text length] };
+    let location = range.location.min(length);
+    env.objc.borrow_mut::<UITextViewHostObject>(this).selected_range = NSRange {
+        location,
+        length: range.length.min(length - location),
+    };
 }
 
 - (id)textColor { env.objc.borrow::<UITextViewHostObject>(this).text_color }
@@ -207,6 +223,84 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (bool)isEditable { env.objc.borrow::<UITextViewHostObject>(this).editable }
 - (())setEditable:(bool)editable { env.objc.borrow_mut::<UITextViewHostObject>(this).editable = editable; }
+
+- (bool)isEditing {
+    env.framework_state.uikit.ui_responder.first_responder == this
+}
+
+- (bool)canBecomeFirstResponder {
+    env.objc.borrow::<UITextViewHostObject>(this).editable
+}
+
+- (bool)canResignFirstResponder { true }
+
+- (())touchesBegan:(id)_touches withEvent:(id)_event {
+    let _: bool = msg![env; this becomeFirstResponder];
+}
+
+- (bool)becomeFirstResponder {
+    if !env.objc.borrow::<UITextViewHostObject>(this).editable { return false; }
+    if env.framework_state.uikit.ui_responder.first_responder == this { return true; }
+
+    let delegate: id = msg![env; this delegate];
+    let delegate_alive = if delegate != nil {
+        let isa: u32 = env.mem.read(delegate.cast());
+        isa != 0
+    } else {
+        false
+    };
+    if delegate_alive {
+        let selector = env.objc.register_host_selector("textViewShouldBeginEditing:".to_string(), &mut env.mem);
+        if msg![env; delegate respondsToSelector:selector] && !msg![env; delegate textViewShouldBeginEditing:this] { return false; }
+    }
+
+    let previous_responder = env.framework_state.uikit.ui_responder.first_responder;
+    if previous_responder != nil && previous_responder != this && !msg![env; previous_responder resignFirstResponder] { return false; }
+
+    crate::frameworks::uikit::ui_keyboard::post_keyboard_notifications(env, true);
+    env.framework_state.uikit.ui_responder.first_responder = this;
+    env.on_parent_stack_in_coroutine(|window, _| window.start_text_input());
+
+    let name = get_static_str(env, "UITextViewTextDidBeginEditingNotification");
+    let center: id = msg_class![env; NSNotificationCenter defaultCenter];
+    let _: () = msg![env; center postNotificationName:name object:this userInfo:nil];
+
+    if delegate_alive {
+        let selector = env.objc.register_host_selector("textViewDidBeginEditing:".to_string(), &mut env.mem);
+        if msg![env; delegate respondsToSelector:selector] { let _: () = msg![env; delegate textViewDidBeginEditing:this]; }
+    }
+    true
+}
+
+- (bool)resignFirstResponder {
+    if env.framework_state.uikit.ui_responder.first_responder != this { return true; }
+
+    let delegate: id = msg![env; this delegate];
+    let delegate_alive = if delegate != nil {
+        let isa: u32 = env.mem.read(delegate.cast());
+        isa != 0
+    } else {
+        false
+    };
+    if delegate_alive {
+        let selector = env.objc.register_host_selector("textViewShouldEndEditing:".to_string(), &mut env.mem);
+        if msg![env; delegate respondsToSelector:selector] && !msg![env; delegate textViewShouldEndEditing:this] { return false; }
+    }
+
+    crate::frameworks::uikit::ui_keyboard::post_keyboard_notifications(env, false);
+    env.framework_state.uikit.ui_responder.first_responder = nil;
+    env.on_parent_stack_in_coroutine(|window, _| window.stop_text_input());
+
+    let name = get_static_str(env, "UITextViewTextDidEndEditingNotification");
+    let center: id = msg_class![env; NSNotificationCenter defaultCenter];
+    let _: () = msg![env; center postNotificationName:name object:this userInfo:nil];
+
+    if delegate_alive {
+        let selector = env.objc.register_host_selector("textViewDidEndEditing:".to_string(), &mut env.mem);
+        if msg![env; delegate respondsToSelector:selector] { let _: () = msg![env; delegate textViewDidEndEditing:this]; }
+    }
+    true
+}
 
 - (())scrollRangeToVisible:(NSRange)range {
     let &mut UITextViewHostObject { font, text, .. } = env.objc.borrow_mut(this);
@@ -349,3 +443,106 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 };
+
+fn text_view_selected_range(env: &Environment, text_view: id) -> NSRange {
+    env.objc.borrow::<UITextViewHostObject>(text_view).selected_range
+}
+
+fn post_text_view_text_did_change(env: &mut Environment, text_view: id) {
+    let center: id = msg_class![env; NSNotificationCenter defaultCenter];
+    let name = get_static_str(env, "UITextViewTextDidChangeNotification");
+    let _: () = msg![env; center postNotificationName:name object:text_view userInfo:nil];
+
+    let delegate: id = msg![env; text_view delegate];
+    let delegate_alive = if delegate != nil {
+        let isa: u32 = env.mem.read(delegate.cast());
+        isa != 0
+    } else {
+        false
+    };
+    if delegate_alive {
+        let selector = env.objc.register_host_selector("textViewDidChange:".to_string(), &mut env.mem);
+        if msg![env; delegate respondsToSelector:selector] {
+            let _: () = msg![env; delegate textViewDidChange:text_view];
+        }
+    }
+}
+
+fn replace_text_view_range(
+    env: &mut Environment,
+    text_view: id,
+    range: NSRange,
+    replacement: id,
+) {
+    if !msg![env; text_view isEditable] {
+        return;
+    }
+
+    let mut text: id = msg![env; text_view text];
+    if text == nil {
+        text = get_static_str(env, "");
+    }
+    let text_length: NSUInteger = msg![env; text length];
+    let location = range.location.min(text_length);
+    let range = NSRange {
+        location,
+        length: range.length.min(text_length - location),
+    };
+
+    let delegate: id = msg![env; text_view delegate];
+    let delegate_alive = if delegate != nil {
+        let isa: u32 = env.mem.read(delegate.cast());
+        isa != 0
+    } else {
+        false
+    };
+    if delegate_alive {
+        let selector = env.objc.register_host_selector(
+            "textView:shouldChangeTextInRange:replacementText:".to_string(),
+            &mut env.mem,
+        );
+        if msg![env; delegate respondsToSelector:selector]
+            && !msg![env; delegate textView:text_view shouldChangeTextInRange:range replacementText:replacement]
+        {
+            return;
+        }
+    }
+
+    let replacement_length: NSUInteger = msg![env; replacement length];
+    let new_text: id = msg![env; text stringByReplacingCharactersInRange:range withString:replacement];
+    let _: () = msg![env; text_view setText:new_text];
+    let new_range = NSRange {
+        location: range.location + replacement_length,
+        length: 0,
+    };
+    let _: () = msg![env; text_view setSelectedRange:new_range];
+    let _: () = msg![env; text_view scrollRangeToVisible:new_range];
+    post_text_view_text_did_change(env, text_view);
+    release(env, new_text);
+}
+
+pub fn handle_text(env: &mut Environment, text_view: id, text: String) {
+    let replacement = crate::frameworks::foundation::ns_string::from_rust_string(env, text);
+    let range = text_view_selected_range(env, text_view);
+    replace_text_view_range(env, text_view, range, replacement);
+    release(env, replacement);
+}
+
+pub fn handle_backspace(env: &mut Environment, text_view: id) {
+    let mut range = text_view_selected_range(env, text_view);
+    if range.length == 0 {
+        if range.location == 0 {
+            return;
+        }
+        range.location -= 1;
+        range.length = 1;
+    }
+    let empty = get_static_str(env, "");
+    replace_text_view_range(env, text_view, range, empty);
+}
+
+pub fn handle_return(env: &mut Environment, text_view: id) {
+    let newline = get_static_str(env, "\n");
+    let range = text_view_selected_range(env, text_view);
+    replace_text_view_range(env, text_view, range, newline);
+}

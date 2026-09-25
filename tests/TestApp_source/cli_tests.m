@@ -40,6 +40,103 @@
 
 #import "SyncTester.h"
 
+@interface NSBundle : NSObject
++ (instancetype)mainBundle;
++ (instancetype)bundleWithPath:(NSString *)path;
++ (instancetype)bundleWithIdentifier:(NSString *)identifier;
+- (NSString *)pathForResource:(NSString *)name ofType:(NSString *)extension;
+- (NSString *)bundleIdentifier;
+@end
+
+@interface NSObject (PerformSelectorOnMainThreadTest)
+- (void)performSelectorOnMainThread:(SEL)selector
+                         withObject:(id)object
+                      waitUntilDone:(BOOL)wait;
+@end
+
+@interface NSRunLoop : NSObject
++ (instancetype)mainRunLoop;
+- (BOOL)runMode:(id)mode beforeDate:(id)limitDate;
+@end
+
+@interface NSDate : NSObject
++ (instancetype)dateWithTimeIntervalSinceNow:(NSTimeInterval)seconds;
+@end
+
+extern NSString *const NSDefaultRunLoopMode;
+
+static int perform_selector_on_main_thread_calls;
+
+@interface PerformSelectorOnMainThreadProbe : NSObject
+- (void)signal:(id)object;
+@end
+
+@implementation PerformSelectorOnMainThreadProbe
+- (void)signal:(id)object {
+  (void)object;
+  perform_selector_on_main_thread_calls++;
+}
+@end
+
+int test_performSelectorOnMainThread_mainThreadDeferred(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  PerformSelectorOnMainThreadProbe *probe =
+      [[PerformSelectorOnMainThreadProbe alloc] init];
+  perform_selector_on_main_thread_calls = 0;
+
+  [probe performSelectorOnMainThread:@selector(signal:)
+                          withObject:nil
+                       waitUntilDone:YES];
+  if (perform_selector_on_main_thread_calls != 1) {
+    [probe release];
+    [pool drain];
+    return -1;
+  }
+
+  [probe performSelectorOnMainThread:@selector(signal:)
+                          withObject:nil
+                       waitUntilDone:NO];
+  if (perform_selector_on_main_thread_calls != 1) {
+    [probe release];
+    [pool drain];
+    return -2;
+  }
+
+  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:1.0];
+  [[NSRunLoop mainRunLoop] runMode:NSDefaultRunLoopMode beforeDate:deadline];
+  int result = perform_selector_on_main_thread_calls == 2 ? 0 : -3;
+
+  [probe release];
+  [pool drain];
+  return result;
+}
+
+int test_NSBundle_subbundleCacheRetainsAutoreleasedBundle(void) {
+  NSString *identifier = @"org.touchhle.TestResources";
+  NSAutoreleasePool *innerPool = [[NSAutoreleasePool alloc] init];
+  NSString *path = [[NSBundle mainBundle] pathForResource:@"TestResources"
+                                                   ofType:@"bundle"];
+  if (path == nil) {
+    [innerPool drain];
+    return -1;
+  }
+  NSBundle *created = [NSBundle bundleWithPath:path];
+  if (created == nil) {
+    [innerPool drain];
+    return -2;
+  }
+  [innerPool drain];
+
+  NSBundle *cached = [NSBundle bundleWithIdentifier:identifier];
+  if (cached == nil)
+    return -3;
+  if (![[cached bundleIdentifier] isEqualToString:identifier])
+    return -4;
+  if ([cached pathForResource:@"marker" ofType:@"txt"] == nil)
+    return -5;
+  return 0;
+}
+
 // TODO: include from <mach/thread_act.h> once available in the common-sdk
 extern kern_return_t thread_suspend(mach_port_t target_act);
 extern kern_return_t thread_resume(mach_port_t target_act);
@@ -6268,6 +6365,8 @@ struct {
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName),
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName_withObject),
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName_removeObserver),
+    FUNC_DEF(test_performSelectorOnMainThread_mainThreadDeferred),
+    FUNC_DEF(test_NSBundle_subbundleCacheRetainsAutoreleasedBundle),
 };
 // clang-format on
 

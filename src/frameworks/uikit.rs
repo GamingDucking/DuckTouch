@@ -1093,20 +1093,35 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
             }
             Event::TextInput(text_event) => {
                 let responder = env.framework_state.uikit.ui_responder.first_responder;
-                let class = msg![env; responder class];
-                let ui_text_field_class = env.objc.get_known_class("UITextField", &mut env.mem);
-
-                if !responder.is_null() && env.objc.class_is_subclass_of(class, ui_text_field_class)
-                {
-                    match text_event {
-                        TextInputEvent::Text(text) => {
-                            ui_view::ui_control::ui_text_field::handle_text(env, responder, text)
+                if !responder.is_null() {
+                    let class = msg![env; responder class];
+                    let ui_text_field_class = env.objc.get_known_class("UITextField", &mut env.mem);
+                    if env.objc.class_is_subclass_of(class, ui_text_field_class) {
+                        match text_event {
+                            TextInputEvent::Text(text) => {
+                                ui_view::ui_control::ui_text_field::handle_text(env, responder, text)
+                            }
+                            TextInputEvent::Backspace => {
+                                ui_view::ui_control::ui_text_field::handle_backspace(env, responder)
+                            }
+                            TextInputEvent::Return => {
+                                ui_view::ui_control::ui_text_field::handle_return(env, responder)
+                            }
                         }
-                        TextInputEvent::Backspace => {
-                            ui_view::ui_control::ui_text_field::handle_backspace(env, responder)
-                        }
-                        TextInputEvent::Return => {
-                            ui_view::ui_control::ui_text_field::handle_return(env, responder)
+                    } else {
+                        let ui_text_view_class = env.objc.get_known_class("UITextView", &mut env.mem);
+                        if env.objc.class_is_subclass_of(class, ui_text_view_class) {
+                            match text_event {
+                                TextInputEvent::Text(text) => {
+                                    ui_view::ui_scroll_view::ui_text_view::handle_text(env, responder, text)
+                                }
+                                TextInputEvent::Backspace => {
+                                    ui_view::ui_scroll_view::ui_text_view::handle_backspace(env, responder)
+                                }
+                                TextInputEvent::Return => {
+                                    ui_view::ui_scroll_view::ui_text_view::handle_return(env, responder)
+                                }
+                            }
                         }
                     }
                 }
