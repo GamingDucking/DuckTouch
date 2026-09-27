@@ -26,3 +26,6 @@ com.telltalegames.Grickle101: --landscape-left
 # touchHLE's desktop OpenGL 2.1 compatibility backend.
 com.telltalegames.SamMax301: --landscape-left --gles2-compat
 com.telltalegames.WallaceGromit102: --landscape-left --gles2-compat
+
+# PvZ 2 requires a front-facing-camera-capable device profile.
+com.popcap.ios.PvZ2: --device-family=iphone-4 --no-corrupt-game

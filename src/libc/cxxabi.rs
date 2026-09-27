@@ -442,13 +442,10 @@ fn __cxa_call_unexpected(env: &mut Environment, _exc: MutVoidPtr) {
 /// Returns the casted pointer on success, or NULL on failure (the cast
 /// does not apply / a `dynamic_cast<T*>` should evaluate to nullptr).
 ///
-/// touchHLE has no real RTTI walk because every Itanium type_info vtable
-/// is stubbed (see [crate::dyld::do_non_lazy_linking]). We can't ever
-/// say "yes this is the right cast", so always returning NULL is the
-/// only safe answer — it matches the language semantics for failed
-/// casts. Apps that rely on dynamic_cast to *succeed* (rather than just
-/// using it as a defensive nullptr check) will still misbehave, but
-/// they were already going to crash on the broken vtables anyway.
+/// The guest libstdc++ implementation dispatches through Itanium `type_info`
+/// vtables, which may be stubbed by the linker. This host implementation
+/// reads the guest RTTI records and uses vtable-kind metadata registered by
+/// dyld so casts can succeed without calling those vtable methods.
 const MAX_RTTI_SUBOBJECTS: usize = 4096;
 const MAX_RTTI_BASES: u32 = 512;
 const MAX_RTTI_DEPTH: u8 = 64;
@@ -500,9 +497,28 @@ fn rtti_types_equal(env: &Environment, left: u32, right: u32) -> bool {
         )
 }
 
-fn rtti_typeinfo_kind(env: &Environment, type_info: u32) -> Option<crate::dyld::CxxAbiTypeInfoKind> {
-    let vtable = read_guest_u32(env, type_info)?;
-    env.dyld.cxxabi_typeinfo_kind(vtable)
+fn rtti_typeinfo_kind(
+    env: &Environment,
+    type_info: u32,
+    trace: bool,
+) -> Option<crate::dyld::CxxAbiTypeInfoKind> {
+    let Some(vtable) = read_guest_u32(env, type_info) else {
+        if trace {
+            log!(
+                "__dynamic_cast RTTI node has unreadable vtable: type_info={type_info:#010x} name={:?}",
+                rtti_type_name(env, type_info)
+            );
+        }
+        return None;
+    };
+    let kind = env.dyld.cxxabi_typeinfo_kind(vtable);
+    if trace {
+        log!(
+            "RTTI node type_info={type_info:#010x} name={:?} vtable={vtable:#010x} kind={kind:?}",
+            rtti_type_name(env, type_info)
+        );
+    }
+    kind
 }
 
 fn rtti_base_object_address(env: &Environment, derived: u32, offset_flags: u32) -> Option<u32> {
@@ -548,6 +564,7 @@ fn rtti_subobjects(
     env: &Environment,
     dynamic_type: u32,
     dynamic_object: u32,
+    trace: bool,
 ) -> Option<Vec<RttiSubobject>> {
     use crate::dyld::CxxAbiTypeInfoKind;
 
@@ -562,7 +579,7 @@ fn rtti_subobjects(
     let mut index = 0;
     while index < nodes.len() {
         let node = nodes[index];
-        match rtti_typeinfo_kind(env, node.type_info)? {
+        match rtti_typeinfo_kind(env, node.type_info, trace)? {
             CxxAbiTypeInfoKind::Class => {}
             CxxAbiTypeInfoKind::SingleInheritance => {
                 let base_type = read_guest_u32(env, node.type_info.checked_add(8)?)?;
@@ -751,7 +768,7 @@ fn __dynamic_cast(
             .map_or(Ptr::null(), ConstVoidPtr::from_bits);
     }
 
-    let Some(nodes) = rtti_subobjects(env, dynamic_type, dynamic_object) else {
+    let Some(nodes) = rtti_subobjects(env, dynamic_type, dynamic_object, trace) else {
         if trace {
             log!("__dynamic_cast hierarchy decode failed for {:#010x}", dynamic_type);
         }

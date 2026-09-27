@@ -209,47 +209,64 @@ fn touchhle_cocos_is_gl_or_game_view_name(class_name: &str) -> bool {
         || class_name.contains("RootView")
 }
 
-fn touchhle_should_use_landscape_touch_remap(env: &Environment) -> bool {
-    match env.bundle.bundle_identifier() {
-        // Confirmed landscape Source/Cocos games.
-        //
-        // NOTE: com.robtop.geometryjump (Geometry Dash) is deliberately NOT in
-        // this list. GD mounts its cocos2d-x EAGLView as a UIViewController's
-        // view, so UIWindow's landscape autorotation transform makes
-        // -locationInView: already return coordinates in the game's landscape
-        // (480x320) space, aligned with what is on screen. Applying the
-        // portrait->landscape cocos remap on top of that rotated the
-        // already-correct point a second time (a squash-rotated 90° map), so
-        // taps landed on the wrong UI elements: pressing high opened the
-        // settings, pressing low opened the level menu.
-        "at.source.veggie1"
-        | "at.source.potato3D"
-        | "at.source.potpan" => true,
+fn touchhle_manual_landscape_touch_remap_enabled() -> bool {
+    crate::env_flag_cached!("TOUCHHLE_TOUCH_LOCATION_PORTRAIT_TO_LANDSCAPE")
+        || crate::env_flag_cached!("TOUCHHLE_COCOS_TOUCH_REMAP")
+        || crate::env_flag_cached!("TOUCHHLE_UNITY_TOUCH_REMAP")
+        || crate::env_flag_cached!("TOUCHHLE_ENGINE_TOUCH_REMAP")
+}
 
-        // TomatoZombie is native portrait.
+fn touchhle_should_use_landscape_touch_remap_for_bundle(
+    bundle_id: &str,
+    manual_override: bool,
+) -> bool {
+    match bundle_id {
+        "at.source.veggie1" | "at.source.potato3D" | "at.source.potpan" => true,
         "at.source.tomzom" => false,
-
-        // Manual override for testing.
-        // PERF: read-once cached flags; this is checked per touch event.
-        _ => {
-            crate::env_flag_cached!("TOUCHHLE_TOUCH_LOCATION_PORTRAIT_TO_LANDSCAPE")
-                || crate::env_flag_cached!("TOUCHHLE_COCOS_TOUCH_REMAP")
-                || crate::env_flag_cached!("TOUCHHLE_UNITY_TOUCH_REMAP")
-                || crate::env_flag_cached!("TOUCHHLE_ENGINE_TOUCH_REMAP")
-        }
+        // UIKit already returns the landscape coordinates used by the game's 480x320 view.
+        "com.saban.powerrangersbash" => manual_override,
+        _ => manual_override,
     }
 }
 
-fn should_remap_touch_location_for_view(env: &mut Environment, view: id) -> bool {
-    if !touchhle_should_use_landscape_touch_remap(env) {
-        return false;
-    }
+fn touchhle_should_use_landscape_touch_remap(env: &Environment) -> bool {
+    touchhle_should_use_landscape_touch_remap_for_bundle(
+        env.bundle.bundle_identifier(),
+        touchhle_manual_landscape_touch_remap_enabled(),
+    )
+}
 
-    if view == nil {
+fn should_remap_touch_location_for_view(env: &mut Environment, view: id) -> bool {
+    if view == nil || !touchhle_should_use_landscape_touch_remap(env) {
         return false;
     }
     let class_name = touchhle_cocos_view_class_name(env, view);
     touchhle_cocos_is_gl_or_game_view_name(&class_name)
+}
+
+#[cfg(test)]
+mod landscape_touch_remap_tests {
+    use super::touchhle_should_use_landscape_touch_remap_for_bundle;
+
+    #[test]
+    fn power_rangers_keeps_its_native_landscape_touch_coordinates() {
+        assert!(!touchhle_should_use_landscape_touch_remap_for_bundle(
+            "com.saban.powerrangersbash",
+            false
+        ));
+        assert!(touchhle_should_use_landscape_touch_remap_for_bundle(
+            "com.saban.powerrangersbash",
+            true
+        ));
+        assert!(touchhle_should_use_landscape_touch_remap_for_bundle(
+            "at.source.veggie1",
+            false
+        ));
+        assert!(!touchhle_should_use_landscape_touch_remap_for_bundle(
+            "at.source.tomzom",
+            true
+        ));
+    }
 }
 
 fn touchhle_cocos_target_size() -> (f32, f32) {
@@ -278,17 +295,19 @@ fn touchhle_cocos_remap_point(env: &mut Environment, view: id, point: CGPoint) -
     let mode = crate::env_var_cached!("TOUCHHLE_TOUCH_MODE")
         .map(str::to_owned)
         .unwrap_or_else(|| {
-        match env.bundle.bundle_identifier() {
-            "at.source.veggie1"
-            | "at.source.potato3D"
-            | "at.source.potpan" => "scale".to_string(),
-            _ => crate::env_var_cached!("TOUCHHLE_COCOS_TOUCH_MODE")
+            let bundle_id = env.bundle.bundle_identifier();
+            let custom_mode = crate::env_var_cached!("TOUCHHLE_COCOS_TOUCH_MODE")
                 .or(crate::env_var_cached!("TOUCHHLE_UNITY_TOUCH_MODE"))
-                .or(crate::env_var_cached!("TOUCHHLE_ENGINE_TOUCH_MODE"))
-                .map(str::to_owned)
-                .unwrap_or_else(|| "scale".to_string()),
-        }
-    });
+                .or(crate::env_var_cached!("TOUCHHLE_ENGINE_TOUCH_MODE"));
+            match bundle_id {
+                "at.source.veggie1" | "at.source.potato3D" | "at.source.potpan" => {
+                    "scale".to_string()
+                }
+                _ => custom_mode
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| "scale".to_string()),
+            }
+        });
 
     let source_bounds: CGRect = if view != nil {
         msg![env; view bounds]
@@ -361,7 +380,6 @@ fn touchhle_cocos_remap_point(env: &mut Environment, view: id, point: CGPoint) -
         "UITouch Cocos remap mode={} source=({:.1}x{:.1}) target=({:.1}x{:.1}): ({:.1}, {:.1}) -> ({:.1}, {:.1})",
         mode, source_w, source_h, target_w, target_h, old_x, old_y, new_x, new_y
     );
-
     CGPoint { x: new_x, y: new_y }
 }
 
@@ -429,7 +447,29 @@ pub const CLASSES: ClassExports = objc_classes! {
     };
 
     let remap_view = if that_view != nil { that_view } else { view };
-    if touchhle_should_use_landscape_touch_remap(env) || should_remap_touch_location_for_view(env, remap_view) {
+    let should_remap =
+        touchhle_should_use_landscape_touch_remap(env) || should_remap_touch_location_for_view(env, remap_view);
+
+    if crate::env_flag_cached!("TOUCHHLE_TRACE_TOUCH_REMAP")
+        && env.bundle.bundle_identifier() == "com.saban.powerrangersbash"
+    {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        if COUNTER.fetch_add(1, Ordering::Relaxed) < 12 {
+            let location_x = location.x;
+            let location_y = location.y;
+            let location_in_window_x = location_in_window.x;
+            let location_in_window_y = location_in_window.y;
+            let result_x = result.x;
+            let result_y = result.y;
+            log!(
+                "TOUCHHLE_TRACE_TOUCH_REMAP: location=({:.1},{:.1}) location_in_window=({:.1},{:.1}) result=({:.1},{:.1}) should_remap={}",
+                location_x, location_y, location_in_window_x, location_in_window_y, result_x, result_y,
+                should_remap
+            );
+        }
+    }
+
+    if should_remap {
         // Important: this happens AFTER UIKit hit-testing. The touch can still
         // hit a portrait-sized EAGL/CCGL view, but the game can receive the
         // Cocos/OpenGL coordinate system it expects.

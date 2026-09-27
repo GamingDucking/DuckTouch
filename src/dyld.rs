@@ -64,6 +64,9 @@ pub struct HostDylib {
     pub function_exports: &'static [FunctionExports],
 }
 
+/// Debug: number of upcoming host calls to log.
+pub static TRACE_HOST_CALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 pub type HostFunction = &'static dyn CallFromGuest;
 
 /// Type for lists of functions exported by host implementations of dynamic
@@ -223,6 +226,41 @@ pub(crate) enum CxxAbiTypeInfoKind {
     MultipleInheritance,
 }
 
+fn cxxabi_typeinfo_vtable_kind(name: &str) -> Option<CxxAbiTypeInfoKind> {
+    match name {
+        "__ZTVN10__cxxabiv117__class_type_infoE" => Some(CxxAbiTypeInfoKind::Class),
+        "__ZTVN10__cxxabiv120__si_class_type_infoE" => Some(CxxAbiTypeInfoKind::SingleInheritance),
+        "__ZTVN10__cxxabiv121__vmi_class_type_infoE" => {
+            Some(CxxAbiTypeInfoKind::MultipleInheritance)
+        }
+        _ => None,
+    }
+}
+
+fn register_cxxabi_typeinfo_vtable(
+    name: &str,
+    addr: u32,
+    typeinfo_vtable_kinds: &mut HashMap<u32, CxxAbiTypeInfoKind>,
+) {
+    let Some(kind) = cxxabi_typeinfo_vtable_kind(name) else {
+        return;
+    };
+    let inserted_base = typeinfo_vtable_kinds.insert(addr, kind).is_none();
+    let inserted_address_point = if let Some(address_point) = addr.checked_add(8) {
+        typeinfo_vtable_kinds.insert(address_point, kind).is_none()
+    } else {
+        false
+    };
+    if (inserted_base || inserted_address_point)
+        && std::env::var_os("TOUCHHLE_TRACE_DYNAMIC_CAST").is_some()
+    {
+        log!(
+            "__dynamic_cast RTTI vtable registered: name={name} base={addr:#010x} address_point={:#010x} kind={kind:?}",
+            addr.saturating_add(8)
+        );
+    }
+}
+
 fn link_cxxabi_vtable(
     name: &str,
     cxxabi_vtable_addrs: &mut HashMap<String, u32>,
@@ -242,19 +280,7 @@ fn link_cxxabi_vtable(
             }
             v.to_bits()
         });
-    let kind = match name {
-        "__ZTVN10__cxxabiv117__class_type_infoE" => Some(CxxAbiTypeInfoKind::Class),
-        "__ZTVN10__cxxabiv120__si_class_type_infoE" => {
-            Some(CxxAbiTypeInfoKind::SingleInheritance)
-        }
-        "__ZTVN10__cxxabiv121__vmi_class_type_infoE" => {
-            Some(CxxAbiTypeInfoKind::MultipleInheritance)
-        }
-        _ => None,
-    };
-    if let Some(kind) = kind {
-        typeinfo_vtable_kinds.insert(addr + 8, kind);
-    }
+    register_cxxabi_typeinfo_vtable(name, addr, typeinfo_vtable_kinds);
     Ptr::from_bits(addr).cast_const()
 }
 
@@ -657,6 +683,13 @@ impl Dyld {
                 ","
             };
             let symbol = symbol.as_ref().unwrap();
+            if let Some(sym) = cxxabi_intercept_symbol(symbol, self.guest_sjlj_runtime_available) {
+                writeln!(
+                    file,
+                    "        {{ \"symbol\": \"{sym}\", \"linked_to\": \"host\"}}{comma}"
+                )?;
+                continue 'sym;
+            }
             for dylib in bins.iter() {
                 if dylib.exported_symbols.contains_key(symbol) {
                     writeln!(
@@ -856,21 +889,30 @@ impl Dyld {
         // same vtable symbol must resolve to the same address so that vtable
         // identity checks in dynamic_cast work correctly.
         let mut cxxabi_vtable_addrs: HashMap<String, u32> = HashMap::new();
+        for other_bin in bins {
+            for (name, &addr) in &other_bin.exported_symbols {
+                register_cxxabi_typeinfo_vtable(name, addr, &mut self.cxxabi_typeinfo_vtable_kinds);
+            }
+        }
         for &(ptr_ptr, ref name) in &bin.external_relocations {
             let ptr_ptr: MutPtr<ConstVoidPtr> = Ptr::from_bits(ptr_ptr);
             // There will be an existing value at the address, which is an
             // offset that should be applied to the external symbol's address.
             // It is often 0, but not always.
             let offset: u32 = mem.read(ptr_ptr).to_bits();
-            let guest_cxxabi_export = if self.guest_sjlj_runtime_available
-                && is_guest_cxxabi_symbol(name)
-            {
-                bins.iter()
-                    .find_map(|other_bin| other_bin.exported_symbols.get(name))
-                    .copied()
-            } else {
-                None
-            };
+            let guest_cxxabi_export =
+                if self.guest_sjlj_runtime_available && is_guest_cxxabi_symbol(name) {
+                    bins.iter()
+                        .find_map(|other_bin| other_bin.exported_symbols.get(name))
+                        .copied()
+                } else {
+                    None
+                };
+            // Keep guest vtable methods for exception handling; the host RTTI walker
+            // needs the Itanium class kind at each guest vtable address point.
+            if let Some(addr) = guest_cxxabi_export {
+                register_cxxabi_typeinfo_vtable(name, addr, &mut self.cxxabi_typeinfo_vtable_kinds);
+            }
             let target: ConstVoidPtr = if let Some(name) = name.strip_prefix("_OBJC_CLASS_$_") {
                 objc.link_class(name, /* is_metaclass: */ false, mem)
                     .cast()
@@ -1225,6 +1267,11 @@ impl Dyld {
             let ptr_ptr: MutPtr<ConstVoidPtr> = Ptr::from_bits(ptrs.addr + i * entry_size);
             for other_bin in bins {
                 if let Some(&addr) = other_bin.exported_symbols.get(symbol) {
+                    register_cxxabi_typeinfo_vtable(
+                        symbol,
+                        addr,
+                        &mut self.cxxabi_typeinfo_vtable_kinds,
+                    );
                     mem.write(ptr_ptr, Ptr::from_bits(addr));
                     continue 'ptr_loop;
                 }
@@ -1591,6 +1638,10 @@ impl Dyld {
                     return None;
                 };
                 log_dbg!("Call to host function, already linked: {}", symbol);
+                if TRACE_HOST_CALLS.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                    TRACE_HOST_CALLS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    log!("HOSTCALL {} lr={:#x}", symbol, cpu.regs()[14]);
+                }
                 Some(f)
             }
         }
@@ -1687,6 +1738,11 @@ impl Dyld {
                 .iter()
                 .find_map(|dylib| dylib.exported_symbols.get(symbol))
             {
+                register_cxxabi_typeinfo_vtable(
+                    symbol,
+                    addr,
+                    &mut self.cxxabi_typeinfo_vtable_kinds,
+                );
                 let (stub_function_ptr, la_symbol_ptr) = link_by_restoring_stub(
                     mem,
                     cpu,
@@ -1760,6 +1816,11 @@ impl Dyld {
         // dylibs over fallback implementations.
         for dylib in bins.iter() {
             if let Some(&addr) = dylib.exported_symbols.get(symbol) {
+                register_cxxabi_typeinfo_vtable(
+                    symbol,
+                    addr,
+                    &mut self.cxxabi_typeinfo_vtable_kinds,
+                );
                 let (stub_function_ptr, la_symbol_ptr) =
                     link_by_restoring_stub(mem, cpu, addr, svc_pc, info.entry_size, pic_offset);
                 log_dbg!(
@@ -1913,22 +1974,21 @@ impl Dyld {
         GuestFunction::from_addr_with_thumb_bit(function_ptr.to_bits())
     }
 
-    /// Intercepts guest C++ exception ABI symbols that must not reach the
-    /// guest's real unwinder (see `cxxabi_throw_intercept`). Returns the
-    /// linked host stub, or `None` if `name` isn't intercepted.
+    /// Intercepts guest C++ ABI symbols that require host-side behavior.
     fn cxxabi_intercept(&mut self, mem: &mut Mem, name: &str) -> Option<GuestFunction> {
-        if self.guest_sjlj_runtime_available {
-            return None;
-        }
-        let sym: &'static str = match name {
-            "__cxa_throw" => "__cxa_throw",
-            "___cxa_throw" => "___cxa_throw",
-            _ => return None,
-        };
+        let sym = cxxabi_intercept_symbol(name, self.guest_sjlj_runtime_available)?;
         if let Some(&cached) = self.non_lazy_host_functions.get(sym) {
             return Some(cached);
         }
-        let (_, f) = export_c_func!(cxxabi_throw_intercept(_, _, _));
+        let f = if sym == "___dynamic_cast" {
+            // Guest libstdc++ uses type_info vtable methods that touchHLE stubs.
+            // Route casts through the host RTTI walker even when guest SjLj is present.
+            let (_, f) = *search_host_dylibs(|dylib| dylib.function_exports, sym)?;
+            f
+        } else {
+            let (_, f) = export_c_func!(cxxabi_throw_intercept(_, _, _));
+            f
+        };
         let function_ptr = self.create_guest_function(mem, sym, f);
         self.non_lazy_host_functions.insert(sym, function_ptr);
         Some(function_ptr)
@@ -2055,9 +2115,22 @@ fn is_guest_cxxabi_symbol(name: &str) -> bool {
         || name.starts_with("__ZTS")
 }
 
+fn cxxabi_intercept_symbol(name: &str, guest_sjlj_runtime_available: bool) -> Option<&'static str> {
+    match name {
+        "___dynamic_cast" | "__dynamic_cast" => Some("___dynamic_cast"),
+        "__cxa_throw" if !guest_sjlj_runtime_available => Some("__cxa_throw"),
+        "___cxa_throw" if !guest_sjlj_runtime_available => Some("___cxa_throw"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod cxxabi_runtime_detection_tests {
-    use super::has_guest_sjlj_runtime;
+    use super::{
+        cxxabi_intercept_symbol, cxxabi_typeinfo_vtable_kind, has_guest_sjlj_runtime,
+        is_guest_cxxabi_symbol, register_cxxabi_typeinfo_vtable, CxxAbiTypeInfoKind,
+    };
+    use std::collections::HashMap;
 
     const REQUIRED_SYMBOLS: [&str; 4] = [
         "___cxa_throw",
@@ -2078,6 +2151,70 @@ mod cxxabi_runtime_detection_tests {
                     .any(|candidate| *candidate != missing && *candidate == symbol)
             }));
         }
+    }
+
+    #[test]
+    fn dynamic_cast_uses_the_host_rtti_walker_with_a_guest_runtime() {
+        assert!(!is_guest_cxxabi_symbol("___dynamic_cast"));
+        assert_eq!(
+            cxxabi_intercept_symbol("___dynamic_cast", true),
+            Some("___dynamic_cast")
+        );
+        assert_eq!(
+            cxxabi_intercept_symbol("__dynamic_cast", true),
+            Some("___dynamic_cast")
+        );
+        assert_eq!(cxxabi_intercept_symbol("___cxa_throw", true), None);
+    }
+
+    #[test]
+    fn cxxabi_typeinfo_vtable_names_match_the_rtti_walker_kinds() {
+        assert_eq!(
+            cxxabi_typeinfo_vtable_kind("__ZTVN10__cxxabiv117__class_type_infoE"),
+            Some(CxxAbiTypeInfoKind::Class)
+        );
+        assert_eq!(
+            cxxabi_typeinfo_vtable_kind("__ZTVN10__cxxabiv120__si_class_type_infoE"),
+            Some(CxxAbiTypeInfoKind::SingleInheritance)
+        );
+        assert_eq!(
+            cxxabi_typeinfo_vtable_kind("__ZTVN10__cxxabiv121__vmi_class_type_infoE"),
+            Some(CxxAbiTypeInfoKind::MultipleInheritance)
+        );
+        assert_eq!(
+            cxxabi_typeinfo_vtable_kind("__ZTVsome_other_type_info"),
+            None
+        );
+    }
+
+    #[test]
+    fn cxxabi_typeinfo_vtable_registration_covers_both_symbol_address_conventions() {
+        let mut kinds = HashMap::new();
+        register_cxxabi_typeinfo_vtable(
+            "__ZTVN10__cxxabiv120__si_class_type_infoE",
+            0x1000,
+            &mut kinds,
+        );
+        assert_eq!(
+            kinds.get(&0x1000),
+            Some(&CxxAbiTypeInfoKind::SingleInheritance)
+        );
+        assert_eq!(
+            kinds.get(&0x1008),
+            Some(&CxxAbiTypeInfoKind::SingleInheritance)
+        );
+        assert_eq!(kinds.len(), 2);
+        register_cxxabi_typeinfo_vtable(
+            "__ZTVN10__cxxabiv120__si_class_type_infoE",
+            u32::MAX,
+            &mut kinds,
+        );
+        assert_eq!(
+            kinds.get(&u32::MAX),
+            Some(&CxxAbiTypeInfoKind::SingleInheritance)
+        );
+        assert_eq!(kinds.len(), 3);
+        assert!(!kinds.contains_key(&0x7));
     }
 
     #[test]

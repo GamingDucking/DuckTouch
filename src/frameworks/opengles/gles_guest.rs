@@ -12,6 +12,7 @@ use crate::gles::{gles11_raw as gles11, GLES};
 use crate::mem::{ConstPtr, ConstVoidPtr, GuestISize, GuestUSize, Mem, MutPtr, MutVoidPtr, Ptr};
 use crate::objc::nil;
 use crate::Environment;
+use std::collections::HashMap;
 use std::slice::from_raw_parts;
 use touchHLE_gl_bindings::gles11::{
     ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER_BINDING, WRITE_ONLY_OES,
@@ -43,6 +44,49 @@ const SUPPORTED_COMPRESSED_TEXTURE_FORMATS: &[GLenum] = &[
 
 fn trace_potatogold_render() -> bool {
     crate::env_flag_cached!("TOUCHHLE_TRACE_POTATOGOLD_RENDER")
+}
+
+const TEXTURE_CUBE_MAP: GLenum = 0x8513;
+const TEXTURE_BINDING_CUBE_MAP: GLenum = 0x8514;
+const TEXTURE_CUBE_MAP_POSITIVE_X: GLenum = 0x8515;
+const TEXTURE_CUBE_MAP_NEGATIVE_Z: GLenum = 0x851A;
+
+fn texture_binding_pname(target: GLenum) -> Option<GLenum> {
+    if target == gles11::TEXTURE_2D {
+        Some(gles11::TEXTURE_BINDING_2D)
+    } else if target == TEXTURE_CUBE_MAP
+        || (TEXTURE_CUBE_MAP_POSITIVE_X..=TEXTURE_CUBE_MAP_NEGATIVE_Z).contains(&target)
+    {
+        Some(TEXTURE_BINDING_CUBE_MAP)
+    } else {
+        None
+    }
+}
+
+unsafe fn current_bound_texture(gles: &mut dyn GLES, target: GLenum) -> Option<GLuint> {
+    let pname = texture_binding_pname(target)?;
+    let mut texture = 0;
+    gles.GetIntegerv(pname, &mut texture);
+    GLuint::try_from(texture).ok()
+}
+
+fn pvrtc_subimage_matches_level(
+    texture_level: Option<(GLsizei, GLsizei, GLenum)>,
+    xoffset: GLint,
+    yoffset: GLint,
+    width: GLsizei,
+    height: GLsizei,
+    format: GLenum,
+) -> bool {
+    matches!(
+        texture_level,
+        Some((stored_width, stored_height, stored_format))
+            if xoffset == 0
+                && yoffset == 0
+                && width == stored_width
+                && height == stored_height
+                && format == stored_format
+    )
 }
 
 #[track_caller]
@@ -1188,10 +1232,72 @@ fn glCompressedTexSubImage2D(
     image_size: GLsizei,
     data: ConstVoidPtr,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        let data = mem
-            .ptr_at(data.cast::<u8>(), image_size.try_into().unwrap())
-            .cast();
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let image_size_usize = match usize::try_from(image_size) {
+            Ok(size) => size,
+            Err(_) => {
+                gles.CompressedTexSubImage2D(
+                    target,
+                    level,
+                    xoffset,
+                    yoffset,
+                    width,
+                    height,
+                    format,
+                    image_size,
+                    std::ptr::null(),
+                );
+                return;
+            }
+        };
+        let bound_texture = current_bound_texture(gles, target);
+        let texture_level = bound_texture
+            .and_then(|texture| shadow.pvrtc_texture_level(target, texture, level));
+        if pvrtc_subimage_matches_level(
+            texture_level,
+            xoffset,
+            yoffset,
+            width,
+            height,
+            format,
+        ) && !data.is_null()
+            && crate::gles::util::pvrtc_payload_size(format, width, height)
+                == Some(image_size_usize)
+        {
+            if let Some((is_2bit, is_opaque)) = crate::gles::util::pvrtc_format_properties(format) {
+                let data = mem.ptr_at(data.cast::<u8>(), image_size_usize as GuestUSize);
+                let payload = std::slice::from_raw_parts(data, image_size_usize);
+                let pixels = crate::image::decode_pvrtc_with_alpha(
+                    payload,
+                    is_2bit,
+                    width as u32,
+                    height as u32,
+                    is_opaque,
+                );
+                // PVRTC compressed subimages may only replace a complete level.
+                gles.TexSubImage2D(
+                    target,
+                    level,
+                    xoffset,
+                    yoffset,
+                    width,
+                    height,
+                    gles11::RGBA,
+                    gles11::UNSIGNED_BYTE,
+                    pixels.as_ptr().cast(),
+                );
+                log_once!(
+                    "Software-decoded a full PVRTC glCompressedTexSubImage2D update into RGBA storage"
+                );
+                return;
+            }
+        }
+        let data = if data.is_null() {
+            std::ptr::null()
+        } else {
+            mem.ptr_at(data.cast::<u8>(), image_size_usize as GuestUSize)
+                .cast()
+        };
         gles.CompressedTexSubImage2D(
             target, level, xoffset, yoffset, width, height, format, image_size, data,
         )
@@ -2059,10 +2165,18 @@ fn glGenTextures(env: &mut Environment, n: GLsizei, textures: MutPtr<GLuint>) {
     })
 }
 fn glDeleteTextures(env: &mut Environment, n: GLsizei, textures: ConstPtr<GLuint>) {
-    with_ctx_and_mem(env, |gles, mem| {
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| {
         let n_usize: GuestUSize = n.try_into().unwrap();
         let textures = mem.ptr_at(textures, n_usize);
-        unsafe { gles.DeleteTextures(n, textures) }
+        let deleted = if n_usize == 0 {
+            Vec::new()
+        } else {
+            unsafe { from_raw_parts(textures, n_usize as usize) }.to_vec()
+        };
+        unsafe { gles.DeleteTextures(n, textures) };
+        for texture in deleted {
+            shadow.forget_pvrtc_texture(texture);
+        }
     })
 }
 fn glActiveTexture(env: &mut Environment, texture: GLenum) {
@@ -2383,7 +2497,8 @@ fn glTexImage2D(
     }
     let guest_pixels = pixels;
     let fix_filter = env.options.fix_texture_min_filter && level == 0;
-    with_ctx_and_mem(env, |gles, mem| unsafe {
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let bound_texture = current_bound_texture(gles, target);
         let pixels = if pixels.is_null() {
             std::ptr::null()
         } else {
@@ -2402,6 +2517,9 @@ fn glTexImage2D(
             type_,
             pixels,
         );
+        if let Some(texture) = bound_texture {
+            shadow.forget_pvrtc_texture_level(target, texture, level);
+        }
         if crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") {
             static TEX_DUMP_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = TEX_DUMP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2491,7 +2609,11 @@ fn glCompressedTexImage2D(
         }
     }
     let fix_filter = env.options.fix_texture_min_filter && level == 0;
-    with_ctx_and_mem(env, |gles, mem| unsafe {
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let bound_texture = current_bound_texture(gles, target);
+        if let Some(texture) = bound_texture {
+            shadow.forget_pvrtc_texture_level(target, texture, level);
+        }
         // Pre-flight: drain any sticky GL error left by the previous call
         // (e.g. an oversized RGBA8 glTexImage2D on a strict Mali driver),
         // so when we check post-upload below we can attribute a fresh error
@@ -2541,6 +2663,23 @@ fn glCompressedTexImage2D(
                 border,
                 payload,
             ) {
+                if border == 0
+                    && width > 0
+                    && height > 0
+                    && crate::gles::util::pvrtc_payload_size(internalformat, width, height)
+                        == Some(image_size_usize)
+                {
+                    if let Some(texture) = bound_texture {
+                        shadow.record_pvrtc_texture_level(
+                            target,
+                            texture,
+                            level,
+                            width,
+                            height,
+                            internalformat,
+                        );
+                    }
+                }
                 if fix_filter {
                     gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
                 }
@@ -2624,8 +2763,12 @@ fn glCopyTexImage2D(
     height: GLsizei,
     border: GLint,
 ) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.CopyTexImage2D(target, level, internalformat, x, y, width, height, border)
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        let bound_texture = current_bound_texture(gles, target);
+        gles.CopyTexImage2D(target, level, internalformat, x, y, width, height, border);
+        if let Some(texture) = bound_texture {
+            shadow.forget_pvrtc_texture_level(target, texture, level);
+        }
     })
 }
 fn glCopyTexSubImage2D(
@@ -3254,7 +3397,13 @@ fn glCreateProgram(env: &mut Environment) -> GLuint {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.CreateProgram() })
 }
 fn glCreateShader(env: &mut Environment, type_: GLenum) -> GLuint {
-    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.CreateShader(type_) })
+    with_ctx_and_mem(env, |gles, _mem| unsafe {
+        let shader = gles.CreateShader(type_);
+        if shader != 0 {
+            record_shader_type(shader, type_);
+        }
+        shader
+    })
 }
 fn glBindAttribLocation(
     env: &mut Environment,
@@ -3353,11 +3502,15 @@ fn glUseProgram(env: &mut Environment, program: GLuint) {
 fn glDeleteProgram(env: &mut Environment, program: GLuint) {
     with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
         shadow.guest_bound_attribs.remove(&program);
+        record_program_deleted(program);
         gles.DeleteProgram(program)
     });
 }
 fn glDeleteShader(env: &mut Environment, shader: GLuint) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.DeleteShader(shader) });
+    with_ctx_and_mem(env, |gles, _mem| unsafe {
+        record_shader_deleted(shader);
+        gles.DeleteShader(shader)
+    });
 }
 fn glCompileShader(env: &mut Environment, shader: GLuint) {
     with_ctx_and_mem(env, |gles, _mem| unsafe {
@@ -3409,12 +3562,14 @@ fn glGetShaderPrecisionFormat(
 }
 fn glAttachShader(env: &mut Environment, program: GLuint, shader: GLuint) {
     with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.AttachShader(program, shader)
+        gles.AttachShader(program, shader);
+        record_shader_attach(program, shader);
     });
 }
 fn glDetachShader(env: &mut Environment, program: GLuint, shader: GLuint) {
     with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.DetachShader(program, shader)
+        gles.DetachShader(program, shader);
+        record_shader_detach(program, shader);
     });
 }
 fn glLinkProgram(env: &mut Environment, program: GLuint) {
@@ -3500,6 +3655,13 @@ fn glLinkProgram(env: &mut Environment, program: GLuint) {
                 }
             }
         }
+        if gles.is_es2() {
+            // Strict linkers (ANGLE) reject programs whose fragment shader
+            // declares varyings the vertex shader doesn't (legal-but-undefined
+            // on real iPhone-era hardware). Patch the vertex shader first so
+            // the link below succeeds; see `fix_fragment_only_varyings`.
+            fix_fragment_only_varyings(gles, program);
+        }
         gles.LinkProgram(program);
         let mut ok: GLint = 0;
         gles.GetProgramiv(program, 0x8B82 /* GL_LINK_STATUS */, &mut ok);
@@ -3512,7 +3674,23 @@ fn glLinkProgram(env: &mut Environment, program: GLuint) {
                 len as usize,
             ))
             .unwrap_or("?");
-            log!("Program {} link failed: {}", program, s);
+            // Last resort: the pre-link pass may have missed a fragment-only
+            // varying (e.g. exotic source layout). Use the names the driver
+            // itself reported and retry the link once.
+            if gles.is_es2() && inject_driver_reported_varyings(gles, program, s) {
+                gles.LinkProgram(program);
+                gles.GetProgramiv(program, 0x8B82 /* GL_LINK_STATUS */, &mut ok);
+                if ok != 0 {
+                    log!(
+                        "Program {} linked successfully after injecting \
+                         driver-reported fragment-only varyings",
+                        program
+                    );
+                }
+            }
+            if ok == 0 {
+                log!("Program {} link failed: {}", program, s);
+            }
         }
     });
 }
@@ -3853,6 +4031,468 @@ fn normalize_asphalt8_shader_source(source: &str) -> String {
         .replace("vec4(0.5, 0.5, 0.5, 1)", "vec4(0.5, 0.5, 0.5, 1.0)")
 }
 
+/// Move every `#extension` directive to the top of the shader source (right
+/// after the `#version` line, if any). GLSL ES requires extension directives
+/// to appear before any non-preprocessor tokens; strict compilers (ANGLE,
+/// Adreno, Mali) reject shaders that violate this — e.g. Gangstar's fragment
+/// shaders, which the lenient PowerVR drivers of real iPhone-era hardware
+/// accepted. Also normalizes whitespace between `#` and the directive name
+/// (`#  extension` → `#extension`) so such lines are recognized. Lines that
+/// merely contain the word "extension" as part of a longer identifier are
+/// left alone.
+fn hoist_shader_extension_directives(source: &str) -> String {
+    let mut version_line: Option<&str> = None;
+    let mut extension_lines: Vec<String> = Vec::new();
+    let mut body_lines: Vec<&str> = Vec::new();
+    for line in source.split('\n') {
+        let trimmed = line.trim_start();
+        // Recognize `#extension` even with whitespace after `#`.
+        let normalized: Option<String> = trimmed.strip_prefix('#').and_then(|after_hash| {
+            let dir = after_hash.trim_start();
+            if dir.starts_with("extension") {
+                let after_kw = &dir["extension".len()..];
+                if after_kw.is_empty()
+                    || !after_kw
+                        .chars()
+                        .next()
+                        .map_or(false, |c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    Some(format!("#extension{}", after_kw))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
+        if let Some(norm) = normalized {
+            extension_lines.push(norm);
+            continue;
+        }
+        if version_line.is_none() && trimmed.starts_with("#version") {
+            version_line = Some(line);
+        } else if trimmed.starts_with("#extension") {
+            extension_lines.push(line.to_string());
+        } else {
+            body_lines.push(line);
+        }
+    }
+    if extension_lines.is_empty() {
+        return source.to_string();
+    }
+    let mut out = String::with_capacity(source.len() + 32);
+    if let Some(v) = version_line {
+        out.push_str(v);
+        out.push('\n');
+    }
+    for ext in &extension_lines {
+        out.push_str(ext);
+        out.push('\n');
+    }
+    for (i, line) in body_lines.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+    if source.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Strip `//` and `/* */` comments from GLSL source so declaration scanning
+/// never sees commented-out code (Gameloft's shader generator emits the full
+/// varying block in both stages but comments unused entries out — a
+/// comment-blind parser would treat `/* varying float vAlpha; */` in the
+/// vertex shader as a real declaration and skip the fix-up).
+fn strip_glsl_comments(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut chars = source.chars().peekable();
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    while let Some(c) = chars.next() {
+        if in_line_comment {
+            if c == '\n' {
+                in_line_comment = false;
+                out.push('\n');
+            }
+            continue;
+        }
+        if in_block_comment {
+            if c == '*' && matches!(chars.peek(), Some('/')) {
+                chars.next();
+                in_block_comment = false;
+                out.push(' ');
+            }
+            continue;
+        }
+        if c == '/' {
+            if matches!(chars.peek(), Some('/')) {
+                chars.next();
+                in_line_comment = true;
+                continue;
+            }
+            if matches!(chars.peek(), Some('*')) {
+                chars.next();
+                in_block_comment = true;
+                out.push(' ');
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Parse top-level `varying` declarations from a GLSL ES 1.00 / desktop GLSL
+/// 1.20 shader source, returning `(type, name)` pairs. Comments are stripped
+/// first; the whole source is scanned token-wise, so declarations anywhere on
+/// a line and several declarations per line (`varying vec2 a, b; varying
+/// float c;`) are all found. Handles precision qualifiers and (by skipping
+/// bracketed parts) array declarators.
+fn parse_varying_declarations(source: &str) -> Vec<(String, String)> {
+    let src = strip_glsl_comments(source);
+    let bytes = src.as_bytes();
+    let mut out = Vec::new();
+    let mut search_start = 0usize;
+    while let Some(rel) = src[search_start..].find("varying") {
+        let start = search_start + rel;
+        let end = start + "varying".len();
+        let before_ok = start == 0 || {
+            let b = bytes[start - 1];
+            !(b.is_ascii_alphanumeric() || b == b'_')
+        };
+        let after_ok = end >= src.len() || {
+            let b = bytes[end];
+            !(b.is_ascii_alphanumeric() || b == b'_')
+        };
+        if !before_ok || !after_ok {
+            search_start = end;
+            continue;
+        }
+        // Scan tokens up to the first ';' (declarations after it will be
+        // picked up by the next outer-loop iteration).
+        let rest = &src[end..];
+        let semi = rest.find(';').unwrap_or(rest.len());
+        let body = &rest[..semi];
+        let mut items: Vec<(String, bool)> = Vec::new(); // (token, comma-followed)
+        let mut cur = String::new();
+        let mut comma = false;
+        let mut in_brackets = false;
+        for ch in body.chars() {
+            if ch == '[' {
+                in_brackets = true;
+            } else if ch == ']' {
+                in_brackets = false;
+            }
+            if in_brackets {
+                continue;
+            }
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                cur.push(ch);
+            } else {
+                if !cur.is_empty() {
+                    items.push((cur.clone(), comma));
+                    cur.clear();
+                    comma = false;
+                }
+                if ch == ',' {
+                    comma = true;
+                }
+            }
+        }
+        if !cur.is_empty() {
+            items.push((cur, comma));
+        }
+        if !items.is_empty() {
+            let mut idx = 0usize;
+            if matches!(items[0].0.as_str(), "highp" | "mediump" | "lowp") && items.len() >= 2 {
+                idx = 1;
+            }
+            let ty = items[idx].0.clone();
+            let mut k = idx + 1;
+            while k < items.len() {
+                let name = items[k].0.clone();
+                let had_comma = items[k].1;
+                if !name.is_empty() {
+                    out.push((ty.clone(), name));
+                }
+                k += 1;
+                if !had_comma {
+                    break;
+                }
+            }
+        }
+        search_start = end;
+    }
+    out
+}
+
+/// Guest-side bookkeeping of the ES 2.0 shader/program graph: which type each
+/// shader object has, the (normalized) source last submitted for it, and
+/// which shaders are attached to each program. Populated by the
+/// `glCreateShader` / `glShaderSource` / `glAttachShader` / `glDetachShader` /
+/// `glDeleteShader` / `glDeleteProgram` hooks below. `fix_fragment_only_varyings`
+/// reads this instead of calling `glGetAttachedShaders` / `glGetShaderSource`
+/// on the host backend — those entry points are optional and some backends
+/// (notably `GLES2Native`, whose `GetAttachedShaders` default panics) do not
+/// implement them.
+#[derive(Default)]
+struct ShaderBookkeeping {
+    shader_types: HashMap<GLuint, GLuint>,
+    shader_sources: HashMap<GLuint, String>,
+    program_attachments: HashMap<GLuint, Vec<GLuint>>,
+}
+static SHADER_BOOKKEEPING: std::sync::Mutex<Option<ShaderBookkeeping>> =
+    std::sync::Mutex::new(None);
+
+fn with_shader_bookkeeping<R>(f: impl FnOnce(&mut ShaderBookkeeping) -> R) -> R {
+    let mut guard = SHADER_BOOKKEEPING.lock().unwrap();
+    f(guard.get_or_insert_with(ShaderBookkeeping::default))
+}
+
+fn record_shader_type(shader: GLuint, type_: GLuint) {
+    with_shader_bookkeeping(|bk| {
+        bk.shader_types.insert(shader, type_);
+    });
+}
+
+fn record_shader_source(shader: GLuint, source: String) {
+    with_shader_bookkeeping(|bk| {
+        bk.shader_sources.insert(shader, source);
+    });
+}
+
+fn record_shader_attach(program: GLuint, shader: GLuint) {
+    with_shader_bookkeeping(|bk| {
+        let list = bk.program_attachments.entry(program).or_default();
+        if !list.contains(&shader) {
+            list.push(shader);
+        }
+    });
+}
+
+fn record_shader_detach(program: GLuint, shader: GLuint) {
+    with_shader_bookkeeping(|bk| {
+        if let Some(list) = bk.program_attachments.get_mut(&program) {
+            list.retain(|s| *s != shader);
+        }
+    });
+}
+
+fn record_shader_deleted(shader: GLuint) {
+    with_shader_bookkeeping(|bk| {
+        bk.shader_types.remove(&shader);
+        bk.shader_sources.remove(&shader);
+        for list in bk.program_attachments.values_mut() {
+            list.retain(|s| *s != shader);
+        }
+    });
+}
+
+fn record_program_deleted(program: GLuint) {
+    with_shader_bookkeeping(|bk| {
+        bk.program_attachments.remove(&program);
+    });
+}
+
+/// Some apps (e.g. Gangstar) declare `varying` variables in the fragment
+/// shader that the vertex shader never declares. GLSL ES 1.00 tolerates this
+/// (the varying gets an undefined value), and so did the PowerVR drivers of
+/// real devices, but strict linkers — notably ANGLE's — fail the whole
+/// program link with "FRAGMENT varying X does not match any VERTEX varying",
+/// leaving the app drawing with a stale program and producing garbage
+/// (magenta) geometry. Fix it generically: re-declare the fragment-only
+/// varyings at the end of the vertex shader source (top-level declarations
+/// are legal after `main()`), swap in a recompiled vertex shader, and let the
+/// link proceed. Shader/program relationships come from the guest-side
+/// [ShaderBookkeeping], never from optional backend entry points.
+unsafe fn fix_fragment_only_varyings(gles: &mut dyn GLES, program: GLuint) {
+    const VERTEX_SHADER: GLuint = 0x8B31;
+    const FRAGMENT_SHADER: GLuint = 0x8B30;
+
+    let Some((vertex_shader, vertex_src, fragment_src)) = with_shader_bookkeeping(|bk| {
+        let attached = bk.program_attachments.get(&program)?.clone();
+        if attached.len() < 2 {
+            return None;
+        }
+        let mut vertex: Option<(GLuint, String)> = None;
+        let mut fragment_src: Option<String> = None;
+        for shader in attached {
+            match bk.shader_types.get(&shader).copied() {
+                Some(VERTEX_SHADER) => {
+                    if let Some(src) = bk.shader_sources.get(&shader) {
+                        vertex = Some((shader, src.clone()));
+                    }
+                }
+                Some(FRAGMENT_SHADER) => {
+                    if let Some(src) = bk.shader_sources.get(&shader) {
+                        fragment_src = Some(src.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        match (vertex, fragment_src) {
+            (Some(vertex), Some(fragment_src)) => Some((vertex.0, vertex.1, fragment_src)),
+            _ => None,
+        }
+    }) else {
+        return;
+    };
+    let vertex_varyings = parse_varying_declarations(&vertex_src);
+    let fragment_varyings = parse_varying_declarations(&fragment_src);
+    if fragment_varyings.is_empty() {
+        return;
+    }
+    let mut missing: Vec<(String, String)> = Vec::new();
+    for (ty, name) in fragment_varyings {
+        if vertex_varyings.iter().any(|(_, n)| n == &name) {
+            continue;
+        }
+        if missing.iter().any(|(_, n)| n == &name) {
+            continue;
+        }
+        missing.push((ty, name));
+    }
+    if missing.is_empty() {
+        return;
+    }
+    if swap_in_patched_vertex_shader(gles, program, vertex_shader, &vertex_src, &missing) {
+        log!(
+            "Program {}: injected {} fragment-only varying declaration(s) ({}) \
+             into the vertex shader so strict linkers accept the program",
+            program,
+            missing.len(),
+            missing
+                .iter()
+                .map(|(_, n)| n.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+}
+
+/// Append `missing` varying declarations to the program's current vertex
+/// shader source, compile the result and swap it in (updating the guest-side
+/// bookkeeping). Returns `false` (leaving everything as-is) if the patched
+/// shader fails to compile.
+unsafe fn swap_in_patched_vertex_shader(
+    gles: &mut dyn GLES,
+    program: GLuint,
+    vertex_shader: GLuint,
+    vertex_src: &str,
+    missing: &[(String, String)],
+) -> bool {
+    const VERTEX_SHADER: GLuint = 0x8B31;
+    const COMPILE_STATUS: GLenum = 0x8B81;
+
+    let mut patched = vertex_src.to_string();
+    if !patched.ends_with('\n') {
+        patched.push('\n');
+    }
+    for (ty, name) in missing {
+        patched.push_str(&format!("varying {} {};\n", ty, name));
+    }
+    let Ok(csrc) = std::ffi::CString::new(patched.clone()) else {
+        return false;
+    };
+    let new_shader = gles.CreateShader(VERTEX_SHADER as GLenum);
+    if new_shader == 0 {
+        return false;
+    }
+    let ptr = csrc.as_ptr();
+    gles.ShaderSource(new_shader, 1, &ptr, std::ptr::null());
+    gles.CompileShader(new_shader);
+    let mut ok: GLint = 0;
+    gles.GetShaderiv(new_shader, COMPILE_STATUS, &mut ok);
+    if ok == 0 {
+        gles.DeleteShader(new_shader);
+        return false;
+    }
+    gles.DetachShader(program, vertex_shader);
+    gles.AttachShader(program, new_shader);
+    // Keep the guest-side bookkeeping in sync (the Attach/Detach calls above
+    // go straight to the backend, bypassing the glAttachShader hook).
+    with_shader_bookkeeping(|bk| {
+        if let Some(list) = bk.program_attachments.get_mut(&program) {
+            if let Some(slot) = list.iter_mut().find(|s| **s == vertex_shader) {
+                *slot = new_shader;
+            } else {
+                list.push(new_shader);
+            }
+        }
+        bk.shader_types.insert(new_shader, VERTEX_SHADER);
+        bk.shader_sources.insert(new_shader, patched);
+        // The old vertex shader's type/source entries stay in the maps until
+        // the guest deletes it — it may still be attached to other programs.
+    });
+    true
+}
+
+/// Last-resort fix-up: if a link still failed, parse the varying names the
+/// driver complained about ("FRAGMENT varying <name> does not match any
+/// VERTEX varying"), look their types up in the recorded fragment source and
+/// inject them into the vertex shader. The caller re-links afterwards.
+unsafe fn inject_driver_reported_varyings(
+    gles: &mut dyn GLES,
+    program: GLuint,
+    info_log: &str,
+) -> bool {
+    const VERTEX_SHADER: GLuint = 0x8B31;
+    const FRAGMENT_SHADER: GLuint = 0x8B30;
+
+    let mut names: Vec<String> = Vec::new();
+    for (i, _) in info_log.match_indices("FRAGMENT varying") {
+        let rest = info_log[i + "FRAGMENT varying".len()..].trim_start();
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    if names.is_empty() {
+        return false;
+    }
+    let Some((vertex_shader, vertex_src, missing)) = with_shader_bookkeeping(|bk| {
+        let attached = bk.program_attachments.get(&program)?.clone();
+        let mut vertex: Option<(GLuint, String)> = None;
+        let mut fragment_src: Option<String> = None;
+        for shader in attached {
+            match bk.shader_types.get(&shader).copied() {
+                Some(VERTEX_SHADER) => {
+                    if let Some(src) = bk.shader_sources.get(&shader) {
+                        vertex = Some((shader, src.clone()));
+                    }
+                }
+                Some(FRAGMENT_SHADER) => {
+                    if let Some(src) = bk.shader_sources.get(&shader) {
+                        fragment_src = Some(src.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        let (vertex_shader, vertex_src) = vertex?;
+        let fragment_src = fragment_src?;
+        let fs_decls = parse_varying_declarations(&fragment_src);
+        let missing: Vec<(String, String)> = names
+            .iter()
+            .filter_map(|name| fs_decls.iter().find(|(_, n)| n == name).cloned())
+            .collect();
+        if missing.is_empty() {
+            return None;
+        }
+        Some((vertex_shader, vertex_src, missing))
+    }) else {
+        return false;
+    };
+    swap_in_patched_vertex_shader(gles, program, vertex_shader, &vertex_src, &missing)
+}
+
 fn glShaderSource(
     env: &mut Environment,
     shader: GLuint,
@@ -3917,10 +4557,22 @@ fn glShaderSource(
     let src = String::from_utf8_lossy(&raw_source);
     let src = normalize_shader_preprocessor_whitespace(&src);
     let src = normalize_asphalt8_shader_source(&src);
+    // 3. Hoist `#extension` directives to the top — strict compilers (ANGLE
+    //    etc.) reject them after non-preprocessor tokens; see
+    //    `hoist_shader_extension_directives`.
+    let src = hoist_shader_extension_directives(&src);
     let bytes_vec = strip_captain_tomato_shader_precision(&src).into_bytes();
 
     let cs = std::ffi::CString::new(bytes_vec).unwrap_or_default();
     let ptr = cs.as_ptr();
+    // Remember what we submitted so `fix_fragment_only_varyings` can rewrite
+    // the vertex shader at link time without depending on optional backend
+    // entry points (GetShaderSource / GetAttachedShaders are unimplemented
+    // on some backends, e.g. GLES2Native's GetAttachedShaders panics).
+    record_shader_source(
+        shader,
+        String::from_utf8_lossy(cs.as_bytes()).into_owned(),
+    );
     if crate::env_flag_cached!("TOUCHHLE_DUMP_SHADER_SOURCE") {
         let _ = std::fs::write(format!("/tmp/a8run/shader_{}.glsl", shader), cs.as_bytes());
     }
@@ -4919,8 +5571,12 @@ fn glTexStorage2D(
     width: GLsizei,
     height: GLsizei,
 ) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.TexStorage2D(target, levels, internalformat, width, height)
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        let bound_texture = current_bound_texture(gles, target);
+        gles.TexStorage2D(target, levels, internalformat, width, height);
+        if let Some(texture) = bound_texture {
+            shadow.forget_pvrtc_texture(texture);
+        }
     });
 }
 
@@ -6294,6 +6950,57 @@ pub const FUNCTIONS: FunctionExports = &[
 ];
 
 #[cfg(test)]
+mod pvrtc_subimage_matching_tests {
+    use super::pvrtc_subimage_matches_level;
+    use crate::gles::gles11_raw as gles11;
+
+    #[test]
+    fn accepts_only_a_full_update_of_the_tracked_pvrtc_level() {
+        let level = Some((2048, 2048, gles11::COMPRESSED_RGBA_PVRTC_4BPPV1_IMG));
+        assert!(pvrtc_subimage_matches_level(
+            level,
+            0,
+            0,
+            2048,
+            2048,
+            gles11::COMPRESSED_RGBA_PVRTC_4BPPV1_IMG,
+        ));
+        assert!(!pvrtc_subimage_matches_level(
+            level,
+            0,
+            0,
+            1024,
+            2048,
+            gles11::COMPRESSED_RGBA_PVRTC_4BPPV1_IMG,
+        ));
+        assert!(!pvrtc_subimage_matches_level(
+            level,
+            4,
+            0,
+            2048,
+            2048,
+            gles11::COMPRESSED_RGBA_PVRTC_4BPPV1_IMG,
+        ));
+        assert!(!pvrtc_subimage_matches_level(
+            level,
+            0,
+            0,
+            2048,
+            2048,
+            gles11::COMPRESSED_RGB_PVRTC_4BPPV1_IMG,
+        ));
+        assert!(!pvrtc_subimage_matches_level(
+            None,
+            0,
+            0,
+            2048,
+            2048,
+            gles11::COMPRESSED_RGBA_PVRTC_4BPPV1_IMG,
+        ));
+    }
+}
+
+#[cfg(test)]
 mod shader_preprocessor_normalization_tests {
     use super::{normalize_asphalt8_shader_source, normalize_shader_preprocessor_whitespace};
 
@@ -6367,5 +7074,94 @@ mod shader_preprocessor_normalization_tests {
         let out = normalize_shader_preprocessor_whitespace(&joined);
         assert!(out.contains("#endif //trailing comment"));
         assert!(!out.contains("#endif//trailing comment"));
+    }
+}
+
+#[cfg(test)]
+mod shader_extension_hoisting_tests {
+    use super::hoist_shader_extension_directives;
+
+    #[test]
+    fn hoists_late_extension_before_code() {
+        // Mirrors the Gangstar shader layout that fails on ANGLE with
+        // "extension directive must occur before any non-preprocessor tokens".
+        let src = "precision mediump float;\nuniform sampler2D t;\n#extension GL_OES_texture_3D : enable\nvarying vec2 vUV;\nvoid main() {}\n";
+        let out = hoist_shader_extension_directives(src);
+        assert!(
+            out.starts_with("#extension GL_OES_texture_3D : enable\n"),
+            "hoisted source must start with the extension directive, got: {out}"
+        );
+        assert!(out.find("#extension").unwrap() < out.find("precision").unwrap());
+    }
+
+    #[test]
+    fn keeps_version_first_and_normalizes_whitespace() {
+        let src = "#version 100\nvoid main() {}\n#  extension GL_OES_standard_derivatives : enable\n";
+        let out = hoist_shader_extension_directives(src);
+        assert!(
+            out.starts_with("#version 100\n#extension GL_OES_standard_derivatives : enable\n"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn leaves_sources_without_extensions_untouched() {
+        let src = "void main() { gl_FragColor = vec4(1.0); }\n";
+        assert_eq!(hoist_shader_extension_directives(src), src);
+    }
+
+    #[test]
+    fn does_not_misfire_on_extension_identifiers() {
+        let src = "float extensionFlag = 1.0;\nvoid main() {}\n";
+        assert_eq!(hoist_shader_extension_directives(src), src);
+    }
+}
+
+#[cfg(test)]
+mod varying_declaration_parsing_tests {
+    use super::parse_varying_declarations;
+
+    #[test]
+    fn parses_precision_and_declarator_lists() {
+        let frag = "precision mediump float;\nvarying lowp vec4 vAlpha;\nvarying vec2 vUV, vUV2;\nvarying highp vec3 vNormal; // lit\nvoid main() {}\n";
+        let v = parse_varying_declarations(frag);
+        assert!(v.contains(&("vec4".to_string(), "vAlpha".to_string())));
+        assert!(v.contains(&("vec2".to_string(), "vUV".to_string())));
+        assert!(v.contains(&("vec2".to_string(), "vUV2".to_string())));
+        assert!(v.contains(&("vec3".to_string(), "vNormal".to_string())));
+        assert_eq!(v.len(), 4);
+    }
+
+    #[test]
+    fn fragment_only_varyings_detected_as_missing() {
+        // The Gangstar case: fragment declares vAlpha, vertex does not.
+        let vert = parse_varying_declarations("varying vec2 vUV;\nvoid main() {}\n");
+        let frag = parse_varying_declarations("varying vec4 vAlpha;\nvarying vec2 vUV;\nvoid main() {}\n");
+        let missing: Vec<_> = frag
+            .into_iter()
+            .filter(|(_, n)| !vert.iter().any(|(_, vn)| vn == n))
+            .collect();
+        assert_eq!(missing, vec![("vec4".to_string(), "vAlpha".to_string())]);
+    }
+
+    #[test]
+    fn commented_out_varyings_are_ignored() {
+        // Gameloft's generator emits the full varying block in both stages
+        // but comments unused entries out; these must not count as declared.
+        let vert = parse_varying_declarations(
+            "varying vec2 vUV;\n/* varying float vAlpha; */\n// varying vec3 vNormal;\nvoid main() {}\n",
+        );
+        assert_eq!(vert, vec![("vec2".to_string(), "vUV".to_string())]);
+    }
+
+    #[test]
+    fn multiple_declarations_per_line_and_mid_line() {
+        let src = "varying vec2 vUV, vUV2; varying float vAlpha;\nuniform varying_less;\nvoid main() { varying_not_keyword(); }\n";
+        let v = parse_varying_declarations(src);
+        assert!(v.contains(&("vec2".to_string(), "vUV".to_string())));
+        assert!(v.contains(&("vec2".to_string(), "vUV2".to_string())));
+        assert!(v.contains(&("float".to_string(), "vAlpha".to_string())));
+        assert!(!v.iter().any(|(_, n)| n == "varying_not_keyword"));
+        assert_eq!(v.len(), 3);
     }
 }

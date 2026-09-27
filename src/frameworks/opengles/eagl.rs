@@ -156,6 +156,8 @@ pub(super) struct GLShadowState {
     /// must not force-rebind canonical attribute names, because that would
     /// override the app's own vertex layout (e.g. Gameloft's Jet engine).
     pub(super) guest_bound_attribs: HashMap<GLuint, std::collections::HashSet<String>>,
+    /// Dimensions and format for PVRTC levels expanded to RGBA storage.
+    pub(super) pvrtc_texture_levels: HashMap<(GLenum, GLuint, GLint), (GLsizei, GLsizei, GLenum)>,
 }
 impl Default for GLShadowState {
     fn default() -> Self {
@@ -168,6 +170,7 @@ impl Default for GLShadowState {
             fog_end: 1.0,
             generic_attribs_used: false,
             guest_bound_attribs: HashMap::new(),
+            pvrtc_texture_levels: HashMap::new(),
         }
     }
 }
@@ -188,6 +191,40 @@ impl GLShadowState {
         if self.element_array_buffer == Some(deleted) {
             self.element_array_buffer = Some(0);
         }
+    }
+    pub(super) fn record_pvrtc_texture_level(
+        &mut self,
+        target: GLenum,
+        texture: GLuint,
+        level: GLint,
+        width: GLsizei,
+        height: GLsizei,
+        format: GLenum,
+    ) {
+        self.pvrtc_texture_levels
+            .insert((target, texture, level), (width, height, format));
+    }
+    pub(super) fn pvrtc_texture_level(
+        &self,
+        target: GLenum,
+        texture: GLuint,
+        level: GLint,
+    ) -> Option<(GLsizei, GLsizei, GLenum)> {
+        self.pvrtc_texture_levels
+            .get(&(target, texture, level))
+            .copied()
+    }
+    pub(super) fn forget_pvrtc_texture_level(
+        &mut self,
+        target: GLenum,
+        texture: GLuint,
+        level: GLint,
+    ) {
+        self.pvrtc_texture_levels.remove(&(target, texture, level));
+    }
+    pub(super) fn forget_pvrtc_texture(&mut self, texture: GLuint) {
+        self.pvrtc_texture_levels
+            .retain(|key, _| key.1 != texture);
     }
 }
 
@@ -782,6 +819,9 @@ pub const CLASSES: ClassExports = objc_classes! {
                 "[EAGLContext presentRenderbuffer:] frame {} reached (render loop is alive)",
                 n
             );
+        }
+        if n == 3000 && crate::env_flag_cached!("TOUCHHLE_TRACE_FRAME_CALLS") {
+            crate::dyld::TRACE_HOST_CALLS.store(400, Ordering::Relaxed);
         }
     }
 

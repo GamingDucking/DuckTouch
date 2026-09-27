@@ -87,31 +87,6 @@ impl PresentMode {
     }
 }
 
-/// Which host OpenGL ES driver to load on Android (`--gl-driver=`). Has no
-/// effect on other platforms.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum GlDriverPreference {
-    /// On Android, use bundled ANGLE for apps that may use OpenGL ES 1.1 only
-    /// on detected Adreno devices; use the system driver for ES 2.0-only apps
-    /// and other or unrecognized GPUs.
-    Auto,
-    /// Always use the bundled ANGLE driver (when it is available).
-    Angle,
-    /// Always use the vendor's native (system) OpenGL ES driver.
-    Native,
-}
-
-impl GlDriverPreference {
-    pub fn from_short_name(name: &str) -> Result<Self, ()> {
-        match name {
-            "auto" => Ok(Self::Auto),
-            "angle" => Ok(Self::Angle),
-            "native" | "system" => Ok(Self::Native),
-            _ => Err(()),
-        }
-    }
-}
-
 /// Whether host buffer swaps wait for the display's vertical refresh
 /// (`--vsync=`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -192,10 +167,6 @@ pub struct Options {
     /// the app's draws correctly; costs a GPU pipeline stall per frame.
     /// Can also be enabled with `TOUCHHLE_PRESENT_FINISH=1`.
     pub present_finish: bool,
-    /// See [GlDriverPreference]. Can also be set with the
-    /// `TOUCHHLE_GL_DRIVER` environment variable (the option takes
-    /// precedence).
-    pub gl_driver: GlDriverPreference,
     /// See [VsyncMode]. Can also be set with the `TOUCHHLE_VSYNC` environment
     /// variable (the option takes precedence).
     pub vsync: VsyncMode,
@@ -248,6 +219,14 @@ pub struct Options {
     /// Log every GLES call made by the guest (via the LoggingGLES wrapper).
     /// Much noisier than `trace_gl_errors`. Diagnostic only.
     pub verbose_gles: bool,
+    /// Prefer the vendor's native OpenGL ES driver over the bundled ANGLE
+    /// libraries on Android. Defaults to `true` ("GLES Native" quick option
+    /// ON): the native driver behaves closest to real iPhone-era hardware
+    /// (lenient GLSL ES linking etc.) and avoids ANGLE's stricter validation
+    /// that breaks some apps' shaders (e.g. Gangstar's fragment-only
+    /// varyings). Disable (`--no-gles-native`, quick option OFF) to force the
+    /// bundled ANGLE backend. Only meaningful on Android; ignored elsewhere.
+    pub gles_native: bool,
     /// After a `glTexImage2D(level=0, …)` upload, if the bound texture's
     /// `GL_TEXTURE_MIN_FILTER` is still the ES 1.1 default
     /// `GL_NEAREST_MIPMAP_LINEAR` (which makes the texture incomplete
@@ -308,10 +287,6 @@ impl Default for Options {
             present_finish: std::env::var_os("TOUCHHLE_PRESENT_FINISH")
                 .map(|value| value != "0")
                 .unwrap_or(false),
-            gl_driver: std::env::var("TOUCHHLE_GL_DRIVER")
-                .ok()
-                .and_then(|value| GlDriverPreference::from_short_name(value.trim()).ok())
-                .unwrap_or(GlDriverPreference::Auto),
             vsync: std::env::var("TOUCHHLE_VSYNC")
                 .ok()
                 .and_then(|value| VsyncMode::from_short_name(value.trim()).ok())
@@ -333,6 +308,7 @@ impl Default for Options {
             ignore_gl_errors: false,
             trace_gl_errors: false,
             verbose_gles: false,
+            gles_native: true,
             // On Android the host GLES driver is essentially always
             // ARM Mali / Qualcomm Adreno / something equally strict,
             // and apps shipped for iOS overwhelmingly upload PVRTC and
@@ -561,10 +537,6 @@ impl Options {
             self.present_finish = true;
         } else if arg == "--no-present-finish" {
             self.present_finish = false;
-        } else if let Some(value) = arg.strip_prefix("--gl-driver=") {
-            self.gl_driver = GlDriverPreference::from_short_name(value).map_err(|_| {
-                "Invalid value for --gl-driver= (expected auto, angle or native)".to_string()
-            })?;
         } else if let Some(value) = arg.strip_prefix("--vsync=") {
             self.vsync = VsyncMode::from_short_name(value).map_err(|_| {
                 "Invalid value for --vsync= (expected auto, on or off)".to_string()
@@ -598,6 +570,10 @@ impl Options {
             self.trace_gl_errors = true;
         } else if arg == "--verbose-gles" {
             self.verbose_gles = true;
+        } else if arg == "--gles-native" {
+            self.gles_native = true;
+        } else if arg == "--no-gles-native" {
+            self.gles_native = false;
         } else if arg == "--fix-texture-min-filter" {
             self.fix_texture_min_filter = true;
             // GLES1Native reads this as its source of truth (it has no
